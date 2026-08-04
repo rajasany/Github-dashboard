@@ -221,9 +221,10 @@ single faint band tone (`--surface-2`, 1.12:1) used for row hover, group heading
 and code blocks. `color-scheme: light` and a matching `<meta>` keep native selects and
 scrollbars light on a dark-themed OS, with no dark flash on first paint.
 
-Colours were measured rather than eyeballed: all 12 text/background pairs in the feed and
-sidebar clear WCAG AA (4.5:1), the lowest being 4.55:1. The chip and active-row ink is a
-dedicated `--accent-ink` token because the plain accent only reached 3.94:1 on the tinted
+Colours were measured rather than eyeballed: every text/background pair in the feed and
+sidebar clears WCAG AA (4.5:1), the lowest being 4.59:1. The accent is teal (`--accent`,
+5.59:1 on white); the chip and active-row ink is a dedicated `--accent-ink` token that
+gives extra margin (6.7:1) over the plain accent (4.95:1) on the tinted `--accent-soft`
 background.
 
 To reintroduce a dark theme later, add a `@media (prefers-color-scheme: dark)` block

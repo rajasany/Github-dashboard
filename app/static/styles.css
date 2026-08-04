@@ -14,18 +14,20 @@
   --border: #d9dfe6;
   --text: #17191c;
   --muted: #5c636b;
-  --accent: #2f6fed;
-  --accent-soft: #e8f0ff;
+  --accent: #0a7568;
+  --accent-soft: #e3f5f2;
+  --accent-strong: #0c8c7c;
   --green: #1a7f4b;
   --amber: #9a6400;
   /* Cards sit on the same white as the page, so a drop shadow would only muddy
-     the edge the border already draws. */
+     the edge the border already draws. Interactive elements get a shadow only
+     on hover/press — see .btn.primary, .stat.hero — never at rest. */
   --shadow: none;
   --radius: 10px;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
-  /* Darker accent step for text on --accent-soft. Plain --accent only reaches
-     3.94:1 there, which fails AA for the 11px chip labels; this is 5.29:1. */
-  --accent-ink: #1f5bd0;
+  /* Darker accent step for text on --accent-soft. Plain --accent reaches 4.95:1
+     there; this reaches 6.7:1, comfortable margin for 11px chip labels. */
+  --accent-ink: #085f55;
   /* Measured from the real topbar at runtime; this is only the pre-paint guess. */
   --topbar-h: 57px;
 }
@@ -56,6 +58,7 @@ body {
   padding: 12px 20px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
   position: sticky;
   top: 0;
   z-index: 10;
@@ -63,7 +66,22 @@ body {
 
 .brand { display: flex; align-items: center; gap: 10px; }
 .brand h1 { font-size: 16px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
-.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); }
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 0 0 rgba(26, 127, 75, 0.35);
+  animation: pulse-dot 2.4s ease-out infinite;
+}
+@keyframes pulse-dot {
+  0% { box-shadow: 0 0 0 0 rgba(26, 127, 75, 0.35); }
+  70% { box-shadow: 0 0 0 6px rgba(26, 127, 75, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(26, 127, 75, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dot { animation: none; }
+}
 
 .topbar-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 
@@ -76,7 +94,10 @@ select, .input {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 6px 9px;
+  transition: border-color 0.15s ease;
 }
+select:hover, .input:hover { border-color: #c3cbd4; }
+select:focus, .input:focus { border-color: var(--accent); }
 select:focus-visible, .input:focus-visible, .btn:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
@@ -90,10 +111,18 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
   background: var(--surface);
   color: var(--text);
   cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease, transform 0.08s ease;
 }
 .btn:hover { background: var(--surface-2); }
-.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-.btn.primary:hover { filter: brightness(1.07); }
+.btn:active { transform: translateY(1px); }
+.btn.primary {
+  background: linear-gradient(180deg, var(--accent-strong), var(--accent));
+  border-color: var(--accent);
+  color: #fff;
+  box-shadow: 0 1px 2px rgba(10, 117, 104, 0.25);
+}
+.btn.primary:hover { filter: brightness(1.06); box-shadow: 0 2px 5px rgba(10, 117, 104, 0.3); }
+.btn.primary:active { filter: brightness(0.98); box-shadow: 0 1px 2px rgba(10, 117, 104, 0.25); }
 .btn.primary[disabled] { opacity: 0.6; cursor: progress; }
 .btn.ghost { width: 100%; margin-top: 8px; }
 
@@ -137,6 +166,22 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
   overflow-y: auto;
 }
 
+/* A thin, low-key scrollbar for the sidebar and its own scrolling panels —
+   the default OS scrollbar reads heavy against this flat, hairline-bordered UI. */
+.sidebar, .optlist.scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+.sidebar::-webkit-scrollbar, .optlist.scroll::-webkit-scrollbar { width: 7px; }
+.sidebar::-webkit-scrollbar-track, .optlist.scroll::-webkit-scrollbar-track { background: transparent; }
+.sidebar::-webkit-scrollbar-thumb, .optlist.scroll::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 999px;
+}
+.sidebar::-webkit-scrollbar-thumb:hover, .optlist.scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--accent);
+}
+
 .panel {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -173,6 +218,7 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
   color: var(--text);
   text-align: left;
   cursor: pointer;
+  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
 }
 .opt:hover { background: var(--surface-2); }
 .opt:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
@@ -240,9 +286,10 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
 .stat .value { font-size: 22px; font-weight: 650; letter-spacing: -0.02em; line-height: 1.15; }
 .stat .label { font-size: 12px; color: var(--muted); }
 
-/* The one number the pane leads with. */
+/* The one number the pane leads with — the only stat carrying the accent
+   color, so it reads as the headline rather than competing with the rest. */
 .stat.hero { grid-column: span 2; justify-content: center; }
-.stat.hero .value { font-size: clamp(30px, 4.5vw, 48px); letter-spacing: -0.03em; }
+.stat.hero .value { font-size: clamp(30px, 4.5vw, 48px); letter-spacing: -0.03em; color: var(--accent); }
 .stat.hero .label { font-size: 13px; }
 @media (max-width: 520px) {
   .stat.hero { grid-column: span 1; }
@@ -316,6 +363,7 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
   /* Always present so the hover accent never shifts the layout. */
   border-left: 3px solid transparent;
   border-bottom: 1px solid var(--border);
+  transition: background-color 0.12s ease, border-left-color 0.12s ease;
 }
 .commit:last-child { border-bottom: none; }
 .commit:hover { background: var(--surface-2); border-left-color: var(--accent); }
@@ -329,6 +377,7 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
   border-radius: 50%;
   background: var(--surface-2);
   object-fit: cover; /* stops non-square avatars from stretching */
+  box-shadow: 0 0 0 2px var(--accent-soft);
 }
 .avatar-fallback {
   display: grid;
@@ -415,8 +464,8 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
 .chip.source.github { background: var(--surface-2); color: var(--text); }
 .chip.source.csr { background: #e8f0fe; color: #1558d6; }
 
-/* Quality-signal badges — same red/amber pairing as the error banner and the
-   folder chip's amber, so severity reads consistently across the page. */
+/* Quality-signal badges — same red as the error banner and the same amber
+   token as elsewhere in the app, so severity reads consistently across the page. */
 .chip.revert { border-color: transparent; font-weight: 600; font-family: inherit; background: #fdecec; color: #8a1c1c; }
 .chip.churn { border-color: transparent; font-weight: 600; font-family: inherit; background: #fff4e0; color: var(--amber); }
 
