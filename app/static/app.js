@@ -22,6 +22,7 @@ const ICON = {
 };
 
 const el = {
+  topbar: $("topbar"),
   days: $("days"),
   refresh: $("refresh"),
   rate: $("rate"),
@@ -87,7 +88,12 @@ function dayLabel(iso) {
   const same = (a, b) => a.toDateString() === b.toDateString();
   if (same(d, today)) return "Today";
   if (same(d, yesterday)) return "Yesterday";
-  return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+  // Assembled by hand: passing weekday + month + day + year to toLocaleDateString
+  // yields awkward output in some locales ("Mon, 15 Jun, 2026").
+  const weekday = d.toLocaleDateString(undefined, { weekday: "short" });
+  const dayMonth = d.toLocaleDateString(undefined, { day: "numeric", month: "short" });
+  const year = d.getFullYear() === today.getFullYear() ? "" : ` ${d.getFullYear()}`;
+  return `${weekday} · ${dayMonth}${year}`;
 }
 
 function showBanner(html, isError) {
@@ -112,7 +118,9 @@ async function load({ refresh = false } = {}) {
     const body = await res.json();
     if (!res.ok) {
       showBanner(`<strong>Could not load data.</strong> ${body.detail || res.statusText}`, true);
-      el.feed.innerHTML = '<p class="muted pad">No data.</p>';
+      el.feed.replaceChildren(
+        stateNode("Could not load commits", body.detail || res.statusText || "The request failed.")
+      );
       return;
     }
     state.data = body;
@@ -160,7 +168,16 @@ function tally(keyFn, commits) {
 function optlist(
   container,
   counts,
-  { active, onSelect, allLabel, search = "", label = (k) => k, rowLabel = null, group = null } = {}
+  {
+    active,
+    onSelect,
+    allLabel,
+    allCount = null,
+    search = "",
+    label = (k) => k,
+    rowLabel = null,
+    group = null,
+  } = {}
 ) {
   // `label` drives search/sort/tooltip; `rowLabel` is the visible text, which can
   // be shorter when a group header already supplies the context.
@@ -171,7 +188,9 @@ function optlist(
     .filter(([key]) => !search || label(key).toLowerCase().includes(search.toLowerCase()))
     .sort((a, b) => b[1] - a[1] || label(a[0]).localeCompare(label(b[0])));
 
-  const total = [...counts.values()].reduce((a, b) => a + b, 0);
+  // Summing the per-key counts over-counts whenever one commit owns several keys
+  // (a commit touching three services). Callers pass the real commit total.
+  const total = allCount ?? [...counts.values()].reduce((a, b) => a + b, 0);
 
   const addRow = (key, text, count, { isAll = false, title = text } = {}) => {
     const row = document.createElement("button");
@@ -312,17 +331,21 @@ function select(dimension, key) {
 function buildFilters() {
   // Only worth showing the source picker when more than one provider is configured.
   el.providerPanel.classList.toggle("hidden", state.data.providers.length < 2);
-  optlist(el.providerFilters, tally((c) => [c.provider], scopedTo(STAGE.PROVIDER)), {
+  const providerScope = scopedTo(STAGE.PROVIDER);
+  optlist(el.providerFilters, tally((c) => [c.provider], providerScope), {
     active: state.provider,
     onSelect: (k) => select("provider", k),
     allLabel: "All sources",
+    allCount: providerScope.length,
     label: (p) => PROVIDER_LABEL[p] || p,
   });
 
-  optlist(el.repoFilters, tally((c) => [c.repo_key], scopedTo(STAGE.REPO)), {
+  const repoScope = scopedTo(STAGE.REPO);
+  optlist(el.repoFilters, tally((c) => [c.repo_key], repoScope), {
     active: state.repo,
     onSelect: (k) => select("repo", k),
     allLabel: "All repositories",
+    allCount: repoScope.length,
     label: repoNameOf,
   });
 
@@ -334,10 +357,12 @@ function buildFilters() {
   el.branchScope.textContent = scopeNote;
 
   el.folderPanel.classList.toggle("hidden", !state.data.folders?.enabled);
-  optlist(el.folderFilters, tally(folderKeysOf, scopedTo(STAGE.FOLDER)), {
+  const folderScope = scopedTo(STAGE.FOLDER);
+  optlist(el.folderFilters, tally(folderKeysOf, folderScope), {
     active: state.folder,
     onSelect: (k) => select("folder", k),
     allLabel: "All services",
+    allCount: folderScope.length,
     search: el.folderSearch.value,
     label: folderLabel,
     // With a repo selected the header is redundant; otherwise group by repo so
@@ -346,16 +371,20 @@ function buildFilters() {
     group: state.repo ? null : (key) => repoNameOf(splitFolderKey(key).repoKey),
   });
 
-  optlist(el.branchFilters, tally((c) => c.branches, scopedTo(STAGE.BRANCH)), {
+  const branchScope = scopedTo(STAGE.BRANCH);
+  optlist(el.branchFilters, tally((c) => c.branches, branchScope), {
     active: state.branch,
     onSelect: (k) => select("branch", k),
     allLabel: "All branches",
+    allCount: branchScope.length,
     search: el.branchSearch.value,
   });
 
-  optlist(el.authorFilters, tally((c) => [c.author_name], scopedTo(STAGE.AUTHOR)), {
+  const authorScope = scopedTo(STAGE.AUTHOR);
+  optlist(el.authorFilters, tally((c) => [c.author_name], authorScope), {
     active: state.author,
     onSelect: (k) => select("author", k),
+    allCount: authorScope.length,
     allLabel: "All authors",
   });
 }
@@ -475,7 +504,7 @@ function commitNode(c) {
     : "";
 
   const fileCount = c.files_changed
-    ? `<span class="files" title="${c.files_truncated ? "At least " : ""}${c.files_changed} file(s) changed">${c.files_changed} file${c.files_changed === 1 ? "" : "s"}${c.files_truncated ? "+" : ""}</span>`
+    ? `<span class="files" title="${c.files_truncated ? "At least " : ""}${c.files_changed} file${c.files_changed === 1 ? "" : "s"} changed">${c.files_changed} file${c.files_changed === 1 ? "" : "s"}${c.files_truncated ? "+" : ""}</span>`
     : "";
 
   // Full message is opt-in; native <details> gives keyboard and screen-reader
@@ -630,6 +659,15 @@ function stateNode(title, hint) {
 
 /* ---------- wiring ---------- */
 
+/* The sticky group headers must sit exactly below the topbar. The topbar's height
+ * changes when its controls wrap, so measure it rather than hard-coding a value. */
+function syncTopbarHeight() {
+  const h = el.topbar?.offsetHeight;
+  if (h) document.documentElement.style.setProperty("--topbar-h", `${h}px`);
+}
+window.addEventListener("resize", syncTopbarHeight);
+syncTopbarHeight();
+
 el.refresh.addEventListener("click", () => load({ refresh: true }));
 el.days.addEventListener("change", () => load());
 el.search.addEventListener("input", render);
@@ -658,7 +696,9 @@ el.reset.addEventListener("click", () => {
 
   if (!cfg.configured) {
     showBanner("<strong>Setup needed.</strong> Copy <code>config.example.yaml</code> to <code>config.yaml</code> and list your repositories, then restart.", true);
-    el.feed.innerHTML = '<p class="muted pad">No repositories configured.</p>';
+    el.feed.replaceChildren(
+      stateNode("No repositories configured", "Copy config.example.yaml to config.yaml, list your repositories, then restart.")
+    );
     return;
   }
   // Only warn about a missing GitHub token if GitHub repos are actually tracked.

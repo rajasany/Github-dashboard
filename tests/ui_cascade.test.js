@@ -17,11 +17,33 @@ function makeEl(tag) {
     type: "",
     value: "",
     disabled: false,
-    innerHTML: "",
-    textContent: "",
     title: "",
     className: "",
+    offsetHeight: 57,
     children: [],
+    // Assigning innerHTML replaces an element's content, so it must drop any
+    // children the stub is tracking — `feed.innerHTML = ""` relies on that.
+    _html: "",
+    get innerHTML() {
+      return this._html;
+    },
+    set innerHTML(v) {
+      this._html = v == null ? "" : String(v);
+      this.children = [];
+    },
+    // The app's escapeHtml() writes textContent and reads back innerHTML, so the
+    // stub has to model that link or every escaped string comes back empty.
+    _text: "",
+    get textContent() {
+      return this._text;
+    },
+    set textContent(v) {
+      this._text = v == null ? "" : String(v);
+      this.innerHTML = this._text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    },
     classList: { toggle() {}, add() {}, remove() {} },
     setAttribute() {},
     addEventListener(kind, fn) {
@@ -31,6 +53,9 @@ function makeEl(tag) {
       this.children.push(c);
       return c;
     },
+    replaceChildren(...c) {
+      this.children = c;
+    },
     append(...c) {
       this.children.push(...c);
     },
@@ -38,6 +63,9 @@ function makeEl(tag) {
 }
 
 const els = new Map();
+// Records CSS custom properties the app sets on :root (e.g. --topbar-h).
+const rootVars = new Map();
+
 const context = {
   console,
   document: {
@@ -46,7 +74,11 @@ const context = {
       return els.get(id);
     },
     createElement: (tag) => makeEl(tag),
+    documentElement: {
+      style: { setProperty: (k, v) => rootVars.set(k, v) },
+    },
   },
+  window: { addEventListener() {} },
   fetch: () => new Promise(() => {}), // init IIFE hangs harmlessly
   URLSearchParams,
   Date,
@@ -67,7 +99,8 @@ vm.runInContext(
 vm.runInContext(
   `globalThis.__api = { state, tally, folderKeysOf, splitFolderKey, repoNameOf,
      scopedTo, STAGE, FOLDER_SEP, visibleCommits, renderStats, folderLabel,
-     buildFilters, foldersOf, select, pruneSelections };`,
+     buildFilters, foldersOf, select, pruneSelections, commitNode, render,
+     escapeAttr, escapeHtml };`,
   context
 );
 const api = context.__api;
@@ -115,6 +148,12 @@ const DATA = {
     C("csr:gcp-proj/pay", ["backend", "ledger"], ["release/1"], "dave", false),
   ],
 };
+
+// One commit gets a body, and one gets hostile characters in its title and URL,
+// so the rendering tests below exercise the expand affordance and escaping.
+DATA.commits[0].body = "Longer explanation\nacross two lines.";
+DATA.commits[1].title = 'Fix "quoted" title & <tag>';
+DATA.commits[1].url = 'https://example.test/c?a="1"';
 
 const S = api.state;
 S.data = DATA;
@@ -272,6 +311,60 @@ reset();
 S.repo = SHOP;
 api.select("repo", null);
 check("repo cleared, full feed back", shas().length, 6);
+
+console.log("\n=== 12. commit row rendering ===");
+reset();
+const html1 = api.commitNode(DATA.commits[0]).innerHTML;
+const html2 = api.commitNode(DATA.commits[1]).innerHTML;
+const html3 = api.commitNode(DATA.commits[2]).innerHTML;
+
+check("service chip carries the folder class", /class="chip folder"/.test(html1), true);
+check("branch chip carries the branch class", /class="chip branch/.test(html1), true);
+check("default branch is marked", /class="chip branch is-default"/.test(html1), true);
+check("non-default branch is not marked", /is-default/.test(html3), false);
+check("chips carry an icon", /class="ic"/.test(html1), true);
+check(
+  "full message shown only when a body exists",
+  [/commit-body/.test(html1), /commit-body/.test(html2)],
+  [true, false]
+);
+check("time uses <time> with a machine-readable datetime", /<time class="when" datetime="2026-08-02T10:00:00Z"/.test(html1), true);
+check("sha link present", /class="sha"/.test(html1), true);
+check("avatar falls back to initials when no image", /avatar-fallback/.test(html1), true);
+
+console.log("\n=== 13. escaping ===");
+check("escapeAttr escapes quotes", api.escapeAttr('a"b'), "a&quot;b");
+check("markup in a title is escaped, not injected", /&lt;tag&gt;/.test(html2) && !/<tag>/.test(html2), true);
+check("ampersand escaped", /&amp;/.test(html2), true);
+check("quoted URL cannot break out of href", html2.includes('href="https://example.test/c?a=&quot;1&quot;"'), true);
+
+console.log("\n=== 14. KPI row leads with exactly one hero ===");
+reset();
+api.renderStats(api.visibleCommits());
+const statsHtml = els.get("stats").innerHTML;
+check("exactly one hero tile", (statsHtml.match(/class="stat hero"/g) || []).length, 1);
+check("hero is the commits tile", statsHtml.startsWith('<div class="stat hero"><div class="value">6</div><div class="label">Commits</div>'), true);
+check("labels read as sentence case", /Not on default branch/.test(statsHtml), true);
+
+console.log("\n=== 15. empty result renders a state node, not bare text ===");
+reset();
+els.get("search").value = "zzz-no-such-commit";
+api.render();
+const feedKids = els.get("feed").children;
+check("feed holds a single state node", feedKids.length, 1);
+check(
+  "state node has both a title and a hint",
+  /state-title/.test(feedKids[0].innerHTML) && /state-hint/.test(feedKids[0].innerHTML),
+  true
+);
+
+console.log("\n=== 16. group headers carry a name and a count ===");
+reset();
+api.render();
+const heads = els.get("feed").children.filter((c) => c.className === "group-head");
+check("headers were rendered", heads.length > 0, true);
+check("each header holds a name span and a count span", heads.every((h) => h.children.length === 2), true);
+check("the count reads as commits", /commit/.test(heads[0].children[1].textContent), true);
 
 console.log(allOk ? "\nALL PASS" : "\nSOME FAILURES");
 process.exit(allOk ? 0 : 1);

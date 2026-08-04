@@ -3,11 +3,14 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Declared before the stylesheet loads so a dark-themed OS cannot flash a
+       dark canvas or paint native controls dark on first render. -->
+  <meta name="color-scheme" content="light" />
   <title>Repo Change Dashboard</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
-  <header class="topbar">
+  <header class="topbar" id="topbar">
     <div class="brand">
       <span class="dot"></span>
       <h1>Repo Change Dashboard</h1>
@@ -90,7 +93,7 @@
         <span id="result-count" class="muted"></span>
       </div>
       <div id="feed" class="feed">
-        <p class="muted pad">Loading…</p>
+        <div class="state"><p class="state-title">Loading…</p><p class="state-hint">Reading commits from the configured repositories.</p></div>
       </div>
     </section>
   </main>

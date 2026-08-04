@@ -189,18 +189,61 @@ Selections that stop making sense are dropped automatically: switching from a re
 you'd selected `backend` to one without it clears the service, while a branch like `main`
 that exists in both is kept.
 
+## Reading the commit feed
+
+Each row is one commit, deduped across branches:
+
+```
+[avatar]  Booth Addition                                    15 Jun
+          Raja Sanyal · rajasany/meetingapp        a31370a  215 files
+          🗂 backend  🗂 data  🗂 deploy  🗂 frontend   ⑂ main
+          ▸ Full message
+```
+
+- **Services** are square-cornered, accent-tinted, folder-icon chips; **branches** are
+  neutral pills with a branch icon. Shape *and* colour differ, so the two are never
+  told apart by hue alone. The default branch is filled and inked rather than accented.
+- **Full message** appears only when the commit has a body beyond its subject line; it
+  is a native `<details>`, so it works by keyboard and screen reader.
+- The relative time carries the exact timestamp as a tooltip, and sits in a `<time>`
+  element with a machine-readable `datetime`.
+- Day headings stick below the top bar while you scroll. The offset is measured from
+  the real top bar at runtime, so it stays correct when the header wraps.
+- Group headings show a per-group commit count; the row hover cue is also applied on
+  keyboard focus.
+
+### Theme
+
+The UI is white — one light theme, regardless of the operating system's appearance
+setting. There is no `prefers-color-scheme` switch: page and cards are both pure white,
+and structure comes from a hairline border (`--border`, 1.34:1 against white) plus a
+single faint band tone (`--surface-2`, 1.12:1) used for row hover, group headings, chips
+and code blocks. `color-scheme: light` and a matching `<meta>` keep native selects and
+scrollbars light on a dark-themed OS, with no dark flash on first paint.
+
+Colours were measured rather than eyeballed: all 12 text/background pairs in the feed and
+sidebar clear WCAG AA (4.5:1), the lowest being 4.55:1. The chip and active-row ink is a
+dedicated `--accent-ink` token because the plain accent only reached 3.94:1 on the tinted
+background.
+
+To reintroduce a dark theme later, add a `@media (prefers-color-scheme: dark)` block
+overriding the `:root` custom properties and drop the `color-scheme: light` line — no
+other rule hard-codes a colour.
+
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_paths.py   # changed paths -> owning folder   (16 checks)
-node tests/ui_cascade.test.js          # drill-down selection behaviour   (23 checks)
+.venv/bin/python tests/test_paths.py   # changed paths -> owning folder      (16 checks)
+node tests/ui_cascade.test.js          # selection, rendering, escaping      (39 checks)
 ```
 
 The second suite runs the real `app/static/app.js` in a stubbed DOM and asserts the cases
 that matter: selecting a repository scopes the folder and branch lists to it; two
 repositories each containing a `backend/` folder stay separate; stale downstream
-selections are pruned on repo switch; and the lists render single-select buttons with no
-checkbox inputs.
+selections are pruned on repo switch; the lists render single-select buttons with no
+checkbox inputs; commit rows mark the default branch and expose the full message only
+when there is one; and a commit title containing `"`, `&`, or `<tag>` is escaped rather
+than injected into the markup.
 
 ## Known limits of this version
 
