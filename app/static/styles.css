@@ -105,11 +105,13 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
 
 .btn {
   font: inherit;
+  display: inline-block;
   border-radius: 8px;
   padding: 7px 14px;
   border: 1px solid var(--border);
   background: var(--surface);
   color: var(--text);
+  text-decoration: none;
   cursor: pointer;
   transition: background-color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease, transform 0.08s ease;
 }
@@ -539,6 +541,36 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
 .state .state-title { font-size: 14px; font-weight: 600; color: var(--text); }
 .state .state-hint { font-size: 12.5px; color: var(--muted); max-width: 42ch; line-height: 1.5; }
 .state .ic { width: 26px; height: 26px; color: var(--muted); opacity: 0.65; }
+
+/* ---------- gcloud sign-in interstitial (gcloud-auth.html) ---------- */
+
+.auth-screen {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.auth-card {
+  width: 100%;
+  max-width: 380px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  text-align: center;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 32px 28px;
+}
+.auth-card h1 { font-size: 16px; font-weight: 650; margin: 4px 0 0; letter-spacing: -0.01em; }
+.auth-card .muted { font-size: 12.5px; line-height: 1.5; }
+.auth-card .btn { width: 100%; margin-top: 6px; }
+.auth-card .banner { width: 100%; border-radius: 8px; text-align: left; margin: 0; }
+
+/* Inline sign-in CTA inside the top banner, next to the error text. */
+.banner .gcloud-signin { display: inline-flex; margin-left: 10px; padding: 4px 12px; }
 
 /* ---------- narrow screens ---------- */
 

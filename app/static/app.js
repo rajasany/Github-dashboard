@@ -171,10 +171,29 @@ async function load({ refresh = false } = {}) {
   }
 }
 
+/* Session-scoped so a failed/cancelled sign-in doesn't bounce the tab back and
+ * forth forever — after one automatic trip to /auth/gcloud, later loads just
+ * show the banner with a manual retry link. */
+const GCLOUD_AUTH_ATTEMPTED_KEY = "gcloudAuthAttempted";
+
 function onDataLoaded() {
   const { errors, rate_limit: rl } = state.data;
+  const authError = errors.find((e) => e.code === "gcloud_auth_required");
 
-  if (errors.length) {
+  if (authError && !sessionStorage.getItem(GCLOUD_AUTH_ATTEMPTED_KEY)) {
+    sessionStorage.setItem(GCLOUD_AUTH_ATTEMPTED_KEY, "1");
+    window.location.href = "/auth/gcloud";
+    return;
+  }
+  if (!authError) sessionStorage.removeItem(GCLOUD_AUTH_ATTEMPTED_KEY);
+
+  if (authError) {
+    showBanner(
+      `<strong>Google Cloud sign-in needed.</strong> ${escapeHtml(authError.error)}` +
+        `<a class="btn primary gcloud-signin" href="/auth/gcloud">Sign in with Google Cloud</a>`,
+      true
+    );
+  } else if (errors.length) {
     const items = errors.map((e) => `<li><code>${e.repo}</code> — ${e.error}</li>`).join("");
     showBanner(`<strong>${errors.length} source(s) could not be read:</strong><ul>${items}</ul>`, true);
   } else if (state.noToken) {

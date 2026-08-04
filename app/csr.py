@@ -34,7 +34,13 @@ TOKEN_TTL = 45 * 60  # gcloud access tokens last ~60 min; refresh early.
 
 
 class CsrError(Exception):
-    pass
+    # Set on subclasses the UI needs to react to specifically, e.g. offering a
+    # sign-in link rather than just printing the message. None means "generic".
+    code: str | None = None
+
+
+class GcloudAuthRequired(CsrError):
+    code = "gcloud_auth_required"
 
 
 class TokenProvider:
@@ -69,11 +75,30 @@ class TokenProvider:
             if proc.returncode != 0:
                 detail = (err or b"").decode().strip().splitlines()
                 hint = detail[-1] if detail else "unknown error"
-                raise CsrError(f"Could not get a gcloud access token — run `gcloud auth login`. ({hint})")
+                raise GcloudAuthRequired(f"Not signed in to Google Cloud. ({hint})")
 
             self._token = out.decode().strip()
             self._fetched_at = time.monotonic()
             return self._token
+
+    async def is_authenticated(self) -> bool:
+        """Cheap local check — reads gcloud's credential store, no network call."""
+        if self.settings.gcloud_token:
+            return True
+        gcloud = shutil.which("gcloud")
+        if not gcloud:
+            return False
+        proc = await asyncio.create_subprocess_exec(
+            gcloud,
+            "auth",
+            "list",
+            "--filter=status:ACTIVE",
+            "--format=value(account)",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await proc.communicate()
+        return proc.returncode == 0 and bool(out.decode().strip())
 
 
 class GitMirror:
@@ -273,7 +298,7 @@ async def collect_repo(
             branches_total=0,
             branches_shown=0,
             private=True,
-            errors=[{"repo": repo.name, "error": str(exc)}],
+            errors=[{"repo": repo.name, "error": str(exc), "code": exc.code}],
         )
 
     errors: list[dict[str, str]] = []
@@ -296,7 +321,7 @@ async def collect_repo(
                 path, name, since, commits_per_branch, with_files=settings.folders_enabled
             )
         except CsrError as exc:
-            errors.append({"repo": f"{repo.name}@{name}", "error": str(exc)})
+            errors.append({"repo": f"{repo.name}@{name}", "error": str(exc), "code": exc.code})
             continue
         for entry in entries:
             commits.append(

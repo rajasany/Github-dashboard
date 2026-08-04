@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light" />
+  <title>Sign in with Google Cloud — Repo Change Dashboard</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="auth-screen">
+    <div class="auth-card">
+      <span class="dot"></span>
+      <h1 id="auth-title">Signing in to Google Cloud…</h1>
+      <p id="auth-hint" class="muted">
+        A browser window should have opened for Google sign-in. Complete it there — this page continues on its own once it's done.
+      </p>
+      <div id="auth-error" class="banner error hidden"></div>
+      <button id="auth-retry" class="btn primary hidden" type="button">Try again</button>
+      <a class="btn ghost" href="/">Back to dashboard</a>
+    </div>
+  </div>
+  <script src="/static/gcloud-auth.js"></script>
+</body>
+</html>
