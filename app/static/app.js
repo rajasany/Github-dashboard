@@ -408,7 +408,7 @@ function renderStats(commits) {
     ["Repositories", `${repos.size} / ${state.data.repos.length}`],
     ["Active branches", branches.size],
     ["Contributors", authors.size],
-    ["Not on default", offDefault],
+    ["Not on default branch", offDefault],
   ];
 
   if (state.data.folders?.enabled) {
@@ -419,8 +419,12 @@ function renderStats(commits) {
     tiles.splice(3, 0, ["Services touched", services.size]);
   }
 
+  // The first tile is the pane's hero figure — exactly one per view.
   el.stats.innerHTML = tiles
-    .map(([label, value]) => `<div class="stat"><div class="value">${value}</div><div class="label">${label}</div></div>`)
+    .map(
+      ([label, value], i) =>
+        `<div class="stat${i === 0 ? " hero" : ""}"><div class="value">${escapeHtml(String(value))}</div><div class="label">${escapeHtml(label)}</div></div>`
+    )
     .join("");
 }
 
@@ -541,9 +545,36 @@ function render() {
 
   el.feed.innerHTML = "";
   if (!commits.length) {
-    el.feed.innerHTML = '<p class="muted pad">No commits match the current filters.</p>';
+    const anyData = state.data.commits.length > 0;
+    el.feed.appendChild(
+      stateNode(
+        anyData ? "No commits match" : "No commits in this window",
+        anyData
+          ? "Widen the selection on the left, clear the search box, or reset the selection."
+          : "Nothing was committed in the selected period. Try a longer window from the menu above."
+      )
+    );
     return;
   }
+
+  // Group headers carry a name and a count in separate spans so the count can sit
+  // flush right and the name can ellipsis without eating it.
+  const addHead = (name, count) => {
+    const head = document.createElement("div");
+    head.className = "group-head";
+    head.title = name;
+
+    const label = document.createElement("span");
+    label.className = "group-name";
+    label.textContent = name;
+
+    const num = document.createElement("span");
+    num.className = "group-count";
+    num.textContent = `${count} commit${count === 1 ? "" : "s"}`;
+
+    head.append(label, num);
+    el.feed.appendChild(head);
+  };
 
   // Folder grouping is one-to-many: a commit touching three services is listed
   // under each of them. The other modes are one-to-one, so they stream in order.
@@ -561,10 +592,7 @@ function render() {
     );
     for (const [key, group] of ordered) {
       const { repoKey, folder } = splitFolderKey(key);
-      const head = document.createElement("div");
-      head.className = "group-head";
-      head.textContent = `${repoNameOf(repoKey)} / ${folder} — ${group.length} commit${group.length === 1 ? "" : "s"}`;
-      el.feed.appendChild(head);
+      addHead(state.repo ? folder : `${repoNameOf(repoKey)} / ${folder}`, group.length);
       for (const c of group) el.feed.appendChild(commitNode(c));
     }
     return;
@@ -572,21 +600,32 @@ function render() {
 
   const groupKey =
     el.groupBy.value === "repo"
-      ? (c) => `${PROVIDER_LABEL[c.provider] || c.provider} · ${c.repo}`
+      ? (c) => c.repo
       : (c) => dayLabel(c.date);
-  let current = null;
 
+  // Count each group up front so its header can show a total.
+  const counts = new Map();
+  for (const c of commits) counts.set(groupKey(c), (counts.get(groupKey(c)) || 0) + 1);
+
+  let current = null;
   for (const c of commits) {
     const key = groupKey(c);
     if (key !== current) {
       current = key;
-      const head = document.createElement("div");
-      head.className = "group-head";
-      head.textContent = key;
-      el.feed.appendChild(head);
+      addHead(key, counts.get(key));
     }
     el.feed.appendChild(commitNode(c));
   }
+}
+
+function stateNode(title, hint) {
+  const box = document.createElement("div");
+  box.className = "state";
+  box.innerHTML = `
+    ${ICON.search}
+    <p class="state-title">${escapeHtml(title)}</p>
+    <p class="state-hint">${escapeHtml(hint)}</p>`;
+  return box;
 }
 
 /* ---------- wiring ---------- */
