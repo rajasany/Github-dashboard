@@ -1,0 +1,72 @@
+# Copy to config.yaml and list the repositories to track.
+
+# --- GitHub (github.com) -----------------------------------------------------
+# Each entry is "owner/repo". You need read access to each with your token.
+repos:
+  - octocat/Hello-World
+
+# --- Google Cloud Source Repositories ---------------------------------------
+# CSR has no REST API for branches or commit history, so these are read from a
+# local bare mirror clone that is fetched on each refresh. Requires `gcloud`
+# on PATH and a one-time `gcloud auth login`.
+gcloud:
+  # Default project for bare repo names below.
+  project: my-gcp-project
+  repos:
+    - my-repo
+    # Or name the project explicitly per repo:
+    # - project: other-project
+    #   repo: services/api
+    # A pasted clone URL also works:
+    # - https://source.developers.google.com/p/my-gcp-project/r/my-repo
+
+# --- Shared settings --------------------------------------------------------
+# Defaults applied when the UI does not override them.
+defaults:
+  # How far back to look for commits.
+  days: 14
+  # Max commits fetched per branch (one API page for GitHub).
+  commits_per_branch: 30
+
+# Folder-level (per-microservice) tracking: attributes each commit to the
+# folder(s) whose files it changed.
+folders:
+  # Turn off to skip file-list lookups entirely (see cost note below).
+  enabled: true
+  # How many leading path segments name a service. 1 => top-level folder, so
+  # "auth/main.py" -> "auth". Use 2 for a "services/auth/..." layout, or better,
+  # use `paths` below.
+  depth: 1
+  # Optional globs for when services sit under a shared prefix. With
+  # "services/*", the path "services/auth/main.py" is attributed to
+  # "services/auth" instead of the useless shared parent "services".
+  # Paths matching no glob fall back to `depth`.
+  paths: []
+  #  - services/*
+  #  - apps/*
+  #  - packages/*
+  # Folders that aren't services. Matches a whole folder or any of its segments,
+  # so "__pycache__" also drops "api/__pycache__".
+  exclude:
+    - __pycache__
+    - node_modules
+    - .github
+    - .venv
+
+# Folder-tracking cost: GitHub's list-commits endpoint carries no file list, so
+# this needs one extra API call per commit. Those results are immutable and are
+# cached permanently in .cache/commit-files.sqlite3, so it is a one-time cost per
+# commit, not per refresh. CSR pays nothing — git log returns files for free.
+
+# Cost note: GitHub costs roughly (2 + branch count) API calls per repo per
+# refresh; authenticated github.com allows 5000/hour and responses are cached
+# for CACHE_TTL_SECONDS. CSR costs one `git fetch` per repo per refresh
+# regardless of branch count, and skips branches with no recent commits.
+
+# Optional: only show branches matching these glob patterns (empty = all branches).
+# Applies to both providers. Example: ["main", "release/*", "feature/*"]
+branch_include: []
+
+# Optional: always hide branches matching these glob patterns.
+branch_exclude:
+  - dependabot/*
