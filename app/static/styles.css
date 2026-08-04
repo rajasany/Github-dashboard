@@ -131,6 +131,10 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
   gap: 14px;
   position: sticky;
   top: calc(var(--topbar-h) + 20px);
+  /* Bounded so the sidebar scrolls on its own once its panels outgrow the
+     viewport, instead of relying on the page/main-canvas scroll. */
+  max-height: calc(100vh - var(--topbar-h) - 40px);
+  overflow-y: auto;
 }
 
 .panel {
@@ -410,6 +414,11 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
 .chip.source { border-color: transparent; font-weight: 600; font-family: inherit; }
 .chip.source.github { background: var(--surface-2); color: var(--text); }
 .chip.source.csr { background: #e8f0fe; color: #1558d6; }
+
+/* Quality-signal badges — same red/amber pairing as the error banner and the
+   folder chip's amber, so severity reads consistently across the page. */
+.chip.revert { border-color: transparent; font-weight: 600; font-family: inherit; background: #fdecec; color: #8a1c1c; }
+.chip.churn { border-color: transparent; font-weight: 600; font-family: inherit; background: #fff4e0; color: var(--amber); }
 
 /* ---------- expandable full message ---------- */
 

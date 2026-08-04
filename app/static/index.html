@@ -46,18 +46,18 @@
         <div id="repo-filters" class="optlist scroll" role="listbox" aria-label="Repository"></div>
       </section>
 
-      <section class="panel" id="folder-panel">
-        <h2>Service / folder</h2>
-        <p id="folder-scope" class="scope-note"></p>
-        <input id="folder-search" class="input" type="search" placeholder="Filter folders…" />
-        <div id="folder-filters" class="optlist scroll" role="listbox" aria-label="Service or folder"></div>
-      </section>
-
       <section class="panel">
         <h2>Branch</h2>
         <p id="branch-scope" class="scope-note"></p>
         <input id="branch-search" class="input" type="search" placeholder="Filter branches…" />
         <div id="branch-filters" class="optlist scroll" role="listbox" aria-label="Branch"></div>
+      </section>
+
+      <section class="panel" id="folder-panel">
+        <h2>Service / folder</h2>
+        <p id="folder-scope" class="scope-note"></p>
+        <input id="folder-search" class="input" type="search" placeholder="Filter folders…" />
+        <div id="folder-filters" class="optlist scroll" role="listbox" aria-label="Service or folder"></div>
       </section>
 
       <section class="panel">
@@ -72,6 +72,8 @@
           <select id="scope-commits">
             <option value="all">All commits</option>
             <option value="off-default">Only commits not on the default branch</option>
+            <option value="reverts">Only reverts</option>
+            <option value="churn">Only rapid re-touches (same folder, 24h)</option>
           </select>
         </label>
         <label class="field block">

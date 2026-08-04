@@ -21,6 +21,10 @@ const ICON = {
     '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m16.5 16.5 4 4"/></svg>',
 };
 
+// A folder touched by two commits within this window reads as active rework
+// rather than two unrelated changes landing on the same area by chance.
+const CHURN_WINDOW_HOURS = 24;
+
 const el = {
   topbar: $("topbar"),
   days: $("days"),
@@ -61,6 +65,40 @@ const state = {
 /** Folders a commit touched, with an explicit bucket when we have no data. */
 function foldersOf(c) {
   return c.folders && c.folders.length ? c.folders : [NO_FOLDER];
+}
+
+/* A commit reads as a revert when GitHub's own revert button named it that way
+ * ("Revert "..."" title, or a "This reverts commit <sha>" line in the body) or
+ * the author used the conventional-commit "revert:" prefix by hand. */
+function isRevert(c) {
+  return /^revert\b/i.test(c.title) || /this reverts commit/i.test(c.body || "");
+}
+
+/* Flags commits whose folder was touched again shortly after (or before) —
+ * a cheap proxy for an area under active rework rather than a one-off change.
+ * Computed once over the full loaded window so it doesn't shift as sidebar
+ * filters narrow the visible set. */
+function annotateChurn(commits) {
+  const byFolder = new Map();
+  for (const c of commits) {
+    c._churn = false;
+    for (const f of foldersOf(c)) {
+      if (f === NO_FOLDER) continue; // "no folder data" isn't a real, shared area
+      const key = `${c.repo_key}${FOLDER_SEP}${f}`;
+      if (!byFolder.has(key)) byFolder.set(key, []);
+      byFolder.get(key).push(c);
+    }
+  }
+  const windowMs = CHURN_WINDOW_HOURS * 3600 * 1000;
+  for (const list of byFolder.values()) {
+    const sorted = [...list].sort((a, b) => new Date(a.date) - new Date(b.date));
+    for (let i = 1; i < sorted.length; i++) {
+      if (new Date(sorted[i].date) - new Date(sorted[i - 1].date) <= windowMs) {
+        sorted[i]._churn = true;
+        sorted[i - 1]._churn = true;
+      }
+    }
+  }
 }
 
 /* ---------- helpers ---------- */
@@ -146,6 +184,9 @@ function onDataLoaded() {
   }
 
   el.rate.textContent = rl.remaining != null ? `GitHub API ${rl.remaining}/${rl.limit}` : "";
+
+  for (const c of state.data.commits) c.is_revert = isRevert(c);
+  annotateChurn(state.data.commits);
 
   // A refresh can retire options the user had selected.
   pruneSelections();
@@ -286,14 +327,14 @@ function folderLabel(key) {
 
 /* Selections drill down in this order. A list's options are computed from the
  * commits matching every selection *above* it, so choosing a repository is what
- * scopes the folder and branch lists to that repository. */
-const STAGE = { PROVIDER: 1, REPO: 2, FOLDER: 3, BRANCH: 4, AUTHOR: 5 };
+ * scopes the branch list, and choosing a branch further scopes the folder list. */
+const STAGE = { PROVIDER: 1, REPO: 2, BRANCH: 3, FOLDER: 4, AUTHOR: 5 };
 
 function passesUpTo(c, stage) {
   if (stage > STAGE.PROVIDER && state.provider && c.provider !== state.provider) return false;
   if (stage > STAGE.REPO && state.repo && c.repo_key !== state.repo) return false;
-  if (stage > STAGE.FOLDER && state.folder && !folderKeysOf(c).includes(state.folder)) return false;
   if (stage > STAGE.BRANCH && state.branch && !c.branches.includes(state.branch)) return false;
+  if (stage > STAGE.FOLDER && state.folder && !folderKeysOf(c).includes(state.folder)) return false;
   if (stage > STAGE.AUTHOR && state.author && c.author_name !== state.author) return false;
   return true;
 }
@@ -311,11 +352,11 @@ function pruneSelections() {
   const repoOpts = tally((c) => [c.repo_key], scopedTo(STAGE.REPO));
   if (state.repo && !repoOpts.has(state.repo)) state.repo = null;
 
-  const folderOpts = tally(folderKeysOf, scopedTo(STAGE.FOLDER));
-  if (state.folder && !folderOpts.has(state.folder)) state.folder = null;
-
   const branchOpts = tally((c) => c.branches, scopedTo(STAGE.BRANCH));
   if (state.branch && !branchOpts.has(state.branch)) state.branch = null;
+
+  const folderOpts = tally(folderKeysOf, scopedTo(STAGE.FOLDER));
+  if (state.folder && !folderOpts.has(state.folder)) state.folder = null;
 
   const authorOpts = tally((c) => [c.author_name], scopedTo(STAGE.AUTHOR));
   if (state.author && !authorOpts.has(state.author)) state.author = null;
@@ -347,15 +388,29 @@ function buildFilters() {
     allLabel: "All repositories",
     allCount: repoScope.length,
     label: repoNameOf,
+    // The owner/org prefix is redundant in a list scoped to one dashboard's repos.
+    rowLabel: repoShortName,
   });
 
-  // Folders and branches are shown for whichever repository is selected.
-  const scopeNote = state.repo
-    ? `in ${repoNameOf(state.repo)}`
+  // Branches are shown for whichever repository is selected.
+  el.branchScope.textContent = state.repo
+    ? `in ${repoShortName(state.repo)}`
     : "across all repositories — select one above to narrow";
-  el.folderScope.textContent = scopeNote;
-  el.branchScope.textContent = scopeNote;
+  const branchScope = scopedTo(STAGE.BRANCH);
+  optlist(el.branchFilters, tally((c) => c.branches, branchScope), {
+    active: state.branch,
+    onSelect: (k) => select("branch", k),
+    allLabel: "All branches",
+    allCount: branchScope.length,
+    search: el.branchSearch.value,
+  });
 
+  // Folders/services are scoped by repository and, once picked, by branch too.
+  el.folderScope.textContent = state.repo
+    ? state.branch
+      ? `in ${repoShortName(state.repo)} on ${state.branch}`
+      : `in ${repoShortName(state.repo)}`
+    : "across all repositories — select one above to narrow";
   el.folderPanel.classList.toggle("hidden", !state.data.folders?.enabled);
   const folderScope = scopedTo(STAGE.FOLDER);
   optlist(el.folderFilters, tally(folderKeysOf, folderScope), {
@@ -368,16 +423,7 @@ function buildFilters() {
     // With a repo selected the header is redundant; otherwise group by repo so
     // same-named folders in different repos stay visibly distinct.
     rowLabel: (key) => splitFolderKey(key).folder,
-    group: state.repo ? null : (key) => repoNameOf(splitFolderKey(key).repoKey),
-  });
-
-  const branchScope = scopedTo(STAGE.BRANCH);
-  optlist(el.branchFilters, tally((c) => c.branches, branchScope), {
-    active: state.branch,
-    onSelect: (k) => select("branch", k),
-    allLabel: "All branches",
-    allCount: branchScope.length,
-    search: el.branchSearch.value,
+    group: state.repo ? null : (key) => repoShortName(splitFolderKey(key).repoKey),
   });
 
   const authorScope = scopedTo(STAGE.AUTHOR);
@@ -391,13 +437,15 @@ function buildFilters() {
 
 function visibleCommits() {
   const query = el.search.value.trim().toLowerCase();
-  const offDefaultOnly = el.scopeCommits.value === "off-default";
+  const scopeMode = el.scopeCommits.value; // "all" | "off-default" | "reverts" | "churn"
 
   return state.data.commits.filter((c) => {
     if (state.provider && c.provider !== state.provider) return false;
     if (state.repo && c.repo_key !== state.repo) return false;
     if (state.author && c.author_name !== state.author) return false;
-    if (offDefaultOnly && c.on_default) return false;
+    if (scopeMode === "off-default" && c.on_default) return false;
+    if (scopeMode === "reverts" && !c.is_revert) return false;
+    if (scopeMode === "churn" && !c._churn) return false;
 
     // A selected branch narrows the chips to that branch; otherwise show them all.
     const branches = state.branch
@@ -438,6 +486,7 @@ function renderStats(commits) {
     ["Active branches", branches.size],
     ["Contributors", authors.size],
     ["Not on default branch", offDefault],
+    ["Reverts", commits.filter((c) => c.is_revert).length],
   ];
 
   if (state.data.folders?.enabled) {
@@ -446,6 +495,7 @@ function renderStats(commits) {
       commits.flatMap((c) => c._visibleFolderKeys).filter((k) => splitFolderKey(k).folder !== NO_FOLDER)
     );
     tiles.splice(3, 0, ["Services touched", services.size]);
+    tiles.push([`Rapid re-touches (${CHURN_WINDOW_HOURS}h)`, commits.filter((c) => c._churn).length]);
   }
 
   // The first tile is the pane's hero figure — exactly one per view.
@@ -483,6 +533,13 @@ function commitNode(c) {
     state.data.providers.length > 1
       ? `<span class="chip source ${c.provider}">${escapeHtml(PROVIDER_LABEL[c.provider] || c.provider)}</span>`
       : "";
+
+  const revertBadge = c.is_revert
+    ? `<span class="chip revert" title="Commit message indicates this reverts a prior change">Revert</span>`
+    : "";
+  const churnBadge = c._churn
+    ? `<span class="chip churn" title="Another commit touched the same folder within ${CHURN_WINDOW_HOURS}h">Rework</span>`
+    : "";
 
   const defaultBranch = defaultBranchOf(c.repo_key);
   const branchChips = c._visibleBranches
@@ -525,6 +582,8 @@ function commitNode(c) {
         <span class="sep">·</span>
         <span class="repo-name">${escapeHtml(c.repo)}</span>
         ${sourceBadge}
+        ${revertBadge}
+        ${churnBadge}
       </div>
       <div class="chips">${folderChips}${branchChips}</div>
       ${body}
