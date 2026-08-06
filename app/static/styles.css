@@ -588,3 +588,68 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
   }
   .avatar { grid-row: 1; }
 }
+
+/* ---------- date range control ---------- */
+
+.daterange {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 4px 10px 4px 4px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+}
+.daterange .field { gap: 5px; }
+.daterange input[type="date"] {
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 5px 7px;
+  /* Native pickers size themselves oddly across browsers; pin a stable width. */
+  min-width: 132px;
+}
+.daterange input[type="date"]:hover { border-color: #c3cbd4; }
+.daterange input[type="date"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+/* Empty "To" reads as "today" rather than as a blank the user forgot to fill. */
+.daterange input[type="date"]:not(:focus):invalid,
+.daterange input[type="date"][value=""] { color: var(--muted); }
+
+.btn.tiny {
+  padding: 4px 9px;
+  font-size: 12px;
+  border-radius: 7px;
+  white-space: nowrap;
+}
+
+/* ---------- export controls ---------- */
+
+.export {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.export-label {
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* The one line that states exactly what the feed — and any export — contains. */
+.scope-line {
+  margin: -6px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.scope-line:empty { display: none; }

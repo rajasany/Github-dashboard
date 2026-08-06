@@ -74,7 +74,9 @@ Consequences worth knowing:
   message / author / SHA / folder, and a "Show" menu to isolate commits not yet on the
   default branch.
 - **Grouping** — by day (default), by repository, or by service/folder.
-- **Lookback window** — 24 hours to 90 days (API accepts up to 365).
+- **Date range** — pick a period preset or type explicit From / To dates. Leaving
+  **To** empty means "everything after this date, through to now".
+- **Reports** — export exactly what is on screen as a PDF or as PowerPoint slides.
 - **Rate-limit readout** for GitHub in the header.
 - Per-repo failures are reported in a banner without taking the rest of the feed down.
 
@@ -150,7 +152,8 @@ a `+` on the file count and may under-report folders.
 | Endpoint | Description |
 | --- | --- |
 | `GET /api/config` | Tracked repos, providers, and defaults, for the UI to bootstrap. |
-| `GET /api/feed?days=14&key=github:owner/repo&refresh=false` | The merged feed. `key` may repeat; values are `github:owner/repo` or `csr:project/repo`. |
+| `GET /api/feed?since=2026-07-01&until=2026-08-05&key=…&refresh=false` | The merged feed. `since`/`until` are UTC calendar dates; `until` is inclusive and may be omitted for "through to now". `days=N` still works as a lookback when `since` is absent. `key` may repeat; values are `github:owner/repo` or `csr:project/repo`. |
+| `POST /api/report` | `{format: "pdf"\|"pptx", criteria: {…}, commits: [...]}` → the document as a file download. |
 | `GET /api/health` | Liveness + configured repo counts per provider. |
 
 ## Layout
@@ -162,6 +165,7 @@ a `+` on the file count and may under-report folders.
 | [app/csr.py](app/csr.py) | gcloud token handling, git mirror, CSR collection. |
 | [app/paths.py](app/paths.py) | Changed paths → owning folder/service. |
 | [app/store.py](app/store.py) | SQLite cache of commit → file paths. |
+| [app/report.py](app/report.py) | Rollup + PDF and PowerPoint generation. |
 | [app/feed.py](app/feed.py) | Merges providers, dedupes by `(repo, sha)`, derives folders. |
 | [app/main.py](app/main.py) | Routes. |
 | [app/static/](app/static/) | The single-page UI. |
@@ -188,6 +192,50 @@ the current scope, and the active path is echoed next to the search box
 Selections that stop making sense are dropped automatically: switching from a repo where
 you'd selected `backend` to one without it clears the service, while a branch like `main`
 that exists in both is kept.
+
+## Date range
+
+The top bar carries a **Period** preset plus explicit **From** and **To** dates.
+
+- Presets (last 24 hours / 7 / 14 / 30 / 90 days / 12 months, this month) fill the two
+  date boxes. Typing in either box switches the preset to *Custom* on its own.
+- **Leaving `To` empty means "through to now"** — that is the "everything after a
+  certain date" case, and it keeps working tomorrow without being edited.
+  The **To today** button clears it again.
+- `To` is **inclusive of the whole day named**. Picking `To = 5 Aug` includes commits
+  made at 23:00 on 5 August, which the naive midnight reading would silently drop.
+- Both dates are UTC calendar dates. Filtering happens at the source — GitHub's API
+  `since`/`until` params and `git log --since/--until` — so commits outside the range
+  are never fetched, and a narrow range is genuinely cheaper.
+
+`days=N` still works on the API as a lookback when `since` is absent, and is counted
+back from `until` when that is given.
+
+## Reports
+
+**Report → PDF / Slides**, next to the result count. The document contains exactly the
+rows on screen: the browser posts the commits it is displaying along with the criteria
+that produced them, so there is no second copy of the filter logic on the server that
+could drift out of step with the UI.
+
+Both formats carry the same material:
+
+| Section | Contents |
+| --- | --- |
+| Cover | Title, date range, and every filter that is set (source, repository, service, branch, author, "showing", search text, grouping) |
+| Summary | Commits, repositories, services, branches, contributors, not-on-default, files changed |
+| By repository | Commits, services touched, contributors, files |
+| By service / folder | Commits, contributors, files — scoped `repository / folder`, so a `backend` in two repos stays two rows |
+| By contributor | Commits, repositories, services, files |
+| By day *(PDF)* | Commit counts per day |
+| Commit detail | Date, repository, service, branch, author, SHA, files, message |
+
+Every figure is derived from the posted commit list inside `app/report.py`, so the
+report and the dashboard cannot disagree. Downloads are named
+`repo-changes_<scope>_<from>_to_<to>.pdf`.
+
+Above 400 commits the detail table is cut and the report **says so** on the page —
+the totals and breakdowns still cover every commit.
 
 ## Reading the commit feed
 
@@ -234,7 +282,8 @@ other rule hard-codes a colour.
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_paths.py   # changed paths -> owning folder      (16 checks)
+.venv/bin/python tests/test_paths.py    # changed paths -> owning folder     (16 checks)
+.venv/bin/python tests/test_report.py   # date window + report rollup        (46 checks)
 node tests/ui_cascade.test.js          # selection, rendering, escaping      (39 checks)
 ```
 

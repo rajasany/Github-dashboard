@@ -118,12 +118,12 @@ class GitHubClient:
         return branches
 
     async def list_commits(
-        self, full_name: str, branch: str, since: str, per_page: int
+        self, full_name: str, branch: str, since: str, until: str | None, per_page: int
     ) -> list[dict[str, Any]]:
-        data = await self._get(
-            f"/repos/{full_name}/commits",
-            {"sha": branch, "since": since, "per_page": per_page},
-        )
+        params: dict[str, Any] = {"sha": branch, "since": since, "per_page": per_page}
+        if until:
+            params["until"] = until
+        data = await self._get(f"/repos/{full_name}/commits", params)
         return data if isinstance(data, list) else []
 
     async def get_commit_files(self, full_name: str, sha: str) -> tuple[list[str], bool]:
@@ -164,6 +164,7 @@ async def collect_repo(
     client: GitHubClient,
     full_name: str,
     since: str,
+    until: str | None,
     commits_per_branch: int,
 ) -> RepoResult:
     """Fetch one GitHub repo's branches and their recent commits."""
@@ -209,7 +210,7 @@ async def collect_repo(
     async def fetch(branch_name: str) -> tuple[str, list[dict[str, Any]]]:
         try:
             return branch_name, await client.list_commits(
-                full_name, branch_name, since, commits_per_branch
+                full_name, branch_name, since, until, commits_per_branch
             )
         except GitHubError as exc:
             errors.append({"repo": f"{full_name}@{branch_name}", "error": exc.message})

@@ -92,7 +92,8 @@ async def build_feed(
     *,
     github_repos: list[str],
     csr_repos: list,
-    days: int,
+    since_dt: datetime,
+    until_dt: datetime | None,
     commits_per_branch: int,
 ) -> dict[str, Any]:
     """Fan out across every provider, then fold into one feed.
@@ -100,15 +101,22 @@ async def build_feed(
     A commit reachable from several branches appears once, tagged with every
     branch it was found on — otherwise the default branch would duplicate every
     feature branch merged into it.
+
+    The window is [since_dt, until_dt]; `until_dt` of None means "up to now".
+    Both providers filter server-side — GitHub via the API's since/until params,
+    CSR via `git log --since/--until` — so nothing outside the range is fetched.
     """
-    since_dt = (datetime.now(timezone.utc) - timedelta(days=days)).replace(microsecond=0)
+    since_dt = since_dt.replace(microsecond=0)
     since = since_dt.isoformat()
+    until = until_dt.replace(microsecond=0).isoformat() if until_dt else None
 
     tasks = [
-        github_provider.collect_repo(gh_client, name, since, commits_per_branch)
+        github_provider.collect_repo(gh_client, name, since, until, commits_per_branch)
         for name in github_repos
     ] + [
-        csr_provider.collect_repo(mirror, repo, since, since_dt, commits_per_branch, settings)
+        csr_provider.collect_repo(
+            mirror, repo, since, since_dt, until, commits_per_branch, settings
+        )
         for repo in csr_repos
     ]
 
@@ -166,10 +174,18 @@ async def build_feed(
         )
         meta["folders"] = touched
 
+    span_days = max(1, round(((until_dt or datetime.now(timezone.utc)) - since_dt).total_seconds() / 86400))
+
+    # Totals the UI and the report both lead with, computed once here so the two
+    # can never disagree about what the same filter selected.
+    files_changed = sum(int(c.get("files_changed") or 0) for c in feed)
+
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "since": since,
-        "window_days": days,
+        "until": until,
+        "window_days": span_days,
+        "files_changed": files_changed,
         "repos": sorted(repo_meta, key=lambda r: (r["provider"], r["full_name"])),
         "commits": feed,
         "errors": errors,

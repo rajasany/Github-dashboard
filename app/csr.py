@@ -204,7 +204,13 @@ class GitMirror:
         return out
 
     async def log(
-        self, path: Path, branch: str, since: str, limit: int, with_files: bool
+        self,
+        path: Path,
+        branch: str,
+        since: str,
+        until: str | None,
+        limit: int,
+        with_files: bool,
     ) -> list[dict[str, Any]]:
         args = [
             "-C",
@@ -215,6 +221,8 @@ class GitMirror:
             f"--format={_LOG_FORMAT}",
             f"refs/heads/{branch}",
         ]
+        if until:
+            args.insert(-1, f"--until={until}")
         if with_files:
             # --diff-merges=first-parent makes merge commits report a file list,
             # matching what the GitHub API returns for a merge.
@@ -282,6 +290,7 @@ async def collect_repo(
     repo: CsrRepo,
     since: str,
     since_dt: datetime,
+    until: str | None,
     commits_per_branch: int,
     settings: Settings,
 ) -> RepoResult:
@@ -318,7 +327,7 @@ async def collect_repo(
     for name, _tip in recent:
         try:
             entries = await mirror.log(
-                path, name, since, commits_per_branch, with_files=settings.folders_enabled
+                path, name, since, until, commits_per_branch, with_files=settings.folders_enabled
             )
         except CsrError as exc:
             errors.append({"repo": f"{repo.name}@{name}", "error": str(exc), "code": exc.code})

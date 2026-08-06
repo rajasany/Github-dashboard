@@ -21,6 +21,9 @@ function makeEl(tag) {
     className: "",
     offsetHeight: 57,
     children: [],
+    // A real <select> exposes these; selectedText() reads them.
+    options: [],
+    selectedIndex: 0,
     // Assigning innerHTML replaces an element's content, so it must drop any
     // children the stub is tracking — `feed.innerHTML = ""` relies on that.
     _html: "",
@@ -100,7 +103,7 @@ vm.runInContext(
   `globalThis.__api = { state, tally, folderKeysOf, splitFolderKey, repoNameOf,
      scopedTo, STAGE, FOLDER_SEP, visibleCommits, renderStats, folderLabel,
      buildFilters, foldersOf, select, pruneSelections, commitNode, render,
-     escapeAttr, escapeHtml };`,
+     escapeAttr, escapeHtml, applyPreset, isoDay, rangeLabel, currentCriteria };`,
   context
 );
 const api = context.__api;
@@ -174,8 +177,22 @@ const authorOpts = () =>
   [...api.tally((c) => [c.author_name], api.scopedTo(api.STAGE.AUTHOR)).keys()].sort();
 const shas = () => api.visibleCommits().map((c) => c.sha);
 
+// Give the two <select>s the options the real markup declares, so the criteria
+// carried into a report read as words rather than as raw values.
+els.get("scope-commits").options = [
+  { value: "all", text: "All commits" },
+  { value: "off-default", text: "Only commits not on the default branch" },
+];
+els.get("group-by").options = [
+  { value: "day", text: "Day" },
+  { value: "repo", text: "Repository" },
+  { value: "folder", text: "Service / folder" },
+];
+
 function reset() {
   S.provider = S.repo = S.folder = S.branch = S.author = null;
+  els.get("scope-commits").selectedIndex = 0;
+  els.get("group-by").selectedIndex = 0;
   els.get("search").value = "";
   els.get("scope-commits").value = "all";
   els.get("folder-search").value = "";
@@ -365,6 +382,64 @@ const heads = els.get("feed").children.filter((c) => c.className === "group-head
 check("headers were rendered", heads.length > 0, true);
 check("each header holds a name span and a count span", heads.every((h) => h.children.length === 2), true);
 check("the count reads as commits", /commit/.test(heads[0].children[1].textContent), true);
+
+console.log("\n=== 17. date range presets ===");
+const from = els.get("date-from");
+const to = els.get("date-to");
+const todayIso = api.isoDay(new Date());
+
+api.applyPreset("7");
+check("a 7-day preset leaves the end open (stays correct tomorrow)", to.value, "");
+const days7 = Math.round((new Date(todayIso) - new Date(from.value)) / 86400000);
+check("'last 7 days' spans 7 days inclusive of today", days7, 6);
+
+api.applyPreset("1");
+check("'last 24 hours' starts today", from.value, todayIso);
+
+api.applyPreset("30");
+check("'last 30 days' steps back 29 whole days", Math.round((new Date(todayIso) - new Date(from.value)) / 86400000), 29);
+
+api.applyPreset("mtd");
+check("'this month' starts on the 1st", from.value.slice(-2), "01");
+check("'this month' is in the current month", from.value.slice(0, 7), todayIso.slice(0, 7));
+
+from.value = "2026-03-05";
+to.value = "2026-04-06";
+api.applyPreset("custom");
+check("'custom' does not overwrite hand-typed dates", [from.value, to.value], ["2026-03-05", "2026-04-06"]);
+
+check("isoDay is timezone-stable (no UTC off-by-one)", api.isoDay(new Date(2026, 0, 1, 0, 30)), "2026-01-01");
+check("isoDay handles late-evening local times", api.isoDay(new Date(2026, 0, 1, 23, 30)), "2026-01-01");
+
+console.log("\n=== 18. range label ===");
+from.value = "2026-03-05";
+to.value = "";
+check("open-ended range reads 'to today'", /today/.test(api.rangeLabel()), true);
+to.value = "2026-04-06";
+check("closed range shows both ends", /–/.test(api.rangeLabel()), true);
+from.value = "";
+check("no start date yields no label", api.rangeLabel(), "");
+
+console.log("\n=== 19. export criteria mirror the active filters ===");
+reset();
+from.value = "2026-05-01";
+to.value = "2026-06-01";
+S.repo = SHOP;
+S.folder = fkey(SHOP, "backend");
+S.branch = "main";
+S.author = "alice";
+els.get("search").value = "fix";
+const crit = api.currentCriteria();
+check("since / until carried through", [crit.since, crit.until], ["2026-05-01", "2026-06-01"]);
+check("repository named in full", crit.repository, "acme/shop");
+check("service is the folder name", crit.service, "backend");
+check("branch and author carried", [crit.branch, crit.author], ["main", "alice"]);
+check("search text carried", crit.search, "fix");
+check("generated_at is an ISO timestamp", /^\d{4}-\d{2}-\d{2}T/.test(crit.generated_at), true);
+
+reset();
+const bare = api.currentCriteria();
+check("unset filters are null, not empty strings", [bare.repository, bare.service, bare.branch, bare.author, bare.search], [null, null, null, null, null]);
 
 console.log(allOk ? "\nALL PASS" : "\nSOME FAILURES");
 process.exit(allOk ? 0 : 1);

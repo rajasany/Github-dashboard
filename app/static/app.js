@@ -27,7 +27,13 @@ const CHURN_WINDOW_HOURS = 24;
 
 const el = {
   topbar: $("topbar"),
-  days: $("days"),
+  preset: $("preset"),
+  dateFrom: $("date-from"),
+  dateTo: $("date-to"),
+  dateClear: $("date-clear"),
+  exportPdf: $("export-pdf"),
+  exportPptx: $("export-pptx"),
+  scopeLine: $("scope-line"),
   refresh: $("refresh"),
   rate: $("rate"),
   banner: $("banner"),
@@ -144,13 +150,60 @@ function hideBanner() {
   el.banner.innerHTML = "";
 }
 
+/* ---------- date range ---------- */
+
+/** YYYY-MM-DD in the viewer's own timezone, which is what a date input expects. */
+function isoDay(d) {
+  const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 10);
+}
+
+/** Fill the From/To inputs from a preset. "custom" leaves them alone. */
+function applyPreset(preset) {
+  if (preset === "custom") return;
+  const today = new Date();
+
+  if (preset === "mtd") {
+    el.dateFrom.value = isoDay(new Date(today.getFullYear(), today.getMonth(), 1));
+    el.dateTo.value = "";
+    return;
+  }
+
+  const days = Number(preset) || 14;
+  const from = new Date(today);
+  // "Last 7 days" should include today, so step back 6 whole days, not 7.
+  from.setDate(from.getDate() - (days - 1));
+  el.dateFrom.value = isoDay(from);
+  // Left blank on purpose: the range runs through to now, and stays correct
+  // tomorrow without the user having to touch it.
+  el.dateTo.value = "";
+}
+
+function rangeLabel() {
+  const from = el.dateFrom.value;
+  const to = el.dateTo.value;
+  const pretty = (iso) =>
+    new Date(`${iso}T00:00:00`).toLocaleDateString(undefined, {
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+    });
+  if (!from) return "";
+  return to ? `${pretty(from)} – ${pretty(to)}` : `${pretty(from)} – today`;
+}
+
 /* ---------- data ---------- */
 
 async function load({ refresh = false } = {}) {
   el.refresh.disabled = true;
   el.refresh.textContent = "Loading…";
   try {
-    const params = new URLSearchParams({ days: el.days.value });
+    const params = new URLSearchParams();
+    // `from` is required; an empty `to` deliberately means "through to now",
+    // which is what "everything after this date" needs.
+    if (el.dateFrom.value) params.set("since", el.dateFrom.value);
+    if (el.dateTo.value) params.set("until", el.dateTo.value);
+    if (!el.dateFrom.value) params.set("days", "14");
     if (refresh) params.set("refresh", "true");
     const res = await fetch(`/api/feed?${params}`);
     const body = await res.json();
@@ -499,11 +552,14 @@ function renderStats(commits) {
   const repos = new Set(commits.map((c) => c.repo_key));
   const offDefault = commits.filter((c) => !c.on_default).length;
 
+  const filesChanged = commits.reduce((sum, c) => sum + (c.files_changed || 0), 0);
+
   const tiles = [
     ["Commits", commits.length],
     ["Repositories", `${repos.size} / ${state.data.repos.length}`],
     ["Active branches", branches.size],
     ["Contributors", authors.size],
+    ["Files changed", filesChanged.toLocaleString()],
     ["Not on default branch", offDefault],
     ["Reverts", commits.filter((c) => c.is_revert).length],
   ];
@@ -638,17 +694,21 @@ function render() {
 
   renderStats(commits);
 
-  // Spell out the active drill-down so the current scope is never ambiguous.
+  el.resultCount.textContent = `${commits.length} commit${commits.length === 1 ? "" : "s"}`;
+
+  // Spell out the full scope in one line, so what you are looking at — and what
+  // an exported report will contain — is never ambiguous.
   const crumbs = [
+    rangeLabel(),
     state.provider && (PROVIDER_LABEL[state.provider] || state.provider),
     state.repo && repoNameOf(state.repo),
     state.folder && splitFolderKey(state.folder).folder,
-    state.branch,
+    state.branch && `branch ${state.branch}`,
     state.author,
+    el.scopeCommits.value !== "all" && selectedText(el.scopeCommits),
+    el.search.value.trim() && `“${el.search.value.trim()}”`,
   ].filter(Boolean);
-  el.resultCount.textContent =
-    `${commits.length} commit${commits.length === 1 ? "" : "s"} · last ${state.data.window_days}d` +
-    (crumbs.length ? ` · ${crumbs.join(" › ")}` : "");
+  el.scopeLine.textContent = crumbs.join("  ›  ");
 
   el.feed.innerHTML = "";
   if (!commits.length) {
@@ -735,6 +795,101 @@ function stateNode(title, hint) {
   return box;
 }
 
+/* ---------- report export ---------- */
+
+function selectedText(select) {
+  return select.options[select.selectedIndex]?.text || "";
+}
+
+/** The filters in force, in words — this becomes the report's cover page. */
+function currentCriteria() {
+  return {
+    since: el.dateFrom.value || (state.data?.since || "").slice(0, 10),
+    until: el.dateTo.value || null,
+    range: rangeLabel(),
+    source: state.provider ? PROVIDER_LABEL[state.provider] || state.provider : null,
+    repository: state.repo ? repoNameOf(state.repo) : null,
+    service: state.folder ? folderLabel(state.folder) : null,
+    branch: state.branch || null,
+    author: state.author || null,
+    show: selectedText(el.scopeCommits),
+    search: el.search.value.trim() || null,
+    grouped_by: selectedText(el.groupBy),
+    generated_at: new Date().toISOString(),
+  };
+}
+
+/* The rows on screen are posted with the request, so the document is exactly
+ * what you are looking at — the server never re-runs the filters. */
+async function exportReport(format) {
+  const button = format === "pdf" ? el.exportPdf : el.exportPptx;
+  const original = button.textContent;
+  const commits = visibleCommits();
+
+  if (!commits.length) {
+    showBanner("<strong>Nothing to export.</strong> The current filter matches no commits.", true);
+    return;
+  }
+
+  button.disabled = true;
+  button.textContent = "Building…";
+  try {
+    const res = await fetch("/api/report", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        format,
+        criteria: currentCriteria(),
+        commits: commits.map((c) => ({
+          date: c.date,
+          repo: c.repo,
+          provider: c.provider,
+          sha: c.sha,
+          title: c.title,
+          author_name: c.author_name,
+          // Send what is *visible*, so a narrowed service or branch selection is
+          // reflected in the document rather than the commit's full membership.
+          branches: c._visibleBranches || c.branches,
+          folders: c._visibleFolders || c.folders,
+          files_changed: c.files_changed,
+          on_default: c.on_default,
+          url: c.url,
+        })),
+      }),
+    });
+
+    if (!res.ok) {
+      let detail = res.statusText;
+      try {
+        detail = (await res.json()).detail || detail;
+      } catch {
+        /* non-JSON error body */
+      }
+      showBanner(`<strong>Report failed.</strong> ${detail}`, true);
+      return;
+    }
+
+    const blob = await res.blob();
+    const name =
+      res.headers.get("Content-Disposition")?.match(/filename="([^"]+)"/)?.[1] ||
+      `repo-changes.${format}`;
+
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    showBanner(`<strong>Report failed.</strong> ${err.message}`, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
 /* ---------- wiring ---------- */
 
 /* The sticky group headers must sit exactly below the topbar. The topbar's height
@@ -747,7 +902,24 @@ window.addEventListener("resize", syncTopbarHeight);
 syncTopbarHeight();
 
 el.refresh.addEventListener("click", () => load({ refresh: true }));
-el.days.addEventListener("change", () => load());
+el.preset.addEventListener("change", () => {
+  applyPreset(el.preset.value);
+  load();
+});
+// Editing either date by hand is what "custom" means — no need to pick it first.
+for (const input of [el.dateFrom, el.dateTo]) {
+  input.addEventListener("change", () => {
+    el.preset.value = "custom";
+    load();
+  });
+}
+el.dateClear.addEventListener("click", () => {
+  el.dateTo.value = "";
+  el.preset.value = "custom";
+  load();
+});
+el.exportPdf.addEventListener("click", () => exportReport("pdf"));
+el.exportPptx.addEventListener("click", () => exportReport("pptx"));
 el.search.addEventListener("input", render);
 el.branchSearch.addEventListener("input", buildFilters);
 el.folderSearch.addEventListener("input", buildFilters);
@@ -770,7 +942,10 @@ el.reset.addEventListener("click", () => {
 
 (async function init() {
   const cfg = await fetch("/api/config").then((r) => r.json());
-  el.days.value = String(cfg.defaults.days);
+  // Seed the range from the configured default lookback.
+  const seed = String(cfg.defaults.days);
+  el.preset.value = [...el.preset.options].some((o) => o.value === seed) ? seed : "custom";
+  applyPreset(el.preset.value === "custom" ? cfg.defaults.days : el.preset.value);
 
   if (!cfg.configured) {
     showBanner("<strong>Setup needed.</strong> Copy <code>config.example.yaml</code> to <code>config.yaml</code> and list your repositories, then restart.", true);

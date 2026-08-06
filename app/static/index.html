@@ -16,17 +16,30 @@
       <h1>Repo Change Dashboard</h1>
     </div>
     <div class="topbar-controls">
-      <label class="field">
-        <span>Window</span>
-        <select id="days">
-          <option value="1">24 hours</option>
-          <option value="3">3 days</option>
-          <option value="7">7 days</option>
-          <option value="14">14 days</option>
-          <option value="30">30 days</option>
-          <option value="90">90 days</option>
-        </select>
-      </label>
+      <div class="daterange" role="group" aria-label="Date range">
+        <label class="field">
+          <span>Period</span>
+          <select id="preset">
+            <option value="1">Last 24 hours</option>
+            <option value="7">Last 7 days</option>
+            <option value="14">Last 14 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="90">Last 90 days</option>
+            <option value="365">Last 12 months</option>
+            <option value="mtd">This month</option>
+            <option value="custom">Custom…</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>From</span>
+          <input type="date" id="date-from" aria-label="Commits on or after this date" />
+        </label>
+        <label class="field">
+          <span>To</span>
+          <input type="date" id="date-to" placeholder="today" aria-label="Commits up to and including this date" />
+        </label>
+        <button id="date-clear" class="btn tiny" title="Clear the end date to run through to today">To&nbsp;today</button>
+      </div>
       <button id="refresh" class="btn primary">Refresh</button>
       <span id="rate" class="rate" title="GitHub API requests remaining this hour"></span>
     </div>
@@ -93,7 +106,13 @@
       <div class="feed-head">
         <input id="search" class="input grow" type="search" placeholder="Search commit message, author, or SHA…" />
         <span id="result-count" class="muted"></span>
+        <div class="export" role="group" aria-label="Export report">
+          <span class="export-label">Report</span>
+          <button id="export-pdf" class="btn tiny" title="Download a PDF of exactly what is on screen">PDF</button>
+          <button id="export-pptx" class="btn tiny" title="Download PowerPoint slides of exactly what is on screen">Slides</button>
+        </div>
       </div>
+      <p id="scope-line" class="scope-line"></p>
       <div id="feed" class="feed">
         <div class="state"><p class="state-title">Loading…</p><p class="state-hint">Reading commits from the configured repositories.</p></div>
       </div>

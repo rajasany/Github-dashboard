@@ -3,3 +3,7 @@ uvicorn[standard]>=0.52
 httpx>=0.28
 pyyaml>=6.0
 python-dotenv>=1.2
+
+# Report generation (/api/report)
+reportlab>=4.0        # PDF
+python-pptx>=1.0      # PowerPoint

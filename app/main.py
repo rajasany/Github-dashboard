@@ -5,12 +5,16 @@ from __future__ import annotations
 import asyncio
 import shutil
 from contextlib import asynccontextmanager
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, field_validator
 
+from . import report
 from .config import load_settings
 from .csr import GitMirror
 from .feed import build_feed
@@ -95,9 +99,45 @@ async def get_config() -> dict:
     }
 
 
+def _resolve_window(days: int | None, since: str | None, until: str | None) -> tuple[datetime, datetime | None]:
+    """Turn the request's date arguments into a concrete [since, until] window.
+
+    `since`/`until` are calendar dates (YYYY-MM-DD) interpreted in UTC. `until`
+    is inclusive of the whole day named, which is what a person picking "to 5 Aug"
+    means — the naive reading would silently drop that day's commits.
+    """
+    now = datetime.now(timezone.utc)
+
+    until_dt: datetime | None = None
+    if until:
+        try:
+            day = date.fromisoformat(until)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="`until` must be a date, e.g. 2026-08-05.")
+        until_dt = datetime.combine(day, time.max, tzinfo=timezone.utc)
+
+    if since:
+        try:
+            day = date.fromisoformat(since)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="`since` must be a date, e.g. 2026-07-01.")
+        since_dt = datetime.combine(day, time.min, tzinfo=timezone.utc)
+    else:
+        # No explicit start: fall back to a lookback counted from the window's end.
+        span = days or settings.days
+        since_dt = (until_dt or now) - timedelta(days=span)
+
+    if until_dt and until_dt < since_dt:
+        raise HTTPException(status_code=422, detail="`until` is before `since`.")
+
+    return since_dt, until_dt
+
+
 @app.get("/api/feed")
 async def get_feed(
-    days: int = Query(default=None, ge=1, le=365),
+    days: int = Query(default=None, ge=1, le=3650, description="Lookback in days; ignored when `since` is given."),
+    since: str = Query(default=None, description="Start date, YYYY-MM-DD (UTC). Overrides `days`."),
+    until: str = Query(default=None, description="End date, YYYY-MM-DD (UTC), inclusive. Defaults to now."),
     commits_per_branch: int = Query(default=None, ge=1, le=100),
     key: list[str] | None = Query(
         default=None, description="Restrict to these repo keys, e.g. github:owner/repo or csr:project/repo"
@@ -122,6 +162,8 @@ async def get_feed(
     github_repos = [r for r in settings.repos if wanted is None or f"github:{r}" in wanted]
     csr_repos = [r for r in settings.csr_repos if wanted is None or r.key in wanted]
 
+    since_dt, until_dt = _resolve_window(days, since, until)
+
     if refresh:
         gh_client.cache.clear()
 
@@ -133,11 +175,62 @@ async def get_feed(
             store,
             github_repos=github_repos,
             csr_repos=csr_repos,
-            days=days or settings.days,
+            since_dt=since_dt,
+            until_dt=until_dt,
             commits_per_branch=commits_per_branch or settings.commits_per_branch,
         )
     except GitHubError as exc:
         raise HTTPException(status_code=exc.status or 502, detail=exc.message) from exc
+
+
+class ReportRequest(BaseModel):
+    """What the browser sends to have its current view turned into a document.
+
+    The commits travel with the request rather than being re-queried, so the
+    report is exactly the rows on screen — there is no second copy of the filter
+    logic on the server that could drift out of step with the UI.
+    """
+
+    format: Literal["pdf", "pptx"]
+    criteria: dict[str, Any] = Field(default_factory=dict)
+    commits: list[dict[str, Any]] = Field(default_factory=list)
+
+    @field_validator("commits")
+    @classmethod
+    def _bounded(cls, value: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if len(value) > 20000:
+            raise ValueError("Too many commits for one report; narrow the date range.")
+        return value
+
+
+@app.post("/api/report")
+async def create_report(request: ReportRequest) -> Response:
+    if not request.commits:
+        raise HTTPException(
+            status_code=400,
+            detail="Nothing to report — the current filter matches no commits.",
+        )
+
+    roll = report.aggregate(request.commits, request.criteria)
+
+    if request.format == "pdf":
+        payload = await asyncio.to_thread(report.build_pdf, roll)
+        media = "application/pdf"
+        extension = "pdf"
+    else:
+        payload = await asyncio.to_thread(report.build_pptx, roll)
+        media = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        extension = "pptx"
+
+    name = report.report_filename(request.criteria, extension)
+    return Response(
+        content=payload,
+        media_type=media,
+        headers={
+            "Content-Disposition": f'attachment; filename="{name}"',
+            "Content-Length": str(len(payload)),
+        },
+    )
 
 
 @app.get("/auth/gcloud", include_in_schema=False)
