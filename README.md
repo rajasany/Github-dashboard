@@ -74,6 +74,8 @@ Consequences worth knowing:
   message / author / SHA / folder, and a "Show" menu to isolate commits not yet on the
   default branch.
 - **Grouping** — by day (default), by repository, or by service/folder.
+- **Branch comparison** — pick a base and a head and see what one has that the other
+  does not, measured from their merge base.
 - **Date range** — pick a period preset or type explicit From / To dates. Leaving
   **To** empty means "everything after this date, through to now".
 - **Reports** — export exactly what is on screen as a PDF or as PowerPoint slides.
@@ -153,6 +155,8 @@ a `+` on the file count and may under-report folders.
 | --- | --- |
 | `GET /api/config` | Tracked repos, providers, and defaults, for the UI to bootstrap. |
 | `GET /api/feed?since=2026-07-01&until=2026-08-05&key=…&refresh=false` | The merged feed. `since`/`until` are UTC calendar dates; `until` is inclusive and may be omitted for "through to now". `days=N` still works as a lookback when `since` is absent. `key` may repeat; values are `github:owner/repo` or `csr:project/repo`. |
+| `GET /api/branches?key=github:owner/repo` | Every branch of one repository, for the compare pickers. |
+| `GET /api/compare?key=…&base=main&head=feature/x` | Three-dot comparison: commits, changed files, ahead/behind, merge base. |
 | `POST /api/report` | `{format: "pdf"\|"pptx", criteria: {…}, commits: [...]}` → the document as a file download. |
 | `GET /api/health` | Liveness + configured repo counts per provider. |
 
@@ -166,6 +170,7 @@ a `+` on the file count and may under-report folders.
 | [app/paths.py](app/paths.py) | Changed paths → owning folder/service. |
 | [app/store.py](app/store.py) | SQLite cache of commit → file paths. |
 | [app/report.py](app/report.py) | Rollup + PDF and PowerPoint generation. |
+| [app/compare.py](app/compare.py) | Branch comparison for both providers. |
 | [app/feed.py](app/feed.py) | Merges providers, dedupes by `(repo, sha)`, derives folders. |
 | [app/main.py](app/main.py) | Routes. |
 | [app/static/](app/static/) | The single-page UI. |
@@ -210,6 +215,41 @@ The top bar carries a **Period** preset plus explicit **From** and **To** dates.
 
 `days=N` still works on the API as a lookback when `since` is absent, and is counted
 back from `until` when that is given.
+
+## Comparing two branches
+
+Select a repository, then use **Compare branches** in the sidebar: pick a **Base**
+(what you already have) and a **Head** (what you might bring in) and press **Compare**.
+The pane switches from the feed to a comparison; **Back to feed** returns.
+
+**The comparison is three-dot** — the diff is measured from the two branches' **merge
+base**, not from the tip of `base`. This matters: if `base` has moved on independently,
+a two-dot diff would report *its* commits as reversed changes on `head`, which is the
+classic way branch comparisons mislead. The merge base is shown in the subtitle so you
+can see what it was measured against.
+
+What you get:
+
+- A status word — **ahead / behind / diverged / identical** — plus commits ahead and
+  behind, so a branch that is both ahead *and* stale is not mistaken for simply ahead.
+- Files changed, lines added and removed, and services touched.
+- The changed-file table, sorted added → modified → removed, with per-file line counts.
+- The commits that `head` has and `base` does not, rendered as normal feed rows with
+  their service and branch chips.
+- **⇅ Swap direction** re-runs the comparison the other way, which is what you want when
+  a branch turns out to be behind rather than ahead.
+
+Both providers answer it natively:
+
+| | GitHub | Cloud Source Repositories |
+| --- | --- | --- |
+| Counts | `compare` API `ahead_by` / `behind_by` | `git rev-list --left-right --count base...head` |
+| Commits | `compare` API (capped at 250) | `git log base..head` (uncapped) |
+| Diff | `compare` API `files` (capped at 300) | `git diff --numstat base...head` |
+
+Caps are reported in the UI rather than silently truncating. Folder attribution for
+GitHub comparisons reuses the feed's permanent commit-file cache, so commits already
+seen in the feed cost no extra API calls.
 
 ## Reports
 
@@ -284,6 +324,7 @@ other rule hard-codes a colour.
 ```bash
 .venv/bin/python tests/test_paths.py    # changed paths -> owning folder     (16 checks)
 .venv/bin/python tests/test_report.py   # date window + report rollup        (46 checks)
+.venv/bin/python tests/test_compare.py  # branch comparison, real git repo   (25 checks)
 node tests/ui_cascade.test.js          # selection, rendering, escaping      (39 checks)
 ```
 

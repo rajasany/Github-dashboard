@@ -653,3 +653,109 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
   color: var(--muted);
 }
 .scope-line:empty { display: none; }
+
+/* ---------- branch comparison ---------- */
+
+#compare-panel.dimmed .compare-controls { opacity: 0.5; pointer-events: none; }
+.compare-controls { display: flex; flex-direction: column; gap: 2px; }
+.compare-controls .compare-go { width: 100%; margin-top: 6px; }
+.compare-controls .compare-swap { width: 100%; margin-top: 6px; }
+
+.compare-view { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+
+.compare-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 14px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.compare-title { min-width: 0; }
+.compare-title h2 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  font-family: var(--mono);
+}
+.compare-title p { margin: 4px 0 0; font-size: 12px; line-height: 1.5; }
+.compare-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; flex-wrap: wrap; }
+
+/* State reads from a word as well as a colour, never colour alone. */
+.status-badge {
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  background: var(--surface-2);
+  color: var(--muted);
+}
+.status-badge.is-ahead { background: var(--accent-soft); color: var(--accent-ink); }
+.status-badge.is-behind { background: #fff4e0; color: #8a5300; }
+.status-badge.is-diverged { background: #fdecec; color: #8a1c1c; }
+.status-badge.is-identical { background: var(--surface-2); color: var(--muted); }
+
+.compare-section { margin-top: 4px; }
+.compare-section h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: -0.005em;
+}
+.compare-section .note { font-size: 12px; margin: 8px 0 0; }
+.compare-section .chips { margin-top: 0; }
+
+/* Wide diffs scroll inside their own box; the page never scrolls sideways. */
+.table-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.file-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.file-table th {
+  position: sticky;
+  top: var(--topbar-h);
+  z-index: 1;
+  text-align: left;
+  padding: 8px 12px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 650;
+  color: var(--muted);
+}
+.file-table td { padding: 7px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.file-table tr:last-child td { border-bottom: none; }
+.file-table tr:hover td { background: var(--surface-2); }
+.file-table .file-path { font-family: var(--mono); font-size: 11.5px; overflow-wrap: anywhere; }
+.file-table .num {
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.file-table .add { color: var(--green); }
+.file-table .del { color: #a3323b; }
+
+.file-status {
+  display: inline-block;
+  min-width: 68px;
+  padding: 1px 8px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+  background: var(--surface-2);
+  color: var(--muted);
+}
+.file-status.is-added { background: #e6f6ed; color: #14683e; }
+.file-status.is-removed { background: #fdecec; color: #8a1c1c; }
+.file-status.is-renamed { background: #eef1fd; color: #34449b; }

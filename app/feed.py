@@ -14,26 +14,19 @@ from .paths import derive_folders
 from .store import FileStore
 
 
-async def _enrich_github_paths(
-    settings: Settings,
+async def _resolve_paths(
     gh_client: github_provider.GitHubClient,
     store: FileStore,
-    results: list[RepoResult],
-) -> dict[str, Any]:
-    """Attach changed-file paths to GitHub commits, using the disk cache first.
+    targets: dict[str, tuple[str, str]],
+) -> tuple[dict[str, dict], dict[str, Any]]:
+    """Look up each commit's changed-file list: disk cache first, API for the rest.
 
-    GitHub's list-commits endpoint has no file list, so this costs one API call
-    per commit — but only per commit *ever*, since the store is permanent.
+    GitHub's list-commits and compare endpoints both omit file lists, so this
+    costs one API call per commit — but only per commit *ever*, since the store
+    is permanent and a commit's files never change.
     """
-    targets: dict[str, tuple[str, str]] = {}  # store key -> (repo full name, sha)
-    for result in results:
-        if result.provider != "github":
-            continue
-        for commit in result.commits:
-            targets[f"{result.key}@{commit['sha']}"] = (result.name, commit["sha"])
-
     if not targets:
-        return {"requested": 0, "from_cache": 0, "fetched": 0, "failed": 0}
+        return {}, {"requested": 0, "from_cache": 0, "fetched": 0, "failed": 0}
 
     cached = await store.get_many(list(targets))
     missing = {k: v for k, v in targets.items() if k not in cached}
@@ -65,23 +58,75 @@ async def _enrich_github_paths(
             ]
         )
 
-    resolved = {**cached, **fetched}
-    for result in results:
-        if result.provider != "github":
-            continue
-        for commit in result.commits:
-            hit = resolved.get(f"{result.key}@{commit['sha']}")
-            if hit:
-                commit["paths"] = hit["paths"]
-                commit["files_changed"] = hit.get("files_changed", len(hit["paths"]))
-                commit["files_truncated"] = bool(hit.get("truncated"))
-
-    return {
+    return {**cached, **fetched}, {
         "requested": len(targets),
         "from_cache": len(cached),
         "fetched": len(fetched),
         "failed": failed,
     }
+
+
+def _apply_paths(commit: dict[str, Any], hit: dict | None) -> None:
+    if not hit:
+        return
+    commit["paths"] = hit["paths"]
+    commit["files_changed"] = hit.get("files_changed", len(hit["paths"]))
+    commit["files_truncated"] = bool(hit.get("truncated"))
+
+
+async def _enrich_github_paths(
+    settings: Settings,
+    gh_client: github_provider.GitHubClient,
+    store: FileStore,
+    results: list[RepoResult],
+) -> dict[str, Any]:
+    """Attach changed-file paths to the GitHub commits inside a feed fan-out."""
+    targets: dict[str, tuple[str, str]] = {}  # store key -> (repo full name, sha)
+    for result in results:
+        if result.provider != "github":
+            continue
+        for commit in result.commits:
+            targets[f"{result.key}@{commit['sha']}"] = (result.name, commit["sha"])
+
+    resolved, stats = await _resolve_paths(gh_client, store, targets)
+
+    for result in results:
+        if result.provider != "github":
+            continue
+        for commit in result.commits:
+            _apply_paths(commit, resolved.get(f"{result.key}@{commit['sha']}"))
+
+    return stats
+
+
+async def enrich_commit_folders(
+    settings: Settings,
+    gh_client: github_provider.GitHubClient,
+    store: FileStore,
+    commits: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Fill `folders` and `files_changed` on a bare list of GitHub commits.
+
+    Used by branch comparison, where commits arrive from the compare API rather
+    than from a per-repo fan-out. Shares the feed's cache, so a commit already
+    seen in the feed costs nothing here.
+    """
+    targets = {
+        f"{c['repo_key']}@{c['sha']}": (c["repo_key"].split(":", 1)[1], c["sha"])
+        for c in commits
+        if c.get("provider") == "github" and c.get("sha")
+    }
+    resolved, stats = await _resolve_paths(gh_client, store, targets)
+
+    for commit in commits:
+        _apply_paths(commit, resolved.get(f"{commit['repo_key']}@{commit['sha']}"))
+        commit["folders"] = derive_folders(
+            commit.pop("paths", None) or [],
+            settings.folder_depth,
+            settings.folder_paths,
+            settings.folder_exclude,
+        )
+    return stats
 
 
 async def build_feed(

@@ -14,10 +14,10 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from . import report
+from . import compare, report
 from .config import load_settings
 from .csr import GitMirror
-from .feed import build_feed
+from .feed import build_feed, enrich_commit_folders
 from .github import GitHubClient, GitHubError
 from .store import FileStore
 
@@ -181,6 +181,68 @@ async def get_feed(
         )
     except GitHubError as exc:
         raise HTTPException(status_code=exc.status or 502, detail=exc.message) from exc
+
+
+@app.get("/api/branches")
+async def get_branches(key: str = Query(description="Repo key, e.g. github:owner/repo")) -> dict:
+    """All branches of one repository, for the comparison pickers."""
+    assert gh_client is not None and mirror is not None
+    if key not in set(settings.all_keys()):
+        raise HTTPException(status_code=400, detail=f"Unknown repository: {key}")
+    try:
+        return await compare.list_branches(settings, gh_client, mirror, key)
+    except compare.CompareError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/compare")
+async def get_compare(
+    key: str = Query(description="Repo key, e.g. github:owner/repo"),
+    base: str = Query(description="Branch to compare against"),
+    head: str = Query(description="Branch whose extra work you want to see"),
+) -> dict:
+    """What `head` has that `base` does not, measured from their merge base."""
+    assert gh_client is not None and mirror is not None and store is not None
+
+    if key not in set(settings.all_keys()):
+        raise HTTPException(status_code=400, detail=f"Unknown repository: {key}")
+    if base == head:
+        raise HTTPException(status_code=400, detail="Pick two different branches to compare.")
+
+    try:
+        if key.startswith("github:"):
+            result = await compare.compare_github(
+                gh_client, key.split(":", 1)[1], base, head, settings
+            )
+            # GitHub's compare payload carries no per-commit file list, so folder
+            # attribution needs the same permanently-cached lookup the feed uses.
+            if settings.folders_enabled and result["commits"]:
+                await enrich_commit_folders(settings, gh_client, store, result["commits"])
+        else:
+            repo = next(r for r in settings.csr_repos if r.key == key)
+            result = await compare.compare_csr(mirror, repo, base, head, settings)
+    except compare.CompareError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    default_branch = None
+    try:
+        default_branch = (await compare.list_branches(settings, gh_client, mirror, key)).get(
+            "default_branch"
+        )
+    except compare.CompareError:
+        pass
+
+    # These commits are on `head` and absent from `base`, so they are "on the
+    # default branch" precisely when `head` is it. Without this the field is
+    # missing and every downstream consumer reads it as False — which would make
+    # a report of the default branch claim none of its commits had landed.
+    on_default = bool(default_branch) and head == default_branch
+    for commit in result["commits"]:
+        commit["on_default"] = on_default
+
+    result["default_branch"] = default_branch
+    result["generated_at"] = datetime.now(timezone.utc).isoformat()
+    return result
 
 
 class ReportRequest(BaseModel):

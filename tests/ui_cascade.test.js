@@ -12,13 +12,13 @@ const vm = require("vm");
 const path = require("path");
 
 function makeEl(tag) {
-  return {
+  const el = {
     tag,
     type: "",
     value: "",
     disabled: false,
     title: "",
-    className: "",
+    href: "",
     offsetHeight: 57,
     children: [],
     // A real <select> exposes these; selectedText() reads them.
@@ -47,7 +47,6 @@ function makeEl(tag) {
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;");
     },
-    classList: { toggle() {}, add() {}, remove() {} },
     setAttribute() {},
     addEventListener(kind, fn) {
       if (kind === "click") this.onClick = fn;
@@ -63,6 +62,28 @@ function makeEl(tag) {
       this.children.push(...c);
     },
   };
+
+  // A real classList, backed by a set that stays in sync with className —
+  // the compare view toggles `hidden` through it and the tests read it back.
+  const classes = new Set();
+  Object.defineProperty(el, "className", {
+    get: () => [...classes].join(" "),
+    set: (v) => {
+      classes.clear();
+      String(v || "")
+        .split(/\s+/)
+        .filter(Boolean)
+        .forEach((c) => classes.add(c));
+    },
+  });
+  el.classList = {
+    add: (...c) => c.forEach((x) => classes.add(x)),
+    remove: (...c) => c.forEach((x) => classes.delete(x)),
+    toggle: (c, on) => ((on === undefined ? !classes.has(c) : on) ? classes.add(c) : classes.delete(c)),
+    has: (c) => classes.has(c),
+    contains: (c) => classes.has(c),
+  };
+  return el;
 }
 
 const els = new Map();
@@ -103,7 +124,8 @@ vm.runInContext(
   `globalThis.__api = { state, tally, folderKeysOf, splitFolderKey, repoNameOf,
      scopedTo, STAGE, FOLDER_SEP, visibleCommits, renderStats, folderLabel,
      buildFilters, foldersOf, select, pruneSelections, commitNode, render,
-     escapeAttr, escapeHtml, applyPreset, isoDay, rangeLabel, currentCriteria };`,
+     escapeAttr, escapeHtml, applyPreset, isoDay, rangeLabel, currentCriteria,
+     renderCompare, compareCriteria, exitCompare };`,
   context
 );
 const api = context.__api;
@@ -440,6 +462,102 @@ check("generated_at is an ISO timestamp", /^\d{4}-\d{2}-\d{2}T/.test(crit.genera
 reset();
 const bare = api.currentCriteria();
 check("unset filters are null, not empty strings", [bare.repository, bare.service, bare.branch, bare.author, bare.search], [null, null, null, null, null]);
+
+console.log("\n=== 20. branch comparison view ===");
+reset();
+
+function walk(node, out = []) {
+  for (const c of node.children || []) {
+    out.push(c);
+    walk(c, out);
+  }
+  return out;
+}
+
+const CMP = {
+  provider: "github",
+  repo_key: SHOP,
+  repo: "acme/shop",
+  base: "main",
+  head: "feature/x",
+  status: "diverged",
+  ahead_by: 2,
+  behind_by: 1,
+  total_commits: 2,
+  merge_base: "abcdef1234567890",
+  html_url: "https://example.test/compare",
+  folders: ["(repo root)", "backend", "web"],
+  files_changed: 3,
+  additions: 40,
+  deletions: 5,
+  commits_truncated: 0,
+  files_truncated: 0,
+  files: [
+    { path: "z-last.txt", status: "modified", additions: 1, deletions: 1 },
+    { path: "web/new.ts", status: "added", additions: 30, deletions: 0 },
+    { path: "old.md", status: "removed", additions: 0, deletions: 4 },
+  ],
+  commits: [
+    { ...DATA.commits[0], repo_key: SHOP, branches: ["feature/x"], folders: ["backend"] },
+    { ...DATA.commits[2], repo_key: SHOP, branches: ["feature/x"], folders: ["web"] },
+  ],
+};
+
+S.compare = CMP;
+api.renderCompare();
+
+check("compare view shown, feed hidden", [
+  !els.get("compare-view").classList.has("hidden"),
+  els.get("feed-view").classList.has("hidden"),
+], [true, true]);
+check("heading names both branches", els.get("compare-heading").textContent, "main  ←  feature/x");
+check("subtitle explains the direction", /what “feature\/x” has that “main” does not/.test(els.get("compare-sub").textContent), true);
+check("subtitle names the merge base", /abcdef1/.test(els.get("compare-sub").textContent), true);
+check("status badge carries a word, not just colour", els.get("compare-status").textContent, "diverged");
+check("status badge is class-tagged", els.get("compare-status").className, "status-badge is-diverged");
+
+const kpi = els.get("compare-stats").innerHTML;
+check("ahead is the hero figure", /class="stat hero"><div class="value">2<\/div><div class="label">Commits ahead/.test(kpi), true);
+check("behind reported too", /<div class="value">1<\/div><div class="label">Commits behind/.test(kpi), true);
+check("line counts signed", /\+40/.test(kpi) && /−5/.test(kpi), true);
+check("(repo root) excluded from services touched", /<div class="value">2<\/div><div class="label">Services touched/.test(kpi), true);
+
+const nodes = walk(els.get("compare-body"));
+check("commit rows rendered", nodes.filter((n) => n.className === "commit").length, 2);
+// The walk already includes compare-body's direct children — concatenating both
+// would count every table twice.
+const bodyHtml = nodes.map((n) => n.innerHTML).join("");
+check("changed-file table present", /file-table/.test(bodyHtml), true);
+const order = [...bodyHtml.matchAll(/<td class="file-path">([^<]+)/g)].map((m) => m[1]);
+check("files sort added → modified → removed", order, ["web/new.ts", "z-last.txt", "old.md"]);
+
+console.log("\n=== 21. comparison edge states ===");
+S.compare = { ...CMP, status: "identical", ahead_by: 0, behind_by: 0, commits: [], files: [], folders: [] };
+api.renderCompare();
+check("identical branches explained, no tables", walk(els.get("compare-body")).some((n) => n.className === "state"), true);
+
+S.compare = { ...CMP, status: "behind", ahead_by: 0, behind_by: 3, commits: [], files: [] };
+api.renderCompare();
+const behindText = walk(els.get("compare-body")).map((n) => n.innerHTML).join("");
+check("behind-only state suggests swapping direction", /Swap the direction/.test(behindText), true);
+check("behind-only state names the count", /3 commits behind/.test(behindText), true);
+
+console.log("\n=== 22. export describes the comparison, not the date filter ===");
+S.compare = CMP;
+const cc = api.compareCriteria();
+check("comparison line is the headline criterion", cc.comparison, "main  ←  feature/x  ·  2 ahead, 1 behind");
+check("repository carried", cc.repository, "acme/shop");
+check("head branch carried", cc.branch, "feature/x");
+check("diff totals carried", cc.files, "3 changed, +40 / −5");
+check("merge base carried", cc.merge_base, "abcdef1");
+check("range says it is not a date range", /not a date range/.test(cc.range), true);
+
+api.exitCompare();
+check("exiting restores the feed", [
+  els.get("compare-view").classList.has("hidden"),
+  !els.get("feed-view").classList.has("hidden"),
+  S.compare,
+], [true, true, null]);
 
 console.log(allOk ? "\nALL PASS" : "\nSOME FAILURES");
 process.exit(allOk ? 0 : 1);

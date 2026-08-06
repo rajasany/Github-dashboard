@@ -125,6 +125,8 @@ def aggregate(commits: list[dict[str, Any]], criteria: dict[str, Any]) -> Rollup
 def _criteria_rows(criteria: dict[str, Any]) -> list[tuple[str, str]]:
     """Only the filters that are actually set, in drill-down order."""
     order = [
+        ("comparison", "Comparison"),
+        ("merge_base", "Merge base"),
         ("range", "Date range"),
         ("source", "Source"),
         ("repository", "Repository"),
@@ -132,6 +134,10 @@ def _criteria_rows(criteria: dict[str, Any]) -> list[tuple[str, str]]:
         ("branch", "Branch"),
         ("author", "Author"),
         ("show", "Showing"),
+        # Distinct files in the whole diff. The Summary's "Files changed" counts
+        # per-commit touches instead, so a file edited twice counts twice —
+        # different measures, hence different labels.
+        ("files", "Net diff vs base"),
         ("search", "Search"),
         ("grouped_by", "Grouped by"),
     ]
@@ -286,7 +292,7 @@ def build_pdf(roll: Rollup) -> bytes:
         table(
             [
                 ["Commits", "Repositories", "Services", "Branches", "Contributors",
-                 "Not on default", "Files changed"],
+                 "Not on default", "File changes"],
                 [str(s["commits"]), str(s["repositories"]), str(s["services"]),
                  str(s["branches"]), str(s["contributors"]), str(s["off_default"]),
                  str(s["files_changed"])],

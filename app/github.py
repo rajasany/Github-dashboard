@@ -126,6 +126,17 @@ class GitHubClient:
         data = await self._get(f"/repos/{full_name}/commits", params)
         return data if isinstance(data, list) else []
 
+    async def get_compare(self, full_name: str, base: str, head: str) -> dict[str, Any]:
+        """Three-dot comparison: what `head` has that `base` does not.
+
+        GitHub caps the embedded commit list at 250 and the file list at 300;
+        `total_commits` still reports the true figure so the UI can say so.
+        """
+        data = await self._get(
+            f"/repos/{full_name}/compare/{base}...{head}", {"per_page": 250}
+        )
+        return data if isinstance(data, dict) else {}
+
     async def get_commit_files(self, full_name: str, sha: str) -> tuple[list[str], bool]:
         """Changed paths for one commit.
 

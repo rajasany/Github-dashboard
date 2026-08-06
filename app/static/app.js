@@ -34,6 +34,23 @@ const el = {
   exportPdf: $("export-pdf"),
   exportPptx: $("export-pptx"),
   scopeLine: $("scope-line"),
+  feedView: $("feed-view"),
+  comparePanel: $("compare-panel"),
+  compareScope: $("compare-scope"),
+  compareBase: $("compare-base"),
+  compareHead: $("compare-head"),
+  compareRun: $("compare-run"),
+  compareSwap: $("compare-swap"),
+  compareView: $("compare-view"),
+  compareHeading: $("compare-heading"),
+  compareSub: $("compare-sub"),
+  compareStatus: $("compare-status"),
+  compareLink: $("compare-link"),
+  compareExit: $("compare-exit"),
+  compareExportPdf: $("compare-export-pdf"),
+  compareExportPptx: $("compare-export-pptx"),
+  compareStats: $("compare-stats"),
+  compareBody: $("compare-body"),
   refresh: $("refresh"),
   rate: $("rate"),
   banner: $("banner"),
@@ -66,6 +83,8 @@ const state = {
   folder: null,
   branch: null,
   author: null,
+  // Non-null puts the pane into branch-comparison mode instead of the feed.
+  compare: null,
 };
 
 /** Folders a commit touched, with an explicit bucket when we have no data. */
@@ -264,6 +283,7 @@ function onDataLoaded() {
   pruneSelections();
   buildFilters();
   render();
+  loadBranchesForCompare();
 }
 
 /* ---------- filters ---------- */
@@ -435,10 +455,17 @@ function pruneSelections() {
 }
 
 function select(dimension, key) {
+  const repoBefore = state.repo;
   state[dimension] = key;
   pruneSelections();
   buildFilters();
   render();
+  // The compare pickers list every branch of the selected repo, so they have to
+  // be refetched when that selection moves.
+  if (state.repo !== repoBefore) {
+    exitCompare();
+    loadBranchesForCompare();
+  }
 }
 
 function buildFilters() {
@@ -795,10 +822,259 @@ function stateNode(title, hint) {
   return box;
 }
 
+/* ---------- branch comparison ---------- */
+
+/* A comparison is always within one repository, and always three-dot: what
+ * `head` has that `base` does not, measured from their merge base. */
+
+const FILE_STATUS_ORDER = { added: 0, modified: 1, renamed: 2, copied: 3, changed: 4, removed: 5 };
+
+async function loadBranchesForCompare() {
+  const repoKey = state.repo;
+  el.comparePanel.classList.toggle("dimmed", !repoKey);
+
+  if (!repoKey) {
+    el.compareScope.textContent = "Select a single repository above to compare its branches.";
+    el.compareBase.innerHTML = "";
+    el.compareHead.innerHTML = "";
+    el.compareRun.disabled = true;
+    el.compareSwap.disabled = true;
+    return;
+  }
+
+  el.compareScope.textContent = `in ${repoNameOf(repoKey)}`;
+  el.compareRun.disabled = true;
+  el.compareBase.innerHTML = '<option>Loading…</option>';
+  el.compareHead.innerHTML = "";
+
+  try {
+    const res = await fetch(`/api/branches?key=${encodeURIComponent(repoKey)}`);
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.detail || res.statusText);
+
+    const names = body.branches || [];
+    if (names.length < 2) {
+      el.compareScope.textContent = `${repoNameOf(repoKey)} has only one branch — nothing to compare.`;
+      el.compareBase.innerHTML = "";
+      el.compareRun.disabled = true;
+      el.compareSwap.disabled = true;
+      return;
+    }
+
+    const options = names
+      .map((n) => `<option value="${escapeAttr(n)}">${escapeHtml(n)}</option>`)
+      .join("");
+    el.compareBase.innerHTML = options;
+    el.compareHead.innerHTML = options;
+
+    // Default to "what would merging X into the default branch bring?", which is
+    // the question people almost always mean.
+    const fallback = body.default_branch && names.includes(body.default_branch) ? body.default_branch : names[0];
+    el.compareBase.value = fallback;
+    el.compareHead.value = names.find((n) => n !== fallback) || names[0];
+    el.compareRun.disabled = false;
+    el.compareSwap.disabled = false;
+  } catch (err) {
+    el.compareScope.textContent = `Could not list branches: ${err.message}`;
+    el.compareBase.innerHTML = "";
+    el.compareHead.innerHTML = "";
+    el.compareRun.disabled = true;
+    el.compareSwap.disabled = true;
+  }
+}
+
+async function runCompare() {
+  const repoKey = state.repo;
+  const base = el.compareBase.value;
+  const head = el.compareHead.value;
+  if (!repoKey || !base || !head) return;
+
+  if (base === head) {
+    showBanner("<strong>Pick two different branches.</strong>", true);
+    return;
+  }
+
+  el.compareRun.disabled = true;
+  el.compareRun.textContent = "Comparing…";
+  try {
+    const params = new URLSearchParams({ key: repoKey, base, head });
+    const res = await fetch(`/api/compare?${params}`);
+    const body = await res.json();
+    if (!res.ok) {
+      showBanner(`<strong>Could not compare.</strong> ${body.detail || res.statusText}`, true);
+      return;
+    }
+    state.compare = body;
+    hideBanner();
+    renderCompare();
+  } catch (err) {
+    showBanner(`<strong>Could not compare.</strong> ${err.message}`, true);
+  } finally {
+    el.compareRun.disabled = false;
+    el.compareRun.textContent = "Compare";
+  }
+}
+
+function exitCompare() {
+  state.compare = null;
+  el.compareView.classList.add("hidden");
+  el.feedView.classList.remove("hidden");
+}
+
+function renderCompare() {
+  const c = state.compare;
+  if (!c) return;
+
+  el.feedView.classList.add("hidden");
+  el.compareView.classList.remove("hidden");
+
+  el.compareHeading.textContent = `${c.base}  ←  ${c.head}`;
+  el.compareSub.textContent =
+    `${c.repo} · what “${c.head}” has that “${c.base}” does not, measured from their merge base` +
+    (c.merge_base ? ` (${c.merge_base.slice(0, 7)})` : "");
+
+  el.compareStatus.textContent = c.status;
+  el.compareStatus.className = `status-badge is-${c.status}`;
+  el.compareLink.href = c.html_url || "#";
+  el.compareLink.classList.toggle("hidden", !c.html_url);
+
+  const tiles = [
+    ["Commits ahead", c.ahead_by],
+    ["Commits behind", c.behind_by],
+    ["Files changed", c.files_changed],
+    ["Lines added", `+${(c.additions || 0).toLocaleString()}`],
+    ["Lines removed", `−${(c.deletions || 0).toLocaleString()}`],
+    ["Services touched", (c.folders || []).filter((f) => f !== "(repo root)").length],
+  ];
+  el.compareStats.innerHTML = tiles
+    .map(
+      ([label, value], i) =>
+        `<div class="stat${i === 0 ? " hero" : ""}"><div class="value">${escapeHtml(String(value))}</div><div class="label">${escapeHtml(label)}</div></div>`
+    )
+    .join("");
+
+  el.compareBody.replaceChildren();
+
+  if (c.status === "identical") {
+    el.compareBody.appendChild(
+      stateNode(
+        "These branches are identical",
+        `“${c.head}” has nothing that “${c.base}” does not, and vice versa.`
+      )
+    );
+    return;
+  }
+
+  if (!c.ahead_by) {
+    el.compareBody.appendChild(
+      stateNode(
+        `“${c.head}” is ${c.behind_by} commit${c.behind_by === 1 ? "" : "s"} behind`,
+        `Nothing on “${c.head}” is missing from “${c.base}”. Swap the direction to see what “${c.base}” added.`
+      )
+    );
+    return;
+  }
+
+  // --- services touched -------------------------------------------------
+  if ((c.folders || []).length) {
+    const box = document.createElement("div");
+    box.className = "compare-section";
+    box.innerHTML =
+      `<h3>Services touched</h3><div class="chips">` +
+      c.folders
+        .map(
+          (f) =>
+            `<span class="chip folder${f === "(repo root)" ? " unknown" : ""}">${f === "(repo root)" ? "" : ICON.folder}<span class="txt">${escapeHtml(f)}</span></span>`
+        )
+        .join("") +
+      `</div>`;
+    el.compareBody.appendChild(box);
+  }
+
+  // --- changed files ----------------------------------------------------
+  const files = [...(c.files || [])].sort(
+    (a, b) =>
+      (FILE_STATUS_ORDER[a.status] ?? 9) - (FILE_STATUS_ORDER[b.status] ?? 9) ||
+      a.path.localeCompare(b.path)
+  );
+  if (files.length) {
+    const box = document.createElement("div");
+    box.className = "compare-section";
+    const rows = files
+      .map(
+        (f) => `
+        <tr>
+          <td><span class="file-status is-${escapeAttr(f.status)}">${escapeHtml(f.status)}</span></td>
+          <td class="file-path">${escapeHtml(f.path)}${
+            f.previous_path ? `<span class="muted"> ← ${escapeHtml(f.previous_path)}</span>` : ""
+          }</td>
+          <td class="num add">${f.binary ? "—" : `+${f.additions}`}</td>
+          <td class="num del">${f.binary ? "—" : `−${f.deletions}`}</td>
+        </tr>`
+      )
+      .join("");
+    box.innerHTML = `
+      <h3>Changed files <span class="muted">(${files.length})</span></h3>
+      <div class="table-scroll">
+        <table class="file-table">
+          <thead><tr><th>Status</th><th>File</th><th class="num">Added</th><th class="num">Removed</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      ${c.files_truncated ? `<p class="muted note">${c.files_truncated} further files are not listed.</p>` : ""}`;
+    el.compareBody.appendChild(box);
+  }
+
+  // --- commits ----------------------------------------------------------
+  const box = document.createElement("div");
+  box.className = "compare-section";
+  const heading = document.createElement("h3");
+  heading.innerHTML = `Commits on “${escapeHtml(c.head)}” <span class="muted">(${c.commits.length})</span>`;
+  box.appendChild(heading);
+
+  const feed = document.createElement("div");
+  feed.className = "feed";
+  for (const commit of c.commits) {
+    // The feed's row renderer expects these derived fields.
+    commit._visibleBranches = commit.branches;
+    commit._visibleFolders = commit.folders || [];
+    commit._visibleFolderKeys = (commit.folders || []).map((f) => `${commit.repo_key}${FOLDER_SEP}${f}`);
+    feed.appendChild(commitNode(commit));
+  }
+  box.appendChild(feed);
+
+  if (c.commits_truncated) {
+    const note = document.createElement("p");
+    note.className = "muted note";
+    note.textContent = `${c.commits_truncated} older commits are counted above but not listed — GitHub caps a comparison at 250 commits.`;
+    box.appendChild(note);
+  }
+  el.compareBody.appendChild(box);
+}
+
 /* ---------- report export ---------- */
 
 function selectedText(select) {
   return select.options[select.selectedIndex]?.text || "";
+}
+
+/** A comparison's cover page: the branches, not the date range, define its scope. */
+function compareCriteria() {
+  const c = state.compare;
+  return {
+    since: (c.commits[c.commits.length - 1]?.date || "").slice(0, 10) || null,
+    until: (c.commits[0]?.date || "").slice(0, 10) || null,
+    range: `Branch comparison — not a date range`,
+    comparison: `${c.base}  ←  ${c.head}  ·  ${c.ahead_by} ahead, ${c.behind_by} behind`,
+    repository: c.repo,
+    source: PROVIDER_LABEL[c.provider] || c.provider,
+    branch: c.head,
+    show: `Commits on “${c.head}” absent from “${c.base}”`,
+    merge_base: c.merge_base ? c.merge_base.slice(0, 7) : null,
+    files: `${c.files_changed} changed, +${c.additions} / −${c.deletions}`,
+    grouped_by: "Comparison order",
+    generated_at: new Date().toISOString(),
+  };
 }
 
 /** The filters in force, in words — this becomes the report's cover page. */
@@ -822,9 +1098,13 @@ function currentCriteria() {
 /* The rows on screen are posted with the request, so the document is exactly
  * what you are looking at — the server never re-runs the filters. */
 async function exportReport(format) {
-  const button = format === "pdf" ? el.exportPdf : el.exportPptx;
+  const comparingNow = Boolean(state.compare);
+  const button = comparingNow
+    ? format === "pdf" ? el.compareExportPdf : el.compareExportPptx
+    : format === "pdf" ? el.exportPdf : el.exportPptx;
   const original = button.textContent;
-  const commits = visibleCommits();
+  const comparing = comparingNow;
+  const commits = comparing ? state.compare.commits : visibleCommits();
 
   if (!commits.length) {
     showBanner("<strong>Nothing to export.</strong> The current filter matches no commits.", true);
@@ -839,7 +1119,7 @@ async function exportReport(format) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         format,
-        criteria: currentCriteria(),
+        criteria: comparing ? compareCriteria() : currentCriteria(),
         commits: commits.map((c) => ({
           date: c.date,
           repo: c.repo,
@@ -918,6 +1198,16 @@ el.dateClear.addEventListener("click", () => {
   el.preset.value = "custom";
   load();
 });
+el.compareRun.addEventListener("click", runCompare);
+el.compareExit.addEventListener("click", exitCompare);
+el.compareSwap.addEventListener("click", () => {
+  const base = el.compareBase.value;
+  el.compareBase.value = el.compareHead.value;
+  el.compareHead.value = base;
+  if (state.compare) runCompare();
+});
+el.compareExportPdf.addEventListener("click", () => exportReport("pdf"));
+el.compareExportPptx.addEventListener("click", () => exportReport("pptx"));
 el.exportPdf.addEventListener("click", () => exportReport("pdf"));
 el.exportPptx.addEventListener("click", () => exportReport("pptx"));
 el.search.addEventListener("input", render);
@@ -926,6 +1216,7 @@ el.folderSearch.addEventListener("input", buildFilters);
 el.scopeCommits.addEventListener("change", render);
 el.groupBy.addEventListener("change", render);
 el.reset.addEventListener("click", () => {
+  exitCompare();
   state.provider = null;
   state.repo = null;
   state.folder = null;
