@@ -218,6 +218,41 @@ async def test_flow(root: Path) -> None:
     check("and its tagger", repo_entry["tags"][0]["tagger_name"], "Release Bot")
     check("the total counts it", overview["total"], 1)
 
+    print("\n=== per-repo view: which branches hold each tag ===")
+    per_repo = await tagging.tags_for_repo(
+        settings, gh, mirror, store, fixture.key, lambda commits: None
+    )
+    check("scoped to the one repository", per_repo["repo"], "demo/tagged")
+    check("lists that repo's tags", [t["name"] for t in per_repo["tags"]], ["v1.0.0"])
+    check("reports every branch in the repo", sorted(per_repo["branches_known"]), ["keepme", "main"])
+    check("names the default branch", per_repo["default_branch"], "main")
+
+    # The tag sits on the first commit, which both branches descend from, so both
+    # contain it — a tag belongs to a commit, not to one branch.
+    check("both containing branches are listed", sorted(per_repo["tags"][0]["branches"]),
+          ["keepme", "main"])
+    check("the default branch is listed first", per_repo["tags"][0]["branches"][0], "main")
+    check("nothing was capped for a small repo", per_repo["capped"], {"tags": 0, "branches": 0})
+    check("staged tags for this repo travel with it", isinstance(per_repo["staged"], list), True)
+
+    # A tag on a commit that only one branch can reach.
+    only_keepme = git(["-C", str(path), "rev-parse", "keepme"])
+    solo = await tagging.stage_tag(settings, gh, mirror, store,
+                                   repo_key=fixture.key, sha=only_keepme, name="v3.0.0", message="")
+    await tagging.push_tag(settings, gh, mirror, store, solo["id"])
+    per_repo = await tagging.tags_for_repo(
+        settings, gh, mirror, store, fixture.key, lambda commits: None
+    )
+    holders = {t["name"]: t["branches"] for t in per_repo["tags"]}
+    check("a branch-specific tag lists only that branch", holders["v3.0.0"], ["keepme"])
+    check("the shared tag still lists both", sorted(holders["v1.0.0"]), ["keepme", "main"])
+
+    try:
+        await tagging.tags_for_repo(settings, gh, mirror, store, "csr:no/such", lambda c: None)
+        check("an unknown repo is rejected", "accepted", "rejected")
+    except tagging.TagError:
+        check("an unknown repo is rejected", "rejected", "rejected")
+
     await gh.aclose()
 
 

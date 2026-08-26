@@ -160,7 +160,7 @@ a `+` on the file count and may under-report folders.
 | `GET /api/feed?since=2026-07-01&until=2026-08-05&key=…&refresh=false` | The merged feed. `since`/`until` are UTC calendar dates; `until` is inclusive and may be omitted for "through to now". `days=N` still works as a lookback when `since` is absent. `key` may repeat; values are `github:owner/repo` or `csr:project/repo`. |
 | `GET /api/summary?key=…&branch=…&folder=…&since=…&limit=100` | One row per commit on a branch, with full tag metadata. |
 | `GET /api/lookup?sha=…` | Which repos and branches hold a commit, and its position in each. |
-| `GET /api/tags/overview` | Every tag, per repo and folder, plus anything staged. |
+| `GET /api/tags/overview?key=…` | One repo's tags with the folders and branches of each. Omit `key` for a cross-repo listing without branch data. |
 | `POST /api/tags/stage` | `{repo_key, sha, name, message}` → stage a tag locally. Writes nothing to the remote. |
 | `POST /api/tags/push/{id}` | Publish a staged tag. **This is the step that reaches the remote.** |
 | `DELETE /api/tags/staged/{id}` | Discard a staged tag that has not been pushed. |
@@ -353,20 +353,33 @@ for the invocation and names a single explicit refspec. Only the one tag can tra
 
 ## Tags tab
 
-Every tag across every configured repository, grouped by repository and then by the
-service / folder its commit touched:
+Pick a **repository** from the dropdown; its tags are grouped by the service / folder
+their commit touched, with the branches that contain each one:
 
 ```
-rajasany/Github-dashboard   1 tag
-  🗂 app        1 tag
-     v1.20   34755374a4   Release Bot   2026-08-26 22:51   Tag and summary work
-  🗂 tests      1 tag
-     v1.20   34755374a4   Release Bot   2026-08-26 22:51   Tag and summary work
+rajasany/Github-dashboard · 1 tag · 2 branches
+  🗂 app     1 tag
+     Tag     Branch   Commit       Tag creator   Tag date           Comment
+     v1.20   ⑂ main   34755374a4   Release Bot   2026-08-26 22:51   tag 1.2.0
+  🗂 tests   1 tag
+     v1.20   ⑂ main   34755374a4   Release Bot   2026-08-26 22:51   tag 1.2.0
 ```
 
-A tag whose commit touched several folders is listed under each, so the per-folder
-counts sum to more than the repository's tag total. Lightweight tags show **lightweight**
-in place of a creator and date, for the reason described above.
+**On the Branch column.** A tag names a *commit*, not a branch — git records no branch
+on a tag at all. So this column reports *the branches whose history contains that
+commit*, which is the closest true answer, and it is often more than one: a tag on a
+commit both `main` and a feature branch descend from lists both. The default branch is
+listed first. Where a commit is on no branch (deleted branch, PR-only), the column reads
+**no branch** rather than blank.
+
+Working that out costs one comparison per (tag, branch) pair on GitHub, which is why the
+tab is scoped to one repository. Above 30 tags or 10 branches the probing stops and the
+scope line says how much was skipped — those rows read **not checked**, never a
+misleading "no branch". CSR repositories get it free from `git for-each-ref --contains`.
+
+A tag whose commit touched several folders is listed under each, so the per-folder counts
+sum to more than the repository's tag total. Lightweight tags show **lightweight** in
+place of a creator and date, for the reason described above.
 
 ## Find a commit
 
@@ -478,7 +491,7 @@ other rule hard-codes a colour.
 .venv/bin/python tests/test_paths.py    # changed paths -> owning folder     (16 checks)
 .venv/bin/python tests/test_report.py   # date window + report rollup        (57 checks)
 .venv/bin/python tests/test_lookup.py   # tag metadata, summary, lookup      (47 checks)
-.venv/bin/python tests/test_tagging.py  # staging and pushing tags           (47 checks)
+.venv/bin/python tests/test_tagging.py  # staging, pushing, tag branches     (58 checks)
 .venv/bin/python tests/test_compare.py  # branch comparison, real git repo   (25 checks)
 node tests/ui_cascade.test.js          # selection, rendering, escaping      (39 checks)
 ```

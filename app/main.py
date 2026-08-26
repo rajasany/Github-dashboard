@@ -329,12 +329,27 @@ async def discard_staged_tag(tag_id: int) -> dict:
 
 
 @app.get("/api/tags/overview")
-async def tags_overview() -> dict:
-    """Every tag across every repo, with the folders each tagged commit touched."""
+async def tags_overview(
+    key: str = Query(default=None, description="Repo key; omit for a cross-repo listing."),
+) -> dict:
+    """Tags for one repository, with the folders and branches of each tagged commit.
+
+    Without `key` this falls back to a cross-repo listing that omits branch
+    information — establishing which branches contain a commit costs one API call
+    per (tag, branch) pair on GitHub, which is only affordable one repo at a time.
+    """
     assert gh_client is not None and mirror is not None and store is not None and tag_store is not None
 
     async def enrich(commits):
         return await enrich_commit_folders(settings, gh_client, store, commits)
+
+    if key:
+        if key not in set(settings.all_keys()):
+            raise HTTPException(status_code=400, detail=f"Unknown repository: {key}")
+        try:
+            return await tagging.tags_for_repo(settings, gh_client, mirror, tag_store, key, enrich)
+        except tagging.TagError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return await tagging.tag_overview(settings, gh_client, mirror, tag_store, enrich)
 

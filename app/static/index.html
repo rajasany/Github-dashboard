@@ -200,11 +200,15 @@
       <!-- ============ Tags ============ -->
       <div id="panel-tags" class="tab-panel hidden">
         <section class="picker-bar">
+          <label class="field block">
+            <span>Repository</span>
+            <select id="tags-repo"></select>
+          </label>
           <div class="picker-actions">
             <button id="tags-refresh" class="btn primary">Load tags</button>
           </div>
-          <p class="scope-line" style="margin:0">Every tag across every configured repository, grouped by the service / folder its commit touched.</p>
         </section>
+        <p id="tags-scope" class="scope-line"></p>
         <div id="tags-body"></div>
       </div>
 

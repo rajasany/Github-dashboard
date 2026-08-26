@@ -85,6 +85,8 @@ const el = {
   lkRun: $("lk-run"),
   lkBody: $("lk-body"),
   panelTags: $("panel-tags"),
+  tagsRepo: $("tags-repo"),
+  tagsScope: $("tags-scope"),
   tagsRefresh: $("tags-refresh"),
   tagsBody: $("tags-body"),
   stagedStrip: $("staged-strip"),
@@ -1716,15 +1718,23 @@ function handleTagClicks(event) {
 /* ---------- tags overview ---------- */
 
 function initTagsTab() {
-  if (!state.tags) loadTagsOverview();
+  if (!el.tagsRepo.options.length && repoOptions().length) {
+    fillRepoSelect(el.tagsRepo, state.repo);
+    loadTagsOverview();
+  }
 }
 
 async function loadTagsOverview() {
+  const repoKey = el.tagsRepo.value;
+  if (!repoKey) return;
+
   el.tagsRefresh.disabled = true;
   el.tagsRefresh.textContent = "Loading…";
-  el.tagsBody.replaceChildren(stateNode("Reading tags…", "Checking every configured repository."));
+  el.tagsBody.replaceChildren(
+    stateNode("Reading tags…", `Listing tags in ${repoNameOf(repoKey)} and working out which branches hold them.`)
+  );
   try {
-    const res = await fetch("/api/tags/overview");
+    const res = await fetch(`/api/tags/overview?key=${encodeURIComponent(repoKey)}`);
     const body = await res.json();
     if (!res.ok) {
       el.tagsBody.replaceChildren(stateNode("Could not load tags", body.detail || res.statusText));
@@ -1748,87 +1758,107 @@ function renderTagsOverview() {
   const d = state.tags;
   if (!d) return;
 
-  if (!d.total) {
+  if (d.error) {
+    el.tagsScope.textContent = "";
+    el.tagsBody.replaceChildren(stateNode(`Could not read ${d.repo}`, d.error));
+    return;
+  }
+
+  const capNote = [
+    d.capped?.tags ? `${d.capped.tags} older tags not branch-checked` : "",
+    d.capped?.branches ? `${d.capped.branches} branches not checked` : "",
+  ].filter(Boolean);
+
+  el.tagsScope.textContent =
+    `${d.repo} · ${d.tags.length} tag${d.tags.length === 1 ? "" : "s"} · ` +
+    `${(d.branches_known || []).length} branch${(d.branches_known || []).length === 1 ? "" : "es"}` +
+    (capNote.length ? ` · ${capNote.join(", ")}` : "");
+
+  if (!d.tags.length) {
     el.tagsBody.replaceChildren(
       stateNode(
-        "No tags in any configured repository",
-        "Create one from the Summary table: pick a commit, name the tag, then push it."
+        `No tags in ${d.repo}`,
+        "Create one from the Summary table: pick a commit, press Tag…, then push it."
       )
     );
     return;
   }
 
-  const parts = [];
-  for (const repo of d.repos) {
-    if (repo.error) {
-      parts.push(`<section class="tag-repo"><h3>${escapeHtml(repo.repo)}</h3>
-        <p class="muted">Could not read tags: ${escapeHtml(repo.error)}</p></section>`);
-      continue;
+  /* A tag's commit can touch several folders, so it is listed under each — the
+   * per-folder counts therefore sum to more than the repository's tag total. */
+  const byFolder = new Map();
+  for (const tag of d.tags) {
+    for (const folder of tag.folders?.length ? tag.folders : [NO_FOLDER_TAG]) {
+      if (!byFolder.has(folder)) byFolder.set(folder, []);
+      byFolder.get(folder).push(tag);
     }
-    if (!repo.tags.length) continue;
-
-    // A tag's commit can touch several folders, so it is listed under each —
-    // the counts below therefore sum to more than the repo's tag total.
-    const byFolder = new Map();
-    for (const tag of repo.tags) {
-      for (const folder of tag.folders?.length ? tag.folders : [NO_FOLDER_TAG]) {
-        if (!byFolder.has(folder)) byFolder.set(folder, []);
-        byFolder.get(folder).push(tag);
-      }
-    }
-    const folders = [...byFolder.entries()].sort(
-      (a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0])
-    );
-
-    const groups = folders
-      .map(
-        ([folder, tags]) => `
-        <div class="tag-folder">
-          <h4>
-            <span class="chip folder${folder === NO_FOLDER_TAG ? " unknown" : ""}">${
-              folder === NO_FOLDER_TAG ? "" : ICON.folder
-            }<span class="txt">${escapeHtml(folder)}</span></span>
-            <span class="muted">${tags.length} tag${tags.length === 1 ? "" : "s"}</span>
-          </h4>
-          <div class="table-scroll">
-            <table class="data-table">
-              <thead><tr><th>Tag</th><th>Commit</th><th>Tag creator</th><th>Tag date</th><th>Comment</th></tr></thead>
-              <tbody>
-                ${tags
-                  .map(
-                    (tag) => `
-                  <tr>
-                    <td><span class="chip tag">${ICON.tag}<span class="txt">${escapeHtml(tag.name)}</span></span></td>
-                    <td class="mono">${escapeHtml(tag.commit_sha.slice(0, 10))}
-                        <button type="button" class="copy-sha" data-sha="${escapeAttr(tag.commit_sha)}" title="Copy full hash ${escapeAttr(tag.commit_sha)}" aria-label="Copy full commit hash">${ICON.copy}</button></td>
-                    <td>${
-                      tag.annotated
-                        ? escapeHtml(tag.tagger_name || "unknown")
-                        : '<span class="muted" title="A lightweight tag has no tag object, so git stores no creator or date">lightweight</span>'
-                    }</td>
-                    <td class="mono nowrap">${
-                      tag.tagger_date ? escapeHtml(fmtStamp(tag.tagger_date)) : '<span class="muted">—</span>'
-                    }</td>
-                    <td>${escapeHtml(tag.message || "") || '<span class="muted">—</span>'}</td>
-                  </tr>`
-                  )
-                  .join("")}
-              </tbody>
-            </table>
-          </div>
-        </div>`
-      )
-      .join("");
-
-    parts.push(`
-      <section class="tag-repo">
-        <h3>${escapeHtml(repo.repo)} <span class="muted">${repo.tags.length} tag${repo.tags.length === 1 ? "" : "s"}</span></h3>
-        ${groups}
-      </section>`);
   }
+  const folders = [...byFolder.entries()].sort(
+    (a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0])
+  );
+
+  const branchCell = (tag) => {
+    // null means "we did not probe", which is not the same as "no branch".
+    if (tag.branches === null || tag.branches === undefined) {
+      return '<span class="muted" title="Not checked — see the cap noted above">not checked</span>';
+    }
+    if (!tag.branches.length) {
+      return '<span class="muted" title="The tagged commit is not reachable from any branch — it may be on a deleted branch">no branch</span>';
+    }
+    return tag.branches
+      .map(
+        (b) =>
+          `<span class="chip branch${b === d.default_branch ? " is-default" : ""}">${ICON.branch}<span class="txt">${escapeHtml(b)}</span></span>`
+      )
+      .join(" ");
+  };
+
+  const groups = folders
+    .map(
+      ([folder, tags]) => `
+      <div class="tag-folder">
+        <h4>
+          <span class="chip folder${folder === NO_FOLDER_TAG ? " unknown" : ""}">${
+            folder === NO_FOLDER_TAG ? "" : ICON.folder
+          }<span class="txt">${escapeHtml(folder)}</span></span>
+          <span class="muted">${tags.length} tag${tags.length === 1 ? "" : "s"}</span>
+        </h4>
+        <div class="table-scroll">
+          <table class="data-table">
+            <thead>
+              <tr><th>Tag</th><th>Branch</th><th>Commit</th><th>Tag creator</th><th>Tag date</th><th>Comment</th></tr>
+            </thead>
+            <tbody>
+              ${tags
+                .map(
+                  (tag) => `
+                <tr>
+                  <td><span class="chip tag">${ICON.tag}<span class="txt">${escapeHtml(tag.name)}</span></span></td>
+                  <td>${branchCell(tag)}</td>
+                  <td class="mono">${escapeHtml(tag.commit_sha.slice(0, 10))}
+                      <button type="button" class="copy-sha" data-sha="${escapeAttr(tag.commit_sha)}" title="Copy full hash ${escapeAttr(tag.commit_sha)}" aria-label="Copy full commit hash">${ICON.copy}</button></td>
+                  <td>${
+                    tag.annotated
+                      ? escapeHtml(tag.tagger_name || "unknown")
+                      : '<span class="muted" title="A lightweight tag has no tag object, so git stores no creator or date">lightweight</span>'
+                  }</td>
+                  <td class="mono nowrap">${
+                    tag.tagger_date ? escapeHtml(fmtStamp(tag.tagger_date)) : '<span class="muted">—</span>'
+                  }</td>
+                  <td>${escapeHtml(tag.message || "") || '<span class="muted">—</span>'}</td>
+                </tr>`
+                )
+                .join("")}
+            </tbody>
+          </table>
+        </div>
+      </div>`
+    )
+    .join("");
 
   const box = document.createElement("div");
-  box.innerHTML = parts.join("");
+  box.className = "tag-repo";
+  box.innerHTML = groups;
   el.tagsBody.replaceChildren(box);
 }
 
@@ -2211,6 +2241,7 @@ for (const control of [el.sumBranch, el.sumFolder]) {
 }
 
 on(el.tagsRefresh, "click", loadTagsOverview);
+on(el.tagsRepo, "change", loadTagsOverview);
 on(el.tagReview, "click", reviewTag);
 on(el.tagBack, "click", () => showTagStep("input"));
 on(el.tagCreate, "click", createStagedTag);

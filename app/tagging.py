@@ -335,6 +335,141 @@ async def _push_csr(
 # --------------------------------------------------------------------------
 
 
+
+# Cost guards: for GitHub, "which branches contain this commit" costs one
+# comparison per (tag, branch) pair, so both sides are bounded and the caller is
+# told when a bound was hit rather than shown a quietly partial answer.
+MAX_TAGS_FOR_BRANCHES = 30
+MAX_BRANCHES_FOR_TAGS = 10
+
+
+async def tags_for_repo(
+    settings: Settings,
+    gh_client: github_provider.GitHubClient,
+    mirror: csr_provider.GitMirror,
+    store: TagStore,
+    repo_key: str,
+    enrich_folders,
+) -> dict[str, Any]:
+    """One repository's tags, each with the folders and branches of its commit.
+
+    A tag names a commit, not a branch, so "the branch a tag was created on" is
+    really *the branches whose history contains that commit* — often more than
+    one. That is what the branch column reports.
+    """
+    from .paths import derive_folders
+
+    capped = {"tags": 0, "branches": 0}
+
+    if repo_key.startswith("github:"):
+        full_name = repo_key.split(":", 1)[1]
+        try:
+            by_sha = await gh_client.list_tag_details(full_name)
+            meta, branch_list = await asyncio.gather(
+                gh_client.get_repo(full_name), gh_client.list_branches(full_name)
+            )
+        except github_provider.GitHubError as exc:
+            return {
+                "repo_key": repo_key, "repo": full_name, "provider": "github",
+                "tags": [], "error": exc.message, "branches_known": [],
+                "capped": capped, "staged": store.list(repo_key),
+            }
+
+        default_branch = (meta or {}).get("default_branch")
+        all_branches = [b.get("name") for b in branch_list if b.get("name")]
+        branches = all_branches[:MAX_BRANCHES_FOR_TAGS]
+        capped["branches"] = max(0, len(all_branches) - len(branches))
+
+        shas = list(by_sha)[:MAX_TAGS_FOR_BRANCHES]
+        capped["tags"] = max(0, len(by_sha) - len(shas))
+
+        commits = [{"provider": "github", "repo_key": repo_key, "sha": sha} for sha in by_sha]
+        if settings.folders_enabled and commits:
+            await enrich_folders(commits)
+        folders_by_sha = {c["sha"]: c.get("folders") or [] for c in commits}
+
+        async def containing(sha: str) -> tuple[str, list[str]]:
+            async def holds(branch: str) -> str | None:
+                try:
+                    cmp_ = await gh_client.get_compare(full_name, sha, branch)
+                except github_provider.GitHubError:
+                    return None
+                return branch if int(cmp_.get("behind_by") or 0) == 0 else None
+
+            hits = [b for b in await asyncio.gather(*(holds(b) for b in branches)) if b]
+            hits.sort(key=lambda b: (b != default_branch, b))
+            return sha, hits
+
+        found = dict(await asyncio.gather(*(containing(s) for s in shas)))
+
+        tags = [
+            {
+                **tag,
+                "folders": folders_by_sha.get(sha, []),
+                # None (rather than []) means "not probed", which the UI shows as
+                # unknown instead of claiming no branch holds it.
+                "branches": found.get(sha) if sha in found else None,
+            }
+            for sha, group in by_sha.items()
+            for tag in group
+        ]
+        return {
+            "repo_key": repo_key, "repo": full_name, "provider": "github",
+            "tags": tags, "error": None, "default_branch": default_branch,
+            "branches_known": all_branches, "capped": capped,
+            "staged": store.list(repo_key),
+        }
+
+    repo = next((r for r in settings.csr_repos if r.key == repo_key), None)
+    if repo is None:
+        raise TagError(f"Unknown repository: {repo_key}")
+
+    try:
+        path = await mirror.sync(repo.key, repo.clone_url)
+        by_sha = await mirror.tag_details(path)
+        default_branch = await mirror.default_branch(path)
+        all_branches = [name for name, _ in await mirror.branches(path)]
+    except csr_provider.CsrError as exc:
+        return {
+            "repo_key": repo_key, "repo": repo.name, "provider": "csr",
+            "tags": [], "error": str(exc), "branches_known": [],
+            "capped": capped, "staged": store.list(repo_key),
+        }
+
+    tags = []
+    for sha, group in by_sha.items():
+        # Local git answers containment directly — no per-branch probing needed.
+        try:
+            raw_branches = await mirror._git(  # noqa: SLF001
+                ["-C", str(path), "for-each-ref", "--contains", sha,
+                 "--format=%(refname:short)", "refs/heads/"]
+            )
+            holders = [b.strip() for b in raw_branches.splitlines() if b.strip()]
+            holders.sort(key=lambda b: (b != default_branch, b))
+        except csr_provider.CsrError:
+            holders = None
+
+        try:
+            numstat = await mirror._git(  # noqa: SLF001
+                ["-C", str(path), "show", "--numstat", "--format=", sha]
+            )
+        except csr_provider.CsrError:
+            numstat = ""
+        paths = [ln.split("\t")[-1] for ln in numstat.splitlines() if ln.count("\t") >= 2]
+        folders = derive_folders(
+            paths, settings.folder_depth, settings.folder_paths, settings.folder_exclude
+        )
+        tags.extend({**tag, "folders": folders, "branches": holders} for tag in group)
+
+    tags.sort(key=lambda x: (x.get("tagger_date") or "", x["name"]), reverse=True)
+    return {
+        "repo_key": repo_key, "repo": repo.name, "provider": "csr",
+        "tags": tags, "error": None, "default_branch": default_branch,
+        "branches_known": all_branches, "capped": capped,
+        "staged": store.list(repo_key),
+    }
+
+
 async def tag_overview(
     settings: Settings,
     gh_client: github_provider.GitHubClient,
