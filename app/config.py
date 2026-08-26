@@ -63,6 +63,9 @@ class Settings:
     gcloud_token: str = ""
     mirror_dir: Path = ROOT / ".cache" / "mirrors"
     store_path: Path = ROOT / ".cache" / "commit-files.sqlite3"
+    tag_store_path: Path = ROOT / ".cache" / "staged-tags.sqlite3"
+    tagger_name: str = ""
+    tagger_email: str = ""
     git_timeout: int = 240
 
     @property
@@ -165,5 +168,8 @@ def load_settings() -> Settings:
         gcloud_token=os.getenv("GCLOUD_ACCESS_TOKEN", "").strip(),
         mirror_dir=Path(mirror_dir) if mirror_dir else ROOT / ".cache" / "mirrors",
         store_path=cache_root / "commit-files.sqlite3",
+        tag_store_path=cache_root / "staged-tags.sqlite3",
+        tagger_name=os.getenv("TAGGER_NAME", "").strip(),
+        tagger_email=os.getenv("TAGGER_EMAIL", "").strip(),
         git_timeout=int(os.getenv("GIT_TIMEOUT_SECONDS", "240")),
     )

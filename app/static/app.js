@@ -84,6 +84,28 @@ const el = {
   lkSha: $("lk-sha"),
   lkRun: $("lk-run"),
   lkBody: $("lk-body"),
+  panelTags: $("panel-tags"),
+  tagsRefresh: $("tags-refresh"),
+  tagsBody: $("tags-body"),
+  stagedStrip: $("staged-strip"),
+  tagDialog: $("tag-dialog"),
+  tagTarget: $("tag-target"),
+  tagStepInput: $("tag-step-input"),
+  tagStepConfirm: $("tag-step-confirm"),
+  tagName: $("tag-name"),
+  tagMessage: $("tag-message"),
+  tagError: $("tag-error"),
+  tagError2: $("tag-error-2"),
+  tagSummary: $("tag-summary"),
+  tagCancel: $("tag-cancel"),
+  tagReview: $("tag-review"),
+  tagBack: $("tag-back"),
+  tagCreate: $("tag-create"),
+  pushDialog: $("push-dialog"),
+  pushSummary: $("push-summary"),
+  pushError: $("push-error"),
+  pushCancel: $("push-cancel"),
+  pushConfirm: $("push-confirm"),
   compareBase: $("compare-base"),
   compareHead: $("compare-head"),
   compareRun: $("compare-run"),
@@ -134,6 +156,11 @@ const state = {
   tab: "activity",
   summary: null,
   lookup: null,
+  tags: null,
+  staged: [],
+  // The row a tag is being created for, and the tag queued for pushing.
+  tagTarget: null,
+  pushTarget: null,
 };
 
 /** Folders a commit touched, with an explicit bucket when we have no data. */
@@ -1265,6 +1292,7 @@ const TABS = {
   summary: { panel: () => el.panelSummary, sidebar: false, onShow: initSummaryTab },
   compare: { panel: () => el.panelCompare, sidebar: false, onShow: initCompareTab },
   lookup: { panel: () => el.panelLookup, sidebar: false, onShow: () => el.lkSha.focus?.() },
+  tags: { panel: () => el.panelTags, sidebar: false, onShow: initTagsTab },
 };
 
 function showTab(name) {
@@ -1314,11 +1342,15 @@ async function loadBranchesForSummary() {
     if (names.includes(body.default_branch)) el.sumBranch.value = body.default_branch;
     el.sumRun.disabled = !names.length;
     state.summaryBranchNote = hiddenBranchNote(body);
-    // Run immediately: the folder picker can only list this branch's folders
-    // once the branch has been read, and an empty picker looks broken.
-    if (names.length) runSummary();
-    // Folders are only known once a branch has been read, so start permissive.
+
+    // Clear the folder scope BEFORE running, not after. Otherwise the previous
+    // repository's selection is still in the box when runSummary() reads it, so
+    // the request carries a folder that belongs to a different repo — and if the
+    // request then fails, that other repo's folders stay on screen.
     el.sumFolder.innerHTML = '<option value="">All folders</option>';
+    el.sumFolder.value = "";
+
+    if (names.length) runSummary();
   } catch (err) {
     el.sumBranch.innerHTML = "";
     el.sumScope.textContent = `Could not list branches: ${err.message}`;
@@ -1420,6 +1452,11 @@ function renderSummary() {
             tag && tag.tagger_date ? escapeHtml(fmtStamp(tag.tagger_date)) : '<span class="muted">—</span>'
           }</td>
           <td>${i ? "" : escapeHtml(r.title)}</td>
+          <td>${
+            i
+              ? ""
+              : `<button type="button" class="btn tiny create-tag" data-sha="${escapeAttr(r.sha)}" data-title="${escapeAttr(r.title)}">Tag…</button>`
+          }</td>
         </tr>`);
     });
   }
@@ -1431,7 +1468,7 @@ function renderSummary() {
       <thead>
         <tr>
           <th>Commit hash</th><th>Commit creator</th><th>Commit date</th>
-          <th>Tag</th><th>Tag creator</th><th>Tag date</th><th>Message</th>
+          <th>Tag</th><th>Tag creator</th><th>Tag date</th><th>Message</th><th></th>
         </tr>
       </thead>
       <tbody>${rows.join("")}</tbody>
@@ -1487,6 +1524,312 @@ function downloadBlob(blob, name) {
   link.click();
   link.remove();
   URL.revokeObjectURL(url);
+}
+
+/* ---------- creating tags ---------- */
+
+/* Two deliberate steps. Staging writes only to this app's local store; pushing
+ * is what reaches the remote, and is confirmed separately. */
+
+async function refreshStaged() {
+  try {
+    const res = await fetch("/api/tags/staged");
+    const body = await res.json();
+    state.staged = body.staged || [];
+  } catch {
+    state.staged = [];
+  }
+  renderStagedStrip();
+}
+
+function renderStagedStrip() {
+  const pending = state.staged.filter((s) => !s.pushed);
+  const recent = state.staged.filter((s) => s.pushed).slice(0, 3);
+
+  if (!pending.length && !recent.length) {
+    el.stagedStrip.classList.add("hidden");
+    el.stagedStrip.replaceChildren();
+    return;
+  }
+  el.stagedStrip.classList.remove("hidden");
+
+  const row = (s) => `
+    <li class="staged-row${s.pushed ? " is-pushed" : ""}">
+      <span class="chip tag">${ICON.tag}<span class="txt">${escapeHtml(s.name)}</span></span>
+      <span class="staged-meta">
+        ${escapeHtml(s.repo)} · <code>${escapeHtml(s.sha.slice(0, 10))}</code>
+        ${s.commit_title ? `· ${escapeHtml(_clipText(s.commit_title, 44))}` : ""}
+      </span>
+      ${
+        s.pushed
+          ? '<span class="status-badge is-ahead">pushed</span>'
+          : `<span class="status-badge is-behind">local only</span>
+             <button type="button" class="btn tiny push-tag" data-id="${s.id}">Push…</button>
+             <button type="button" class="btn tiny discard-tag" data-id="${s.id}">Discard</button>`
+      }
+      ${s.push_error ? `<span class="staged-error">${escapeHtml(s.push_error)}</span>` : ""}
+    </li>`;
+
+  el.stagedStrip.innerHTML = `
+    <h3>${pending.length ? `${pending.length} tag${pending.length === 1 ? "" : "s"} staged locally` : "Recently pushed"}</h3>
+    <ul class="staged-list">${[...pending, ...recent].map(row).join("")}</ul>`;
+}
+
+function _clipText(text, limit) {
+  const s = String(text || "");
+  return s.length <= limit ? s : `${s.slice(0, limit - 1)}…`;
+}
+
+function openTagDialog(rowSha, rowTitle) {
+  const s = state.summary;
+  if (!s) return;
+  state.tagTarget = { repo_key: s.repo_key, repo: s.repo, sha: rowSha, title: rowTitle };
+
+  el.tagTarget.innerHTML = `
+    <div class="tip-row"><span class="tip-label">Repository</span><span class="tip-value">${escapeHtml(s.repo)}</span></div>
+    <div class="tip-row"><span class="tip-label">Commit</span><span class="tip-value"><code class="full-sha">${escapeHtml(rowSha)}</code></span></div>
+    <div class="tip-row"><span class="tip-label">Message</span><span class="tip-value">${escapeHtml(rowTitle)}</span></div>`;
+
+  el.tagName.value = "";
+  el.tagMessage.value = "";
+  showTagStep("input");
+  el.tagDialog.showModal?.();
+  el.tagName.focus?.();
+}
+
+function showTagStep(step) {
+  el.tagStepInput.classList.toggle("hidden", step !== "input");
+  el.tagStepConfirm.classList.toggle("hidden", step !== "confirm");
+  el.tagError.classList.add("hidden");
+  el.tagError2.classList.add("hidden");
+}
+
+function reviewTag() {
+  const name = el.tagName.value.trim();
+  if (!name) {
+    el.tagError.textContent = "Give the tag a name.";
+    el.tagError.classList.remove("hidden");
+    return;
+  }
+  const t = state.tagTarget;
+  el.tagSummary.innerHTML = `
+    <p>About to create an <strong>annotated</strong> tag:</p>
+    <div class="tip-row"><span class="tip-label">Tag</span><span class="tip-value"><span class="chip tag">${ICON.tag}<span class="txt">${escapeHtml(name)}</span></span></span></div>
+    <div class="tip-row"><span class="tip-label">Comment</span><span class="tip-value">${escapeHtml(el.tagMessage.value.trim()) || '<span class="muted">none</span>'}</span></div>
+    <div class="tip-row"><span class="tip-label">On commit</span><span class="tip-value"><code class="full-sha">${escapeHtml(t.sha)}</code></span></div>
+    <div class="tip-row"><span class="tip-label">In</span><span class="tip-value">${escapeHtml(t.repo)}</span></div>
+    <p class="dialog-note">Created locally only — the remote is untouched until you push.</p>`;
+  showTagStep("confirm");
+}
+
+async function createStagedTag() {
+  const t = state.tagTarget;
+  if (!t) return;
+  el.tagCreate.disabled = true;
+  el.tagCreate.textContent = "Creating…";
+  try {
+    const res = await fetch("/api/tags/stage", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        repo_key: t.repo_key,
+        sha: t.sha,
+        name: el.tagName.value.trim(),
+        message: el.tagMessage.value.trim(),
+      }),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      el.tagError2.textContent = body.detail || res.statusText;
+      el.tagError2.classList.remove("hidden");
+      return;
+    }
+    el.tagDialog.close?.();
+    await refreshStaged();
+    if (state.summary) runSummary();
+  } catch (err) {
+    el.tagError2.textContent = err.message;
+    el.tagError2.classList.remove("hidden");
+  } finally {
+    el.tagCreate.disabled = false;
+    el.tagCreate.textContent = "Create locally";
+  }
+}
+
+function openPushDialog(id) {
+  const tag = state.staged.find((s) => String(s.id) === String(id));
+  if (!tag) return;
+  state.pushTarget = tag;
+  el.pushSummary.innerHTML = `
+    <div class="tip-row"><span class="tip-label">Tag</span><span class="tip-value"><span class="chip tag">${ICON.tag}<span class="txt">${escapeHtml(tag.name)}</span></span></span></div>
+    <div class="tip-row"><span class="tip-label">Repository</span><span class="tip-value"><strong>${escapeHtml(tag.repo)}</strong></span></div>
+    <div class="tip-row"><span class="tip-label">Commit</span><span class="tip-value"><code class="full-sha">${escapeHtml(tag.sha)}</code></span></div>
+    <div class="tip-row"><span class="tip-label">Comment</span><span class="tip-value">${escapeHtml(tag.message) || '<span class="muted">none</span>'}</span></div>`;
+  el.pushError.classList.add("hidden");
+  el.pushDialog.showModal?.();
+}
+
+async function confirmPush() {
+  const tag = state.pushTarget;
+  if (!tag) return;
+  el.pushConfirm.disabled = true;
+  el.pushConfirm.textContent = "Pushing…";
+  try {
+    const res = await fetch(`/api/tags/push/${tag.id}`, { method: "POST" });
+    const body = await res.json();
+    if (!res.ok) {
+      el.pushError.textContent = body.detail || res.statusText;
+      el.pushError.classList.remove("hidden");
+      await refreshStaged();
+      return;
+    }
+    el.pushDialog.close?.();
+    await refreshStaged();
+    if (state.summary) runSummary();
+    if (state.tags) loadTagsOverview();
+  } catch (err) {
+    el.pushError.textContent = err.message;
+    el.pushError.classList.remove("hidden");
+  } finally {
+    el.pushConfirm.disabled = false;
+    el.pushConfirm.textContent = "Push tag";
+  }
+}
+
+async function discardStaged(id) {
+  const tag = state.staged.find((s) => String(s.id) === String(id));
+  if (tag && !window.confirm(`Discard the local tag “${tag.name}”? It has not been pushed.`)) return;
+  await fetch(`/api/tags/staged/${id}`, { method: "DELETE" });
+  await refreshStaged();
+}
+
+/* Delegated so the buttons survive every re-render of the strip. */
+function handleTagClicks(event) {
+  const push = event.target.closest?.(".push-tag");
+  if (push) return openPushDialog(push.dataset.id);
+  const discard = event.target.closest?.(".discard-tag");
+  if (discard) return discardStaged(discard.dataset.id);
+  const create = event.target.closest?.(".create-tag");
+  if (create) return openTagDialog(create.dataset.sha, create.dataset.title || "");
+}
+
+/* ---------- tags overview ---------- */
+
+function initTagsTab() {
+  if (!state.tags) loadTagsOverview();
+}
+
+async function loadTagsOverview() {
+  el.tagsRefresh.disabled = true;
+  el.tagsRefresh.textContent = "Loading…";
+  el.tagsBody.replaceChildren(stateNode("Reading tags…", "Checking every configured repository."));
+  try {
+    const res = await fetch("/api/tags/overview");
+    const body = await res.json();
+    if (!res.ok) {
+      el.tagsBody.replaceChildren(stateNode("Could not load tags", body.detail || res.statusText));
+      return;
+    }
+    state.tags = body;
+    state.staged = body.staged || [];
+    renderStagedStrip();
+    renderTagsOverview();
+  } catch (err) {
+    el.tagsBody.replaceChildren(stateNode("Could not load tags", err.message));
+  } finally {
+    el.tagsRefresh.disabled = false;
+    el.tagsRefresh.textContent = "Load tags";
+  }
+}
+
+const NO_FOLDER_TAG = "(no folder data)";
+
+function renderTagsOverview() {
+  const d = state.tags;
+  if (!d) return;
+
+  if (!d.total) {
+    el.tagsBody.replaceChildren(
+      stateNode(
+        "No tags in any configured repository",
+        "Create one from the Summary table: pick a commit, name the tag, then push it."
+      )
+    );
+    return;
+  }
+
+  const parts = [];
+  for (const repo of d.repos) {
+    if (repo.error) {
+      parts.push(`<section class="tag-repo"><h3>${escapeHtml(repo.repo)}</h3>
+        <p class="muted">Could not read tags: ${escapeHtml(repo.error)}</p></section>`);
+      continue;
+    }
+    if (!repo.tags.length) continue;
+
+    // A tag's commit can touch several folders, so it is listed under each —
+    // the counts below therefore sum to more than the repo's tag total.
+    const byFolder = new Map();
+    for (const tag of repo.tags) {
+      for (const folder of tag.folders?.length ? tag.folders : [NO_FOLDER_TAG]) {
+        if (!byFolder.has(folder)) byFolder.set(folder, []);
+        byFolder.get(folder).push(tag);
+      }
+    }
+    const folders = [...byFolder.entries()].sort(
+      (a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0])
+    );
+
+    const groups = folders
+      .map(
+        ([folder, tags]) => `
+        <div class="tag-folder">
+          <h4>
+            <span class="chip folder${folder === NO_FOLDER_TAG ? " unknown" : ""}">${
+              folder === NO_FOLDER_TAG ? "" : ICON.folder
+            }<span class="txt">${escapeHtml(folder)}</span></span>
+            <span class="muted">${tags.length} tag${tags.length === 1 ? "" : "s"}</span>
+          </h4>
+          <div class="table-scroll">
+            <table class="data-table">
+              <thead><tr><th>Tag</th><th>Commit</th><th>Tag creator</th><th>Tag date</th><th>Comment</th></tr></thead>
+              <tbody>
+                ${tags
+                  .map(
+                    (tag) => `
+                  <tr>
+                    <td><span class="chip tag">${ICON.tag}<span class="txt">${escapeHtml(tag.name)}</span></span></td>
+                    <td class="mono">${escapeHtml(tag.commit_sha.slice(0, 10))}
+                        <button type="button" class="copy-sha" data-sha="${escapeAttr(tag.commit_sha)}" title="Copy full hash ${escapeAttr(tag.commit_sha)}" aria-label="Copy full commit hash">${ICON.copy}</button></td>
+                    <td>${
+                      tag.annotated
+                        ? escapeHtml(tag.tagger_name || "unknown")
+                        : '<span class="muted" title="A lightweight tag has no tag object, so git stores no creator or date">lightweight</span>'
+                    }</td>
+                    <td class="mono nowrap">${
+                      tag.tagger_date ? escapeHtml(fmtStamp(tag.tagger_date)) : '<span class="muted">—</span>'
+                    }</td>
+                    <td>${escapeHtml(tag.message || "") || '<span class="muted">—</span>'}</td>
+                  </tr>`
+                  )
+                  .join("")}
+              </tbody>
+            </table>
+          </div>
+        </div>`
+      )
+      .join("");
+
+    parts.push(`
+      <section class="tag-repo">
+        <h3>${escapeHtml(repo.repo)} <span class="muted">${repo.tags.length} tag${repo.tags.length === 1 ? "" : "s"}</span></h3>
+        ${groups}
+      </section>`);
+  }
+
+  const box = document.createElement("div");
+  box.innerHTML = parts.join("");
+  el.tagsBody.replaceChildren(box);
 }
 
 /* ---------- find a commit ---------- */
@@ -1867,6 +2210,23 @@ for (const control of [el.sumBranch, el.sumFolder]) {
   on(control, "change", runSummary);
 }
 
+on(el.tagsRefresh, "click", loadTagsOverview);
+on(el.tagReview, "click", reviewTag);
+on(el.tagBack, "click", () => showTagStep("input"));
+on(el.tagCreate, "click", createStagedTag);
+on(el.tagCancel, "click", () => el.tagDialog.close?.());
+on(el.pushConfirm, "click", confirmPush);
+on(el.pushCancel, "click", () => el.pushDialog.close?.());
+on(document, "click", handleTagClicks);
+// Enter in the name field advances to the confirmation step rather than
+// submitting — creating a tag should never be one keystroke away.
+on(el.tagName, "keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    reviewTag();
+  }
+});
+
 on(el.lkRun, "click", runLookup);
 on(el.lkSha, "keydown", (event) => {
   if (event.key === "Enter") runLookup();
@@ -1881,6 +2241,7 @@ console.info(`[dashboard] build ${APP_BUILD}`);
 (async function init() {
   const cfg = await fetch("/api/config").then((r) => r.json());
   state.config = cfg;
+  refreshStaged();
 
   // A cached script paired with a fresh page is the one failure that makes every
   // control inert at once; say so plainly rather than letting it look like a bug.

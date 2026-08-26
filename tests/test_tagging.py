@@ -1,0 +1,233 @@
+"""Tests for staging and pushing tags.
+
+The push path is exercised against a local bare repository acting as the remote,
+so the whole stage → confirm → push cycle is covered without touching anything
+on the network.
+
+Run with:  .venv/bin/python tests/test_tagging.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from app import csr as csr_provider  # noqa: E402
+from app import tagging  # noqa: E402
+from app.config import load_settings  # noqa: E402
+from app.github import GitHubClient  # noqa: E402
+
+FAILURES: list[str] = []
+ENV = {"PATH": "/usr/bin:/bin:/usr/local/bin"}
+
+
+def check(name: str, got, want) -> None:
+    ok = got == want
+    print(f"{'PASS' if ok else 'FAIL'}  {name}")
+    if not ok:
+        print(f"        got  {got!r}\n        want {want!r}")
+        FAILURES.append(name)
+
+
+def git(args: list[str], cwd: Path | None = None) -> str:
+    env = {**ENV, "HOME": str(cwd or Path("/tmp"))}
+    out = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, env=env)
+    return out.stdout.strip()
+
+
+def test_names() -> None:
+    print("=== tag name validation ===")
+    for good in ["v1.0.0", "release-2026-08", "rc1", "team/v2", "v1.0.0-beta.1"]:
+        try:
+            check(f"{good!r} accepted", tagging.validate_tag_name(good), good)
+        except tagging.TagError as exc:
+            check(f"{good!r} accepted", f"rejected: {exc}", good)
+
+    for bad, why in [
+        ("", "empty"),
+        ("   ", "whitespace only"),
+        ("my tag", "contains a space"),
+        ("-lead", "leading dash"),
+        ("trail.", "trailing dot"),
+        ("a..b", "double dot"),
+        ("a~b", "tilde"),
+        ("a^b", "caret"),
+        ("a:b", "colon"),
+        ("a?b", "question mark"),
+        ("a[b", "bracket"),
+        ("a\\b", "backslash"),
+        ("x.lock", "reserved .lock suffix"),
+        ("a//b", "double slash"),
+        ("/lead", "leading slash"),
+    ]:
+        try:
+            tagging.validate_tag_name(bad)
+            check(f"{why} rejected", "accepted", "rejected")
+        except tagging.TagError:
+            check(f"{why} rejected", "rejected", "rejected")
+
+    check("surrounding whitespace is trimmed", tagging.validate_tag_name("  v2.0  "), "v2.0")
+
+
+@dataclass(frozen=True)
+class Fixture:
+    bare: str
+
+    project: str = "demo"
+    repo: str = "tagged"
+
+    @property
+    def key(self) -> str:
+        return "csr:demo/tagged"
+
+    @property
+    def name(self) -> str:
+        return "demo/tagged"
+
+    @property
+    def clone_url(self) -> str:
+        return self.bare
+
+    @property
+    def web_url(self) -> str:
+        return "https://example.test"
+
+    def commit_url(self, sha: str) -> str:
+        return f"https://example.test/{sha}"
+
+
+async def test_flow(root: Path) -> None:
+    print("\n=== stage → push ===")
+
+    bare = root / "remote.git"
+    work = root / "work"
+    git(["init", "-q", "--bare", str(bare)])
+    git(["init", "-q", "-b", "main", str(work)])
+    git(["config", "user.email", "d@e.test"], work)
+    git(["config", "user.name", "Dev"], work)
+    (work / "a.txt").write_text("one\n")
+    git(["add", "-A"], work)
+    git(["commit", "-qm", "first"], work)
+    git(["remote", "add", "origin", str(bare)], work)
+    git(["push", "-q", "origin", "main"], work)
+    # A second branch, to prove a tag push cannot disturb other refs.
+    git(["checkout", "-qb", "keepme"], work)
+    (work / "b.txt").write_text("two\n")
+    git(["add", "-A"], work)
+    git(["commit", "-qm", "second"], work)
+    git(["push", "-q", "origin", "keepme"], work)
+
+    fixture = Fixture(bare=str(bare))
+    settings = load_settings()
+    settings.repos = []
+    settings.csr_repos = [fixture]
+    settings.gcloud_token = "unused-for-local-paths"
+    settings.mirror_dir = root / "mirror"
+    settings.tag_store_path = root / "tags.sqlite3"
+    settings.tagger_name = "Release Bot"
+    settings.tagger_email = "bot@example.test"
+
+    gh = GitHubClient(settings)
+    mirror = csr_provider.GitMirror(settings)
+    store = tagging.TagStore(settings.tag_store_path)
+
+    path = await mirror.sync(fixture.key, fixture.clone_url)
+    sha = git(["-C", str(path), "rev-parse", "main"])
+
+    refs = lambda: sorted(git(["--git-dir", str(bare), "for-each-ref", "--format=%(refname)"]).split())  # noqa: E731
+    before = refs()
+    check("remote starts with two branches and no tags", before,
+          ["refs/heads/keepme", "refs/heads/main"])
+
+    staged = await tagging.stage_tag(
+        settings, gh, mirror, store,
+        repo_key=fixture.key, sha=sha, name="v1.0.0", message="First release",
+    )
+    check("staging records the tag", (staged["name"], staged["pushed"]), ("v1.0.0", False))
+    check("staging resolves the full sha", staged["sha"], sha)
+    check("staging captures the commit subject", staged["commit_title"], "first")
+    check("STAGING TOUCHES NOTHING ON THE REMOTE", refs(), before)
+
+    check("a staged tag is listed", [t["name"] for t in store.list()], ["v1.0.0"])
+    check("listing can be scoped by repo", len(store.list(fixture.key)), 1)
+    check("and returns nothing for another repo", store.list("github:x/y"), [])
+
+    try:
+        await tagging.stage_tag(settings, gh, mirror, store,
+                                repo_key=fixture.key, sha=sha, name="v1.0.0", message="dup")
+        check("staging the same name twice is refused", "accepted", "refused")
+    except tagging.TagError:
+        check("staging the same name twice is refused", "refused", "refused")
+
+    try:
+        await tagging.stage_tag(settings, gh, mirror, store,
+                                repo_key=fixture.key, sha="deadbeef" * 5, name="v9", message="")
+        check("staging on a missing commit is refused", "accepted", "refused")
+    except tagging.TagError:
+        check("staging on a missing commit is refused", "refused", "refused")
+
+    pushed = await tagging.push_tag(settings, gh, mirror, store, staged["id"])
+    check("push marks the row pushed", pushed["pushed"], True)
+    check("push records no error", pushed["push_error"], None)
+
+    after = refs()
+    check("the tag now exists on the remote", after,
+          ["refs/heads/keepme", "refs/heads/main", "refs/tags/v1.0.0"])
+    check("PUSHING ONE TAG DOES NOT DISTURB THE BRANCHES",
+          [r for r in after if r.startswith("refs/heads/")], before)
+
+    meta = git(["--git-dir", str(bare), "for-each-ref",
+                "--format=%(objecttype)|%(taggername)|%(contents:subject)", "refs/tags/v1.0.0"])
+    kind, tagger, subject = meta.split("|")
+    check("the tag is annotated, not lightweight", kind, "tag")
+    check("the configured tagger is recorded", tagger, "Release Bot")
+    check("the comment becomes the tag message", subject, "First release")
+
+    try:
+        await tagging.push_tag(settings, gh, mirror, store, staged["id"])
+        check("pushing twice is refused", "accepted", "refused")
+    except tagging.TagError:
+        check("pushing twice is refused", "refused", "refused")
+
+    try:
+        await tagging.stage_tag(settings, gh, mirror, store,
+                                repo_key=fixture.key, sha=sha, name="v1.0.0", message="")
+        check("staging a name that now exists remotely is refused", "accepted", "refused")
+    except tagging.TagError:
+        check("staging a name that now exists remotely is refused", "refused", "refused")
+
+    # Discarding only affects the local staging record.
+    second = await tagging.stage_tag(settings, gh, mirror, store,
+                                     repo_key=fixture.key, sha=sha, name="v2.0.0", message="")
+    check("a second tag can be staged", second["name"], "v2.0.0")
+    check("discarding removes it locally", store.delete(second["id"]), True)
+    check("and it never reached the remote", refs(), after)
+    check("discarding an unknown id is a no-op", store.delete(99999), False)
+
+    print("\n=== overview ===")
+    overview = await tagging.tag_overview(settings, gh, mirror, store, lambda commits: None)
+    repo_entry = overview["repos"][0]
+    check("the pushed tag appears in the overview", [t["name"] for t in repo_entry["tags"]], ["v1.0.0"])
+    check("with its folders derived", repo_entry["tags"][0]["folders"], ["(repo root)"])
+    check("and its tagger", repo_entry["tags"][0]["tagger_name"], "Release Bot")
+    check("the total counts it", overview["total"], 1)
+
+    await gh.aclose()
+
+
+def main() -> int:
+    test_names()
+    with tempfile.TemporaryDirectory() as tmp:
+        asyncio.run(test_flow(Path(tmp)))
+    print(f"\n{'ALL PASS' if not FAILURES else f'{len(FAILURES)} FAILURES: ' + ', '.join(FAILURES)}")
+    return 1 if FAILURES else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

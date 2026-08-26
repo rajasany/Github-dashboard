@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from . import compare, lookup, report, summary
+from . import compare, lookup, report, summary, tagging
 from .config import load_settings
 from .csr import GitMirror
 from .feed import build_feed, enrich_commit_folders
@@ -27,6 +27,7 @@ settings = load_settings()
 gh_client: GitHubClient | None = None
 mirror: GitMirror | None = None
 store: FileStore | None = None
+tag_store: tagging.TagStore | None = None
 
 # Single-flight state for the local `gcloud auth login` flow. This app is a
 # localhost, single-user tool — the subprocess opens a browser and writes to
@@ -57,10 +58,11 @@ async def _run_gcloud_login() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global gh_client, mirror, store
+    global gh_client, mirror, store, tag_store
     gh_client = GitHubClient(settings)
     mirror = GitMirror(settings)
     store = FileStore(settings.store_path)
+    tag_store = tagging.TagStore(settings.tag_store_path)
     yield
     await gh_client.aclose()
 
@@ -268,6 +270,73 @@ async def get_lookup(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except GitHubError as exc:
         raise HTTPException(status_code=exc.status or 502, detail=exc.message) from exc
+
+
+class StageTagRequest(BaseModel):
+    repo_key: str
+    sha: str = Field(min_length=4, max_length=40)
+    name: str = Field(min_length=1, max_length=200)
+    message: str = Field(default="", max_length=2000)
+
+
+@app.get("/api/tags/staged")
+async def list_staged_tags(key: str = Query(default=None)) -> dict:
+    assert tag_store is not None
+    return {"staged": tag_store.list(key)}
+
+
+@app.post("/api/tags/stage")
+async def stage_tag(body: StageTagRequest) -> dict:
+    """Record a tag locally. Nothing is sent to the remote by this call."""
+    assert gh_client is not None and mirror is not None and tag_store is not None
+    if body.repo_key not in set(settings.all_keys()):
+        raise HTTPException(status_code=400, detail=f"Unknown repository: {body.repo_key}")
+    try:
+        staged = await tagging.stage_tag(
+            settings, gh_client, mirror, tag_store,
+            repo_key=body.repo_key, sha=body.sha, name=body.name, message=body.message,
+        )
+    except tagging.TagError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"staged": staged}
+
+
+@app.post("/api/tags/push/{tag_id}")
+async def push_staged_tag(tag_id: int) -> dict:
+    """Publish a staged tag to its remote. This is the outward-facing step."""
+    assert gh_client is not None and mirror is not None and tag_store is not None
+    try:
+        pushed = await tagging.push_tag(settings, gh_client, mirror, tag_store, tag_id)
+    except tagging.TagError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"pushed": pushed}
+
+
+@app.delete("/api/tags/staged/{tag_id}")
+async def discard_staged_tag(tag_id: int) -> dict:
+    assert tag_store is not None
+    existing = tag_store.get(tag_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="No such staged tag.")
+    if existing["pushed"]:
+        raise HTTPException(
+            status_code=422,
+            detail="That tag has already been pushed; discarding it here would not remove it "
+                   "from the remote. Delete it on the host instead.",
+        )
+    tag_store.delete(tag_id)
+    return {"discarded": tag_id}
+
+
+@app.get("/api/tags/overview")
+async def tags_overview() -> dict:
+    """Every tag across every repo, with the folders each tagged commit touched."""
+    assert gh_client is not None and mirror is not None and store is not None and tag_store is not None
+
+    async def enrich(commits):
+        return await enrich_commit_folders(settings, gh_client, store, commits)
+
+    return await tagging.tag_overview(settings, gh_client, mirror, tag_store, enrich)
 
 
 @app.get("/api/branches")

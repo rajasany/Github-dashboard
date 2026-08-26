@@ -50,6 +50,7 @@
     <button class="tab" id="tab-summary" data-tab="summary" role="tab" aria-selected="false">Summary table</button>
     <button class="tab" id="tab-compare" data-tab="compare" role="tab" aria-selected="false">Compare branches</button>
     <button class="tab" id="tab-lookup" data-tab="lookup" role="tab" aria-selected="false">Find a commit</button>
+    <button class="tab" id="tab-tags" data-tab="tags" role="tab" aria-selected="false">Tags</button>
   </nav>
 
   <div id="banner" class="banner hidden"></div>
@@ -171,6 +172,7 @@
           </div>
         </section>
         <p id="sum-scope" class="scope-line"></p>
+        <section id="staged-strip" class="staged-strip hidden" aria-label="Tags staged locally"></section>
         <div id="sum-body">
           <div class="state">
             <p class="state-title">Pick a repository and branch</p>
@@ -195,6 +197,17 @@
         <div id="lk-body"></div>
       </div>
 
+      <!-- ============ Tags ============ -->
+      <div id="panel-tags" class="tab-panel hidden">
+        <section class="picker-bar">
+          <div class="picker-actions">
+            <button id="tags-refresh" class="btn primary">Load tags</button>
+          </div>
+          <p class="scope-line" style="margin:0">Every tag across every configured repository, grouped by the service / folder its commit touched.</p>
+        </section>
+        <div id="tags-body"></div>
+      </div>
+
       <!-- ============ Activity feed ============ -->
       <div id="panel-activity" class="tab-panel">
       <div id="stats" class="stats"></div>
@@ -215,6 +228,53 @@
       </div>
     </section>
   </main>
+
+  <dialog id="tag-dialog" class="dialog" aria-labelledby="tag-dialog-title">
+    <form method="dialog" id="tag-form">
+      <h2 id="tag-dialog-title">Create a tag</h2>
+
+      <div id="tag-target" class="dialog-target"></div>
+
+      <div id="tag-step-input">
+        <label class="field block">
+          <span>Tag name</span>
+          <input id="tag-name" class="input" type="text" spellcheck="false" placeholder="v1.2.0" required />
+        </label>
+        <label class="field block">
+          <span>Comment</span>
+          <textarea id="tag-message" class="input" rows="3" placeholder="What this tag marks"></textarea>
+        </label>
+        <p class="dialog-note">The tag is created <strong>on this machine only</strong>. Nothing reaches the remote until you press Push afterwards.</p>
+        <p id="tag-error" class="dialog-error hidden"></p>
+        <div class="dialog-actions">
+          <button type="button" id="tag-cancel" class="btn">Cancel</button>
+          <button type="button" id="tag-review" class="btn primary">Review</button>
+        </div>
+      </div>
+
+      <div id="tag-step-confirm" class="hidden">
+        <div id="tag-summary" class="dialog-confirm"></div>
+        <p id="tag-error-2" class="dialog-error hidden"></p>
+        <div class="dialog-actions">
+          <button type="button" id="tag-back" class="btn">Back</button>
+          <button type="button" id="tag-create" class="btn primary">Create locally</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="push-dialog" class="dialog" aria-labelledby="push-dialog-title">
+    <form method="dialog">
+      <h2 id="push-dialog-title">Push this tag to the remote?</h2>
+      <div id="push-summary" class="dialog-confirm"></div>
+      <p class="dialog-note warn">This writes to the remote repository. Removing it again means deleting the tag on the host.</p>
+      <p id="push-error" class="dialog-error hidden"></p>
+      <div class="dialog-actions">
+        <button type="button" id="push-cancel" class="btn">Cancel</button>
+        <button type="button" id="push-confirm" class="btn primary">Push tag</button>
+      </div>
+    </form>
+  </dialog>
 
   <script src="/static/app.js"></script>
 </body>

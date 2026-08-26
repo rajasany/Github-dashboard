@@ -1029,3 +1029,92 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
   letter-spacing: 0.03em;
   color: var(--muted);
 }
+
+/* ---------- staged tags ---------- */
+
+.staged-strip {
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--amber);
+  border-radius: var(--radius);
+}
+.staged-strip h3 {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.staged-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.staged-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12.5px; }
+.staged-row.is-pushed { opacity: 0.72; }
+.staged-meta { color: var(--muted); }
+.staged-meta code { font: 11px var(--mono); }
+.staged-error { color: #8a1c1c; font-size: 12px; flex-basis: 100%; }
+
+/* ---------- dialogs ---------- */
+
+.dialog {
+  width: min(560px, calc(100vw - 32px));
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+}
+.dialog::backdrop { background: rgba(15, 23, 42, 0.4); }
+.dialog form { padding: 18px 20px 16px; display: flex; flex-direction: column; gap: 10px; }
+.dialog h2 { margin: 0; font-size: 17px; font-weight: 650; }
+.dialog .field.block { margin-bottom: 0; }
+.dialog textarea.input { width: 100%; font: inherit; resize: vertical; }
+.dialog .input { width: 100%; }
+
+.dialog-target,
+.dialog-confirm {
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border-radius: 8px;
+  font-size: 12.5px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.dialog-confirm p { margin: 0 0 2px; }
+.dialog-target .tip-row,
+.dialog-confirm .tip-row { grid-template-columns: 92px minmax(0, 1fr); }
+
+.dialog-note { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.5; }
+.dialog-note.warn { color: #8a5300; }
+.dialog-error {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 7px;
+  background: #fdecec;
+  color: #8a1c1c;
+  font-size: 12.5px;
+}
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
+
+/* ---------- tags overview ---------- */
+
+.tag-repo { margin-bottom: 22px; }
+.tag-repo > h3 {
+  margin: 0 0 10px;
+  font-size: 15px;
+  font-weight: 650;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.tag-repo > h3 .muted { font-size: 12px; font-weight: 400; }
+.tag-folder { margin-bottom: 14px; }
+.tag-folder h4 {
+  margin: 0 0 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 500;
+}

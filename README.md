@@ -137,6 +137,7 @@ a `+` on the file count and may under-report folders.
 | `GCLOUD_ACCESS_TOKEN` | — | Use this OAuth token instead of calling gcloud. |
 | `MIRROR_DIR` | `./.cache/mirrors` | Where CSR mirror clones live. |
 | `GIT_TIMEOUT_SECONDS` | `240` | Timeout for any single git operation. |
+| `TAGGER_NAME` / `TAGGER_EMAIL` | — | Credited as the tagger on tags you create. |
 | `CACHE_TTL_SECONDS` | `120` | Server-side GitHub response cache. **Refresh** clears it. |
 | `MAX_CONCURRENCY` | `8` | Parallel in-flight requests. |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | Bind address for `run.sh`. |
@@ -159,6 +160,10 @@ a `+` on the file count and may under-report folders.
 | `GET /api/feed?since=2026-07-01&until=2026-08-05&key=…&refresh=false` | The merged feed. `since`/`until` are UTC calendar dates; `until` is inclusive and may be omitted for "through to now". `days=N` still works as a lookback when `since` is absent. `key` may repeat; values are `github:owner/repo` or `csr:project/repo`. |
 | `GET /api/summary?key=…&branch=…&folder=…&since=…&limit=100` | One row per commit on a branch, with full tag metadata. |
 | `GET /api/lookup?sha=…` | Which repos and branches hold a commit, and its position in each. |
+| `GET /api/tags/overview` | Every tag, per repo and folder, plus anything staged. |
+| `POST /api/tags/stage` | `{repo_key, sha, name, message}` → stage a tag locally. Writes nothing to the remote. |
+| `POST /api/tags/push/{id}` | Publish a staged tag. **This is the step that reaches the remote.** |
+| `DELETE /api/tags/staged/{id}` | Discard a staged tag that has not been pushed. |
 | `GET /api/branches?key=github:owner/repo` | Every branch of one repository, for the compare pickers. |
 | `GET /api/compare?key=…&base=main&head=feature/x` | Three-dot comparison: commits, changed files, ahead/behind, merge base. |
 | `POST /api/report` | `{format: "pdf"\|"pptx", criteria: {…}, commits: [...]}` → the document as a file download. |
@@ -176,6 +181,7 @@ a `+` on the file count and may under-report folders.
 | [app/report.py](app/report.py) | Rollup + PDF and PowerPoint generation. |
 | [app/summary.py](app/summary.py) | Repo + branch + folder → the commit/tag table. |
 | [app/lookup.py](app/lookup.py) | Hash → repo, branches, graph position. |
+| [app/tagging.py](app/tagging.py) | Tag staging, pushing, and the tag overview. |
 | [app/compare.py](app/compare.py) | Branch comparison for both providers. |
 | [app/feed.py](app/feed.py) | Merges providers, dedupes by `(repo, sha)`, derives folders. |
 | [app/main.py](app/main.py) | Routes. |
@@ -291,6 +297,7 @@ the totals and breakdowns still cover every commit.
 | **Summary table** | For one repo + branch + folder: every commit with its tag, in a flat table. |
 | **Compare branches** | What one branch has that another does not, from their merge base. |
 | **Find a commit** | Given a hash: which repo and branches hold it, and how far each has moved on. |
+| **Tags** | Every tag in every repo, grouped by the service / folder its commit touched. |
 
 The sidebar filters drive the Activity feed only; the other three tabs carry their own
 pickers, so the sidebar folds away on them. The date range in the header applies to
@@ -317,6 +324,49 @@ and no timestamp for it anywhere. Those rows read **lightweight** rather than bo
 the commit's own author and date, which would look like an answer to a question nobody
 asked. `psf/requests`, for instance, uses lightweight tags throughout; `git/git` uses
 annotated ones and shows a real tagger for each.
+
+## Creating tags
+
+From the **Summary table**, each row has a **Tag…** button. The flow is two steps on
+purpose, because a tag on a shared remote is awkward to retract:
+
+1. **Create locally.** Name the tag, add a comment, review a confirmation showing the
+   exact commit and repository, then create. This writes **only** to this app's local
+   store (`.cache/staged-tags.sqlite3`). Nothing leaves the machine.
+2. **Push.** Staged tags appear in a strip above the table marked *local only*, with
+   **Push…** and **Discard**. Push asks for a second confirmation naming the remote,
+   then creates the tag there.
+
+Tags are created **annotated**, so they carry a tagger and a date — a lightweight tag
+would leave those columns permanently blank. Set `TAGGER_NAME` / `TAGGER_EMAIL` in
+`.env` to be credited; without them tags are attributed to "Repo Change Dashboard".
+
+Refused before anything happens: invalid git tag names (spaces, `~ ^ : ? *`, `..`,
+leading/trailing `.` `/` `-`, `.lock`), a name already staged, a name that already
+exists on the remote, and a commit that is not in the repository. Pushing twice is
+refused; discarding is only possible before a push.
+
+Pushing to GitHub needs a token with **write** access to the repository. Pushing to CSR
+uses the mirror. Note that `clone --mirror` sets `remote.origin.mirror`, under which a
+plain push would synchronise *every* ref including deletions — so the push disables that
+for the invocation and names a single explicit refspec. Only the one tag can travel.
+
+## Tags tab
+
+Every tag across every configured repository, grouped by repository and then by the
+service / folder its commit touched:
+
+```
+rajasany/Github-dashboard   1 tag
+  🗂 app        1 tag
+     v1.20   34755374a4   Release Bot   2026-08-26 22:51   Tag and summary work
+  🗂 tests      1 tag
+     v1.20   34755374a4   Release Bot   2026-08-26 22:51   Tag and summary work
+```
+
+A tag whose commit touched several folders is listed under each, so the per-folder
+counts sum to more than the repository's tag total. Lightweight tags show **lightweight**
+in place of a creator and date, for the reason described above.
 
 ## Find a commit
 
@@ -427,7 +477,8 @@ other rule hard-codes a colour.
 ```bash
 .venv/bin/python tests/test_paths.py    # changed paths -> owning folder     (16 checks)
 .venv/bin/python tests/test_report.py   # date window + report rollup        (57 checks)
-.venv/bin/python tests/test_lookup.py   # tag metadata, summary, lookup      (43 checks)
+.venv/bin/python tests/test_lookup.py   # tag metadata, summary, lookup      (47 checks)
+.venv/bin/python tests/test_tagging.py  # staging and pushing tags           (47 checks)
 .venv/bin/python tests/test_compare.py  # branch comparison, real git repo   (25 checks)
 node tests/ui_cascade.test.js          # selection, rendering, escaping      (39 checks)
 ```
