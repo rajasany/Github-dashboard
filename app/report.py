@@ -44,6 +44,7 @@ class Rollup:
     by_service: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     by_author: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     by_day: list[tuple[str, int]] = field(default_factory=list)
+    tagged: list[dict[str, Any]] = field(default_factory=list)
     truncated: int = 0
 
 
@@ -108,6 +109,7 @@ def aggregate(commits: list[dict[str, Any]], criteria: dict[str, Any]) -> Rollup
         "contributors": len(authors),
         "off_default": sum(1 for c in commits if not c.get("on_default")),
         "files_changed": sum(int(c.get("files_changed") or 0) for c in commits),
+        "tags": len({t for c in commits for t in (c.get("tags") or [])}),
     }
 
     by_commits = lambda kv: (-kv[1]["commits"], kv[0])  # noqa: E731
@@ -115,6 +117,8 @@ def aggregate(commits: list[dict[str, Any]], criteria: dict[str, Any]) -> Rollup
     roll.by_service = sorted(services.items(), key=by_commits)
     roll.by_author = sorted(authors.items(), key=by_commits)
     roll.by_day = sorted(days.items(), reverse=True)
+
+    roll.tagged = [c for c in commits if c.get("tags")]
 
     if len(commits) > MAX_DETAIL_ROWS:
         roll.truncated = len(commits) - MAX_DETAIL_ROWS
@@ -292,12 +296,12 @@ def build_pdf(roll: Rollup) -> bytes:
         table(
             [
                 ["Commits", "Repositories", "Services", "Branches", "Contributors",
-                 "Not on default", "File changes"],
+                 "Not on default", "File changes", "Tags"],
                 [str(s["commits"]), str(s["repositories"]), str(s["services"]),
                  str(s["branches"]), str(s["contributors"]), str(s["off_default"]),
-                 str(s["files_changed"])],
+                 str(s["files_changed"]), str(s.get("tags", 0))],
             ],
-            [width / 7] * 7,
+            [width / 8] * 8,
         )
     )
 
@@ -356,12 +360,28 @@ def build_pdf(roll: Rollup) -> bytes:
                   [width / cols] * cols)
         )
 
+    if roll.tagged:
+        story.append(Paragraph("Tagged commits", st["h2"]))
+        story.append(
+            table(
+                [["Tag", "Date", "Repository", "Commit hash", "Message"]]
+                + [
+                    [p(", ".join(c.get("tags") or [])), p((c.get("date") or "")[:10]),
+                     p(_clip(c.get("repo"), 26)), p(c.get("sha") or ""),
+                     p(_clip(c.get("title"), 60))]
+                    for c in roll.tagged
+                ],
+                # A 40-char hash needs ~190pt at 8pt; anything less wraps it.
+                [width * 0.15, width * 0.08, width * 0.16, width * 0.27, width * 0.34],
+            )
+        )
+
     # --- detail ----------------------------------------------------------
     story.append(PageBreak())
     story.append(Paragraph("Commit detail", st["h2"]))
 
     detail = roll.commits[:MAX_DETAIL_ROWS]
-    head = ["Date", "Repository", "Service", "Branch", "Author", "SHA", "Files", "Message"]
+    head = ["Date", "Repository", "Service", "Branch", "Tag", "Author", "Commit", "Files", "Message"]
     body = [
         [
             # ISO dates here rather than "04 Aug 2026": half the width, unambiguous,
@@ -370,10 +390,14 @@ def build_pdf(roll: Rollup) -> bytes:
             p(_clip(c.get("repo"), 26)),
             p(_join(c.get("folders") or [], 2)),
             p(_join(c.get("branches") or [], 2)),
+            p(_join(c.get("tags") or [], 2)),
             p(_clip(c.get("author_name"), 18)),
-            p((c.get("sha") or "")[:7]),
+            # 12 characters, not 7: enough to be unambiguous and to `git checkout`,
+            # while still fitting a nine-column table. The Tagged commits section
+            # and the dashboard both carry the full 40.
+            p((c.get("sha") or "")[:12]),
             str(c.get("files_changed") or 0),
-            p(_clip(c.get("title"), 90)),
+            p(_clip(c.get("title"), 70)),
         ]
         for c in detail
     ]
@@ -382,11 +406,14 @@ def build_pdf(roll: Rollup) -> bytes:
             [head] + body,
             # Sized so Date / SHA / Files / Author never wrap; Message takes the
             # slack and is the only column allowed to run to a second line.
+            # Date, Author, Commit and Files are sized never to wrap; Tag and
+            # Message are text columns and may run to a second line.
             [
-                width * 0.075, width * 0.160, width * 0.140, width * 0.100,
-                width * 0.130, width * 0.060, width * 0.040, width * 0.295,
+                width * 0.075, width * 0.125, width * 0.113, width * 0.082,
+                width * 0.085, width * 0.095, width * 0.098, width * 0.036,
+                width * 0.291,
             ],
-            align_right=[6],
+            align_right=[7],
         )
     )
     if roll.truncated:
@@ -528,7 +555,7 @@ def build_pptx(roll: Rollup) -> bytes:
         ("Commits", s["commits"]), ("Repositories", s["repositories"]),
         ("Services", s["services"]), ("Branches", s["branches"]),
         ("Contributors", s["contributors"]), ("Not on default", s["off_default"]),
-        ("Files changed", s["files_changed"]),
+        ("Files changed", s["files_changed"]), ("Tags", s.get("tags", 0)),
     ]
     cols = 4
     box_w = (SW - Inches(1.2) - Inches(0.3) * (cols - 1)) / cols
@@ -581,12 +608,12 @@ def build_pptx(roll: Rollup) -> bytes:
         slide = add_slide()
         suffix = f" ({idx}/{len(pages)})" if len(pages) > 1 else ""
         header(slide, f"Commit detail{suffix}", span)
-        grid(slide, ["Date", "Repository", "Service", "Branch", "Author", "SHA", "Message"],
+        grid(slide, ["Date", "Repository", "Service", "Branch", "Tag", "Author", "Commit", "Message"],
              [[_fmt_date(c.get("date")), _clip(c.get("repo"), 24),
                _join(c.get("folders") or [], 2), _join(c.get("branches") or [], 2),
-               _clip(c.get("author_name"), 18), (c.get("sha") or "")[:7],
-               _clip(c.get("title"), 58)] for c in chunk],
-             [9, 15, 14, 12, 12, 7, 31])
+               _join(c.get("tags") or [], 1), _clip(c.get("author_name"), 16),
+               (c.get("sha") or "")[:10], _clip(c.get("title"), 46)] for c in chunk],
+             [9, 14, 13, 11, 9, 11, 10, 23])
 
     if roll.truncated:
         slide = add_slide()

@@ -30,9 +30,11 @@
   --accent-ink: #085f55;
   /* Measured from the real topbar at runtime; this is only the pre-paint guess. */
   --topbar-h: 57px;
+  /* Measured at runtime too; sticky headers must clear the topbar AND the tabs. */
+  --tabs-h: 39px;
 }
 
-html { scroll-padding-top: calc(var(--topbar-h) + 12px); }
+html { scroll-padding-top: calc(var(--topbar-h) + var(--tabs-h) + 12px); }
 
 * { box-sizing: border-box; }
 
@@ -161,10 +163,10 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
   flex-direction: column;
   gap: 14px;
   position: sticky;
-  top: calc(var(--topbar-h) + 20px);
+  top: calc(var(--topbar-h) + var(--tabs-h) + 20px);
   /* Bounded so the sidebar scrolls on its own once its panels outgrow the
      viewport, instead of relying on the page/main-canvas scroll. */
-  max-height: calc(100vh - var(--topbar-h) - 40px);
+  max-height: calc(100vh - var(--topbar-h) - var(--tabs-h) - 40px);
   overflow-y: auto;
 }
 
@@ -330,7 +332,7 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
 
 .group-head {
   position: sticky;
-  top: var(--topbar-h);
+  top: calc(var(--topbar-h) + var(--tabs-h));
   z-index: 2;
   display: flex;
   align-items: baseline;
@@ -721,7 +723,7 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
 .file-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .file-table th {
   position: sticky;
-  top: var(--topbar-h);
+  top: calc(var(--topbar-h) + var(--tabs-h));
   z-index: 1;
   text-align: left;
   padding: 8px 12px;
@@ -759,3 +761,234 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
 .file-status.is-added { background: #e6f6ed; color: #14683e; }
 .file-status.is-removed { background: #fdecec; color: #8a1c1c; }
 .file-status.is-renamed { background: #eef1fd; color: #34449b; }
+
+/* ---------- tags ---------- */
+
+/* Tags are a third chip family: amber, square-cornered like services but with a
+   distinct hue and a tag glyph, so release markers never read as a folder. */
+.chip.tag {
+  border-radius: 5px;
+  border-color: transparent;
+  background: #fdf1dc;
+  color: #7a4c05;
+  font-weight: 650;
+}
+
+/* ---------- copyable commit hash ---------- */
+
+.copy-sha {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background-color 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.copy-sha .ic { width: 12px; height: 12px; }
+.copy-sha:hover { background: var(--surface-2); color: var(--accent); border-color: var(--border); }
+.copy-sha:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* A step darker than --green: that only reaches 4.49:1 on this tint. */
+.copy-sha.copied { color: #14683e; border-color: #14683e; background: #e6f6ed; }
+.copy-sha.failed { color: #a3323b; border-color: #a3323b; background: #fdecec; }
+
+/* ---------- latest-commit card ---------- */
+
+.tip-card {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 13px 15px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+}
+.tip-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 1px;
+}
+.tip-head h3 { margin: 0; font-size: 13px; font-weight: 650; }
+.tip-head .muted { font-size: 12px; }
+
+.tip-row {
+  display: grid;
+  grid-template-columns: 118px minmax(0, 1fr);
+  gap: 10px;
+  align-items: baseline;
+  font-size: 12.5px;
+}
+.tip-label {
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.tip-value { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; min-width: 0; }
+.tip-value .chips { margin-top: 0; }
+
+/* The full 40-character hash, selectable for copy-by-hand. */
+.full-sha {
+  font: 12px var(--mono);
+  padding: 2px 7px;
+  background: var(--surface-2);
+  border-radius: 5px;
+  user-select: all;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 560px) {
+  .tip-row { grid-template-columns: 1fr; gap: 2px; }
+}
+
+/* ---------- tab bar ---------- */
+
+.tabs {
+  /* Sticks directly below the topbar. Without this the topbar (sticky, z-index 10)
+     slides over the tab bar as soon as the page scrolls, and the tabs stop being
+     clickable even though they are still painted. */
+  position: sticky;
+  top: var(--topbar-h);
+  z-index: 9;
+  display: flex;
+  gap: 2px;
+  padding: 0 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.tabs::-webkit-scrollbar { display: none; }
+
+.tab {
+  position: relative;
+  padding: 10px 14px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: none;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 550;
+  color: var(--muted);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.12s ease, border-color 0.12s ease;
+}
+.tab:hover { color: var(--text); }
+.tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; border-radius: 4px; }
+.tab.is-active { color: var(--accent-ink); border-bottom-color: var(--accent); font-weight: 650; }
+
+.tab-panel { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+
+/* Tabs other than Activity carry their own pickers, so the sidebar folds away. */
+.layout.no-sidebar { grid-template-columns: minmax(0, 1fr); }
+
+/* ---------- picker bar (summary / compare / lookup) ---------- */
+
+.picker-bar {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  padding: 14px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.picker-bar .field.block { margin-bottom: 0; min-width: 190px; flex: 1 1 190px; }
+.picker-bar .field.block.grow { flex: 3 1 320px; }
+.picker-bar .field.block span { font-size: 11px; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; }
+.picker-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+.lookup-bar .input { width: 100%; font-family: var(--mono); }
+
+/* ---------- dense data tables ---------- */
+
+.data-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.data-table th {
+  position: sticky;
+  top: calc(var(--topbar-h) + var(--tabs-h));
+  z-index: 1;
+  text-align: left;
+  padding: 8px 12px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.data-table td { padding: 7px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.data-table tr:last-child td { border-bottom: none; }
+.data-table tbody tr:hover td { background: var(--surface-2); }
+.data-table .mono { font-family: var(--mono); font-size: 11.5px; }
+.data-table .nowrap { white-space: nowrap; }
+.data-table .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.data-table td a { color: var(--accent-ink); text-decoration: none; }
+.data-table td a:hover { text-decoration: underline; }
+
+/* A commit with two tags spills onto a second line; drop its top border so the
+   pair reads as one commit rather than two. */
+.data-table tr.tag-continuation td { border-top: none; padding-top: 0; }
+.data-table tr.tag-continuation + tr td { border-top: 1px solid var(--border); }
+
+/* ---------- commit lookup ---------- */
+
+.lookup-card {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 15px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+}
+.lookup-card + .lookup-card { margin-top: 14px; }
+.lookup-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 2px;
+}
+.lookup-head h3 { margin: 0; font-size: 15px; font-weight: 650; }
+.lookup-head p { margin: 3px 0 0; font-size: 12.5px; }
+.lookup-sub {
+  margin: 12px 0 2px;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.lookup-card .note { font-size: 12px; margin: 8px 0 0; }
+
+/* How far along a branch the commit sits — position, not magnitude, so it is a
+   track with a marker rather than a bar chart to be compared across rows. */
+.graph-cell { min-width: 160px; }
+.graph-bar {
+  position: relative;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.graph-bar span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+}

@@ -24,6 +24,8 @@ function makeEl(tag) {
     // A real <select> exposes these; selectedText() reads them.
     options: [],
     selectedIndex: 0,
+    // The copy-hash button stores the full sha in a data attribute.
+    dataset: {},
     // Assigning innerHTML replaces an element's content, so it must drop any
     // children the stub is tracking — `feed.innerHTML = ""` relies on that.
     _html: "",
@@ -101,8 +103,13 @@ const context = {
     documentElement: {
       style: { setProperty: (k, v) => rootVars.set(k, v) },
     },
+    // The copy-hash handler is delegated on document, and the clipboard
+    // fallback appends a temporary textarea to body.
+    addEventListener() {},
+    body: { appendChild: (c) => c },
   },
   window: { addEventListener() {} },
+  navigator: { clipboard: { writeText: async () => {} } },
   fetch: () => new Promise(() => {}), // init IIFE hangs harmlessly
   URLSearchParams,
   Date,
@@ -124,7 +131,9 @@ vm.runInContext(
   `globalThis.__api = { state, tally, folderKeysOf, splitFolderKey, repoNameOf,
      scopedTo, STAGE, FOLDER_SEP, visibleCommits, renderStats, folderLabel,
      buildFilters, foldersOf, select, pruneSelections, commitNode, render,
+     showTab, TABS, renderSummary, renderLookup, fmtStamp,
      escapeAttr, escapeHtml, applyPreset, isoDay, rangeLabel, currentCriteria,
+     renderTipCard,
      renderCompare, compareCriteria, exitCompare };`,
   context
 );
@@ -157,6 +166,9 @@ function C(repo_key, folders, branches, author, on_default = true) {
   };
 }
 
+const SHOP_KEY = "github:acme/shop";
+const PAY_KEY = "csr:gcp-proj/pay";
+
 const DATA = {
   repos: REPOS,
   providers: ["csr", "github"],
@@ -172,6 +184,16 @@ const DATA = {
     C("csr:gcp-proj/pay", ["ledger"], ["master"], "carol"),
     C("csr:gcp-proj/pay", ["backend", "ledger"], ["release/1"], "dave", false),
   ],
+};
+
+DATA.commits.forEach((c) => (c.tags = []));
+DATA.commits[1].tags = ["v1.0.0", "release-aug"];
+DATA.commits[3].tags = ["pay-v2"];
+// The repo-level sha -> tags map the feed ships, used to tell "no tags at all"
+// apart from "no tags inside this date range".
+DATA.tags = {
+  [SHOP_KEY]: { sha2: ["v1.0.0", "release-aug"] },
+  [PAY_KEY]: { sha4: ["pay-v2"] },
 };
 
 // One commit gets a body, and one gets hostile characters in its title and URL,
@@ -506,10 +528,9 @@ const CMP = {
 S.compare = CMP;
 api.renderCompare();
 
-check("compare view shown, feed hidden", [
-  !els.get("compare-view").classList.has("hidden"),
-  els.get("feed-view").classList.has("hidden"),
-], [true, true]);
+// Hiding the other views is the tab bar's job now; renderCompare only reveals
+// its own result block.
+check("compare result revealed", !els.get("compare-view").classList.has("hidden"), true);
 check("heading names both branches", els.get("compare-heading").textContent, "main  ←  feature/x");
 check("subtitle explains the direction", /what “feature\/x” has that “main” does not/.test(els.get("compare-sub").textContent), true);
 check("subtitle names the merge base", /abcdef1/.test(els.get("compare-sub").textContent), true);
@@ -553,11 +574,195 @@ check("merge base carried", cc.merge_base, "abcdef1");
 check("range says it is not a date range", /not a date range/.test(cc.range), true);
 
 api.exitCompare();
-check("exiting restores the feed", [
+check("exiting clears the result and the state", [
   els.get("compare-view").classList.has("hidden"),
-  !els.get("feed-view").classList.has("hidden"),
   S.compare,
-], [true, true, null]);
+], [true, null]);
+
+
+console.log("\n=== 20. commit hash and tags on a row ===");
+reset();
+const tagRow = api.commitNode(DATA.commits[1]).innerHTML;
+check("tag chips rendered", (tagRow.match(/class="chip tag"/g) || []).length, 2);
+check("tag name shown", /class="txt">v1.0.0</.test(tagRow), true);
+check("short hash still links out", /class="sha"[^>]*>sha2</.test(tagRow), true);
+check("copy button carries the full hash", /class="copy-sha" data-sha="sha2"/.test(tagRow), true);
+
+const plainRow = api.commitNode(DATA.commits[0]).innerHTML;
+check("untagged commit shows no tag chip", /class="chip tag"/.test(plainRow), false);
+
+console.log("\n=== 21. latest-commit card for a branch + folder ===");
+reset();
+S.repo = SHOP;
+S.branch = "main";
+S.folder = fkey(SHOP, "backend");
+api.render();
+const card = els.get("tip-card");
+check("card is shown", card.classList.has("hidden"), false);
+const tagHereRow = (k) =>
+  (card.innerHTML.match(new RegExp(k + "<\\/span>\\s*<span class=\"tip-value[^>]*>([\\s\\S]*?)<\\/span>\\s*<\\/div>"))
+    || [])[1] || "";
+check("heading names the branch and the folder",
+  /branch main · backend/.test(card.innerHTML), true);
+check("full hash is present", /class="full-sha">sha1</.test(card.innerHTML), true);
+check("card has its own copy button", /class="copy-sha" data-sha="sha1"/.test(card.innerHTML), true);
+check("tip commit is untagged, and the card says so",
+  /no tag on this commit/.test(tagHereRow("Tag here")), true);
+check("nearest tag is reported with a distance",
+  /v1\.0\.0[\s\S]*1 commit back/.test(tagHereRow("Most recent tag")), true);
+
+// A selection whose newest commit IS tagged.
+reset();
+S.repo = PAY;
+S.branch = "master";
+api.render();
+check("tagged tip lists its tag", /class="chip tag"/.test(tagHereRow("Tag here")), true);
+check("no distance row when the tip itself is tagged",
+  /Most recent tag/.test(els.get("tip-card").innerHTML), false);
+
+// Nothing tagged anywhere in scope.
+reset();
+S.repo = SHOP;
+S.folder = fkey(SHOP, "frontend");
+S.branch = "feature/x";
+api.render();
+check("says so when the repo has tags but none in range",
+  /none in the loaded date range/.test(els.get("tip-card").innerHTML), true);
+
+// A repository with no tags at all must not be told to widen the date range.
+const savedTags = DATA.tags;
+DATA.tags = { [SHOP]: {}, [PAY]: {} };
+DATA.commits.forEach((c) => (c.tags = []));
+reset();
+S.repo = SHOP;
+api.render();
+check("a repo with no tags says so, not 'widen the range'",
+  /acme\/shop has no tags/.test(els.get("tip-card").innerHTML), true);
+check("and does not suggest widening the range",
+  /widen it to reach further back/.test(els.get("tip-card").innerHTML), false);
+DATA.tags = savedTags;
+DATA.commits[1].tags = ["v1.0.0", "release-aug"];
+DATA.commits[3].tags = ["pay-v2"];
+
+console.log("\n=== 21b. tags KPI tile ===");
+reset();
+api.renderStats(api.visibleCommits());
+check("tile counts distinct tag names",
+  /<div class="value">3<\/div><div class="label">Tags</.test(els.get("stats").innerHTML), true);
+DATA.commits.forEach((c) => (c.tags = []));
+api.renderStats(api.visibleCommits());
+check("tile reads zero when nothing is tagged",
+  /<div class="value">0<\/div><div class="label">Tags</.test(els.get("stats").innerHTML), true);
+DATA.commits[1].tags = ["v1.0.0", "release-aug"];
+DATA.commits[3].tags = ["pay-v2"];
+
+console.log("\n=== 22. card hides when there is nothing to head ===");
+reset();
+els.get("search").value = "zzz-no-match";
+api.render();
+check("no commits means no card", els.get("tip-card").classList.has("hidden"), true);
+els.get("search").value = "";
+
+
+console.log("\n=== 23. tab bar ===");
+for (const name of ["activity", "summary", "compare", "lookup"]) {
+  api.showTab(name);
+  const visible = ["activity", "summary", "compare", "lookup"].filter(
+    (n) => !els.get(`panel-${n}`).classList.has("hidden")
+  );
+  check(`showTab(${name}) reveals exactly its own panel`, visible, [name]);
+}
+api.showTab("activity");
+check("sidebar shown on Activity", els.get("sidebar").classList.has("hidden"), false);
+api.showTab("summary");
+check("sidebar folded away on other tabs", els.get("sidebar").classList.has("hidden"), true);
+check("layout drops its sidebar column", els.get("layout").classList.has("no-sidebar"), true);
+api.showTab("nonsense");
+check("an unknown tab falls back to Activity", S.tab, "activity");
+
+console.log("\n=== 24. summary table ===");
+const SUM = {
+  repo_key: SHOP, repo: "acme/shop", branch: "main", folder: null,
+  since: "2026-08-01", until: null, limit: 100, capped: false,
+  commits_scanned: 3, row_count: 3, tagged_rows: 2,
+  folders_available: ["backend", "web"],
+  rows: [
+    { sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", url: "#", author_name: "alice",
+      date: "2026-08-04T10:00:00Z", title: "annotated release", folders: ["backend"], files_changed: 2,
+      tags: [{ name: "v2.0.0", annotated: true, tagger_name: "Release Bot",
+               tagger_date: "2026-08-04T11:00:00Z", message: "ship it" }] },
+    { sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", url: "#", author_name: "bob",
+      date: "2026-08-03T10:00:00Z", title: "lightweight tagged", folders: ["web"], files_changed: 1,
+      tags: [{ name: "nightly", annotated: false, tagger_name: null, tagger_date: null, message: null }] },
+    { sha: "cccccccccccccccccccccccccccccccccccccccc", url: "#", author_name: "carol",
+      date: "2026-08-02T10:00:00Z", title: "no tag here", folders: ["backend"], files_changed: 4, tags: [] },
+  ],
+};
+S.summary = SUM;
+api.renderSummary();
+const sumHtml = els.get("sum-body").children[0].innerHTML;
+const headers = [...sumHtml.matchAll(/<th>([^<]+)<\/th>/g)].map((m) => m[1]);
+check("the seven requested columns, in order", headers, [
+  "Commit hash", "Commit creator", "Commit date", "Tag", "Tag creator", "Tag date", "Message",
+]);
+check("annotated tag shows its creator", /Release Bot/.test(sumHtml), true);
+check("annotated tag shows its own date",
+  sumHtml.includes(api.fmtStamp("2026-08-04T11:00:00Z")), true);
+check("lightweight tag is labelled, not faked", /lightweight/.test(sumHtml), true);
+check("lightweight tag has no invented creator", /nightly[\s\S]*?Release Bot/.test(sumHtml), false);
+check("untagged commit renders a dash", (sumHtml.match(/—/g) || []).length >= 2, true);
+check("hash is copyable at full length",
+  /data-sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"/.test(sumHtml), true);
+check("folder picker repopulated from the branch",
+  [...els.get("sum-folder").innerHTML.matchAll(/<option value="([^"]*)"/g)].map((m) => m[1]),
+  ["", "backend", "web"]);
+check("scope line reports counts", /3 commits, 2 tagged/.test(els.get("sum-scope").textContent), true);
+
+S.summary = { ...SUM, rows: [], row_count: 0, tagged_rows: 0, folder: "backend" };
+api.renderSummary();
+check("empty result names the folder that matched nothing",
+  /Nothing touched .backend./.test(els.get("sum-body").children[0].innerHTML), true);
+
+console.log("\n=== 25. commit lookup ===");
+S.lookup = {
+  query: "abc1234", sha: "abc1234", found: true, searched: 2, errors: [],
+  matches: [{
+    provider: "github", repo_key: SHOP, repo: "acme/shop",
+    sha: "abc1234abc1234abc1234abc1234abc1234abc12", url: "#",
+    title: "the commit", body: "", author_name: "alice", author_login: "alice",
+    date: "2026-08-04T10:00:00Z", committer_name: "alice", committer_date: "2026-08-04T10:00:00Z",
+    parents: ["dddddddd"], files_changed: 3, additions: 40, deletions: 5,
+    branches: [
+      { name: "main", is_default: true, distance_to_head: 7, is_head: false, total_commits: 20, position: 13 },
+      { name: "dev", is_default: false, distance_to_head: 0, is_head: true, total_commits: 13, position: 13 },
+    ],
+    branches_probed: 2, branches_unprobed: 0,
+    tags: [{ name: "v1.5", annotated: true, tagger_name: "Tagger Person",
+             tagger_date: "2026-08-04T12:00:00Z", message: "milestone" }],
+    nearest_tag: null, default_branch: "main",
+  }],
+};
+api.renderLookup();
+const lkCard = els.get("lk-body").children[0].innerHTML;
+check("names the repository", /acme\/shop/.test(lkCard), true);
+check("shows the full hash", /abc1234abc1234abc1234abc1234abc1234abc12/.test(lkCard), true);
+check("lists both containing branches", /main/.test(lkCard) && /dev/.test(lkCard), true);
+check("reports distance to head", /<td class="num">7<\/td>/.test(lkCard), true);
+check("reports position within the branch", /13.*of 20/.test(lkCard), true);
+check("marks the branch where it is the head", /at head/.test(lkCard), true);
+check("shows tag creator and tag date",
+  /Tagger Person/.test(lkCard) && lkCard.includes(api.fmtStamp("2026-08-04T12:00:00Z")), true);
+check("draws a progress track", /class="graph-bar"/.test(lkCard), true);
+
+S.lookup = { query: "zzz", sha: "zzz", found: false, searched: 3, matches: [], errors: [] };
+api.renderLookup();
+check("a miss says how many repos were searched",
+  /Searched 3 configured repositories/.test(els.get("lk-body").children[0].innerHTML), true);
+
+console.log("\n=== 26. timestamp formatting ===");
+check("pads to a sortable local stamp", /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(api.fmtStamp("2026-08-04T10:00:00Z")), true);
+check("empty input yields empty output", api.fmtStamp(null), "");
+check("unparseable input is not invented", api.fmtStamp("not-a-date"), "not-a-date");
 
 console.log(allOk ? "\nALL PASS" : "\nSOME FAILURES");
 process.exit(allOk ? 0 : 1);

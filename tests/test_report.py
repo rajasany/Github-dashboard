@@ -25,11 +25,13 @@ def check(name: str, got, want) -> None:
         FAILURES.append(name)
 
 
-def commit(date, repo, folders, branches, author, files=1, on_default=True, sha="abc1234", title="t"):
+def commit(date, repo, folders, branches, author, files=1, on_default=True, sha="abc1234",
+           title="t", tags=None):
     return {
         "date": date, "repo": repo, "folders": folders, "branches": branches,
         "author_name": author, "files_changed": files, "on_default": on_default,
         "sha": sha, "title": title, "provider": "github", "url": "#",
+        "tags": tags or [],
     }
 
 
@@ -40,6 +42,9 @@ COMMITS = [
     commit("2026-08-03T08:00:00Z", "gcp/pay", ["backend"], ["master"], "carol", files=7),
     commit("2026-08-01T08:00:00Z", "gcp/pay", ["ledger"], ["master"], "carol", files=1),
 ]
+# Two tags on one commit, one on another, and one commit deliberately untagged.
+COMMITS[1]["tags"] = ["v1.0.0", "release-aug"]
+COMMITS[3]["tags"] = ["pay-v2"]
 
 
 def test_window() -> None:
@@ -183,11 +188,47 @@ def test_documents() -> None:
     check("no blank cells in any table", empties, 0)
 
 
+def test_tags() -> None:
+    print("\n=== tags ===")
+    roll = report.aggregate(COMMITS, {"since": "2026-08-01"})
+
+    check("distinct tag names counted", roll.summary["tags"], 3)
+    check("tagged commits collected", [c["sha"][:7] for c in roll.tagged], ["abc1234", "abc1234"])
+    check("a commit can carry several tags", sorted(roll.tagged[0]["tags"]), ["release-aug", "v1.0.0"])
+    check("untagged commits are excluded", len(roll.tagged), 2)
+
+    untagged = report.aggregate([c for c in COMMITS if not c["tags"]], {})
+    check("no tags means a zero count, not a crash", untagged.summary["tags"], 0)
+    check("no tagged section when nothing is tagged", untagged.tagged, [])
+
+    pdf = report.build_pdf(roll)
+    check("PDF still builds with tags", pdf[:5], b"%PDF-")
+
+    from io import BytesIO
+
+    from pptx import Presentation
+
+    prs = Presentation(BytesIO(report.build_pptx(roll)))
+    cells = [
+        cell.text
+        for slide in prs.slides
+        for shape in slide.shapes
+        if getattr(shape, "has_table", False) and shape.has_table
+        for row in shape.table.rows
+        for cell in row.cells
+    ]
+    check("deck has a Tag column", "Tag" in cells, True)
+    check("a tag name reaches the deck", any("v1.0.0" in c or "release-aug" in c for c in cells), True)
+    # 12-char prefixes in the detail table, full 40 elsewhere.
+    check("deck carries commit hashes", any(c.startswith("abc1234") for c in cells), True)
+
+
 def main() -> int:
     test_window()
     test_rollup()
     test_criteria_and_naming()
     test_documents()
+    test_tags()
     print(f"\n{'ALL PASS' if not FAILURES else f'{len(FAILURES)} FAILURES: ' + ', '.join(FAILURES)}")
     return 1 if FAILURES else 0
 

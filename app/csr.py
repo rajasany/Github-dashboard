@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import CsrRepo, Settings
-from .models import RepoResult, branch_allowed, make_commit
+from .models import RepoResult, branch_allowed, make_commit, make_tag
 
 # git log record/field separators — chosen so commit messages can't contain them.
 _REC = "\x1e"
@@ -203,6 +203,80 @@ class GitMirror:
                 out.append((name.strip(), date.strip()))
         return out
 
+    async def tags(self, path: Path) -> dict[str, list[str]]:
+        """Map commit sha -> tag names pointing at it.
+
+        `%(*objectname)` is the dereferenced target of an annotated tag and is
+        empty for a lightweight one, so prefer it and fall back to `%(objectname)`.
+        """
+        raw = await self._git(
+            [
+                "-C",
+                str(path),
+                "for-each-ref",
+                f"--format=%(refname:short){_FLD}%(objectname){_FLD}%(*objectname)",
+                "refs/tags/",
+            ]
+        )
+        by_sha: dict[str, list[str]] = {}
+        for line in raw.splitlines():
+            bits = line.split(_FLD)
+            if len(bits) < 3:
+                continue
+            name, direct, dereferenced = bits[0].strip(), bits[1].strip(), bits[2].strip()
+            sha = dereferenced or direct
+            if name and sha:
+                by_sha.setdefault(sha, []).append(name)
+        return by_sha
+
+    async def tag_details(self, path: Path) -> dict[str, list[dict[str, Any]]]:
+        """commit sha -> full tag records. One call: git exposes every field.
+
+        `taggername`/`taggerdate` are populated only for annotated tags; a
+        lightweight tag has no tag object and therefore no author or date.
+        """
+        fields = [
+            "%(refname:short)",
+            "%(objecttype)",
+            "%(objectname)",
+            "%(*objectname)",
+            "%(taggername)",
+            "%(taggeremail)",
+            "%(taggerdate:iso-strict)",
+            "%(contents:subject)",
+        ]
+        raw = await self._git(
+            ["-C", str(path), "for-each-ref", f"--format={_FLD.join(fields)}", "refs/tags/"]
+        )
+
+        by_sha: dict[str, list[dict[str, Any]]] = {}
+        for line in raw.splitlines():
+            bits = line.split(_FLD)
+            if len(bits) < 8:
+                continue
+            name, kind, obj, deref, tagger, email, date, subject = (b.strip() for b in bits[:8])
+            commit_sha = deref or obj
+            if not name or not commit_sha:
+                continue
+            annotated = kind == "tag"
+            by_sha.setdefault(commit_sha, []).append(
+                make_tag(
+                    name=name,
+                    commit_sha=commit_sha,
+                    annotated=annotated,
+                    tagger_name=tagger,
+                    tagger_email=email.strip("<>") if email else None,
+                    tagger_date=date,
+                    # For a lightweight tag `contents:subject` falls through to the
+                    # *commit's* subject. Showing that as a tag message would be a
+                    # plausible-looking lie, so drop it.
+                    message=subject if annotated else None,
+                )
+            )
+        for tags in by_sha.values():
+            tags.sort(key=lambda t: t["name"])
+        return by_sha
+
     async def log(
         self,
         path: Path,
@@ -313,6 +387,10 @@ async def collect_repo(
     errors: list[dict[str, str]] = []
     default = await mirror.default_branch(path)
     all_branches = await mirror.branches(path)
+    try:
+        repo_tags = await mirror.tags(path)
+    except CsrError:
+        repo_tags = {}  # tags are decoration, never a reason to lose the feed
 
     allowed = [
         (name, tip)
@@ -359,4 +437,5 @@ async def collect_repo(
         private=True,
         commits=commits,
         errors=errors,
+        tags=repo_tags,
     )

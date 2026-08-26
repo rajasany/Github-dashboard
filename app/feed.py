@@ -175,9 +175,14 @@ async def build_feed(
     errors: list[dict[str, str]] = []
     repo_meta: list[dict[str, Any]] = []
     merged: dict[str, dict[str, Any]] = {}
+    # repo key -> {sha: [tag, ...]} for every tag in the repo, not just the ones
+    # landing inside the date window — the UI needs the full set to answer
+    # "what is the newest tag on this branch".
+    tags_by_repo: dict[str, dict[str, list[str]]] = {}
 
     for result in results:
         errors.extend(result.errors)
+        tags_by_repo[result.key] = result.tags
 
         active: set[str] = set()
         for commit in result.commits:
@@ -201,6 +206,9 @@ async def build_feed(
         default_branch = defaults.get(entry["repo_key"])
         entry["on_default"] = bool(default_branch) and default_branch in entry["branches"]
         entry["branches"].sort(key=lambda b: (b != default_branch, b))
+        # Tags pointing at this exact commit. Sorted so a release tag and its
+        # aliases (v1.2.0, v1.2, latest) always list in a stable order.
+        entry["tags"] = sorted(tags_by_repo.get(entry["repo_key"], {}).get(entry["sha"], []))
 
         if settings.folders_enabled:
             entry["folders"] = derive_folders(
@@ -236,6 +244,10 @@ async def build_feed(
         "errors": errors,
         "rate_limit": gh_client.rate_limit.as_dict(),
         "providers": sorted({r["provider"] for r in repo_meta}),
+        # Full sha -> tags map per repo, so the UI can resolve a tag for any
+        # commit it holds without another round trip.
+        "tags": tags_by_repo,
+        "tags_total": sum(len(v) for m in tags_by_repo.values() for v in m.values()),
         "folders": {
             "enabled": settings.folders_enabled,
             "depth": settings.folder_depth,

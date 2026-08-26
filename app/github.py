@@ -9,7 +9,7 @@ import httpx
 
 from .cache import TTLCache
 from .config import Settings
-from .models import RepoResult, branch_allowed, make_commit
+from .models import RepoResult, branch_allowed, make_commit, make_tag
 
 USER_AGENT = "github-change-dashboard/0.1"
 
@@ -126,6 +126,87 @@ class GitHubClient:
         data = await self._get(f"/repos/{full_name}/commits", params)
         return data if isinstance(data, list) else []
 
+    async def list_tags(self, full_name: str, max_pages: int = 3) -> dict[str, list[str]]:
+        """Map commit sha -> tag names pointing at it.
+
+        The `/tags` endpoint already dereferences annotated tags, so `commit.sha`
+        is the commit itself rather than the tag object.
+        """
+        by_sha: dict[str, list[str]] = {}
+        for page in range(1, max_pages + 1):
+            batch = await self._get(f"/repos/{full_name}/tags", {"per_page": 100, "page": page})
+            if not isinstance(batch, list) or not batch:
+                break
+            for tag in batch:
+                sha = ((tag or {}).get("commit") or {}).get("sha")
+                name = (tag or {}).get("name")
+                if sha and name:
+                    by_sha.setdefault(sha, []).append(name)
+            if len(batch) < 100:
+                break
+        return by_sha
+
+    async def list_tag_details(self, full_name: str, max_pages: int = 3) -> dict[str, list[dict[str, Any]]]:
+        """commit sha -> full tag records, including tagger and tag date.
+
+        The plain `/tags` endpoint carries no tagger, so this walks the refs
+        instead: `object.type == "tag"` means an annotated tag whose own object
+        has to be fetched for its tagger; `"commit"` means a lightweight tag,
+        which has no tagger anywhere.
+        """
+        refs: list[dict[str, Any]] = []
+        for page in range(1, max_pages + 1):
+            try:
+                batch = await self._get(
+                    f"/repos/{full_name}/git/refs/tags", {"per_page": 100, "page": page}
+                )
+            except GitHubError as exc:
+                # A repo with no tags at all answers 404 here, which is not an error.
+                if exc.status == 404:
+                    return {}
+                raise
+            if not isinstance(batch, list) or not batch:
+                break
+            refs.extend(batch)
+            if len(batch) < 100:
+                break
+
+        async def resolve(ref: dict[str, Any]) -> dict[str, Any] | None:
+            name = str(ref.get("ref", "")).removeprefix("refs/tags/")
+            obj = ref.get("object") or {}
+            sha, kind = obj.get("sha"), obj.get("type")
+            if not name or not sha:
+                return None
+
+            if kind != "tag":
+                return make_tag(name=name, commit_sha=sha, annotated=False)
+
+            try:
+                detail = await self._get(f"/repos/{full_name}/git/tags/{sha}")
+            except GitHubError:
+                # Fall back to the ref alone rather than dropping the tag.
+                return make_tag(name=name, commit_sha=sha, annotated=True)
+            tagger = (detail or {}).get("tagger") or {}
+            return make_tag(
+                name=name,
+                commit_sha=((detail or {}).get("object") or {}).get("sha") or sha,
+                annotated=True,
+                tagger_name=tagger.get("name"),
+                tagger_email=tagger.get("email"),
+                tagger_date=tagger.get("date"),
+                message=(detail or {}).get("message"),
+            )
+
+        resolved = await asyncio.gather(*(resolve(r) for r in refs))
+
+        by_sha: dict[str, list[dict[str, Any]]] = {}
+        for tag in resolved:
+            if tag:
+                by_sha.setdefault(tag["commit_sha"], []).append(tag)
+        for tags in by_sha.values():
+            tags.sort(key=lambda t: t["name"])
+        return by_sha
+
     async def get_compare(self, full_name: str, base: str, head: str) -> dict[str, Any]:
         """Three-dot comparison: what `head` has that `base` does not.
 
@@ -150,6 +231,49 @@ class GitHubClient:
         files = data.get("files") or []
         paths = [f.get("filename", "") for f in files if isinstance(f, dict)]
         return [p for p in paths if p], len(files) >= 300
+
+
+async def collect_branch(
+    client: GitHubClient,
+    full_name: str,
+    branch: str,
+    since: str,
+    until: str | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Normalised commits for one branch only — no fan-out over the whole repo."""
+    raw = await client.list_commits(full_name, branch, since, until, limit)
+    key = f"github:{full_name}"
+    return [_commit_from_api(c, key, full_name, branch) for c in raw]
+
+
+async def count_branch_commits(client: GitHubClient, full_name: str, branch: str) -> int | None:
+    """Total commits reachable from a branch tip.
+
+    There is no count endpoint, so this asks for a single commit per page and
+    reads the page number of the `last` link — that number *is* the total.
+    Returns None when the header is absent (a branch of one page).
+    """
+    import re
+
+    path = f"/repos/{full_name}/commits"
+    params = {"sha": branch, "per_page": 1}
+    async with client._semaphore:  # noqa: SLF001 — same package, needs the raw headers
+        try:
+            response = await client._client.get(path, params=params)  # noqa: SLF001
+        except httpx.RequestError:
+            return None
+    client.rate_limit.update(response.headers)
+    if response.status_code >= 400:
+        return None
+
+    link = response.headers.get("link", "")
+    match = re.search(r'[?&]page=(\d+)>;\s*rel="last"', link)
+    if match:
+        return int(match.group(1))
+    # No `last` link means a single page: count what came back.
+    body = response.json()
+    return len(body) if isinstance(body, list) else None
 
 
 def _commit_from_api(raw: dict[str, Any], repo_key: str, repo_name: str, branch: str) -> dict[str, Any]:
@@ -183,8 +307,10 @@ async def collect_repo(
     key = f"github:{full_name}"
 
     try:
-        meta, branches = await asyncio.gather(
-            client.get_repo(full_name), client.list_branches(full_name)
+        meta, branches, tags = await asyncio.gather(
+            client.get_repo(full_name),
+            client.list_branches(full_name),
+            client.list_tags(full_name),
         )
     except GitHubError as exc:
         return RepoResult(
@@ -245,4 +371,5 @@ async def collect_repo(
         private=bool(meta.get("private", False)),
         commits=commits,
         errors=errors,
+        tags=tags,
     )

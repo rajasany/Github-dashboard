@@ -1,6 +1,33 @@
 /* Repo Change Dashboard — one commit feed across providers, repos, branches, services. */
 
-const $ = (id) => document.getElementById(id);
+/* Build marker — check this in the console to be sure you are not looking at a
+ * cached script from a previous version. */
+const APP_BUILD = "2026-08-26.tabs";
+
+/* The ?v= fingerprint this very file was fetched with. Compared against the
+ * server's current fingerprint in init(), so a stale cached script reports
+ * itself instead of failing in confusing ways. */
+const LOADED_VERSION = (() => {
+  // Read straight off the src string: `new URL()` would make this line depend on
+  // a global that need not exist wherever this file is evaluated.
+  const src = document.currentScript?.src || "";
+  return (src.match(/[?&]v=([^&]*)/) || [])[1] || "";
+})();
+
+const $ = (id) => {
+  const node = document.getElementById(id);
+  if (!node) console.warn(`[dashboard] no element with id "${id}" — a control will be inert`);
+  return node;
+};
+
+/* Attach a listener without letting one missing element take down the rest of
+ * the page. Before this, a single stale id threw during wiring and every
+ * listener declared after it — including the tab bar — was never attached. */
+function on(target, event, handler) {
+  if (!target) return false;
+  target.addEventListener(event, handler);
+  return true;
+}
 
 const PROVIDER_LABEL = { github: "GitHub", csr: "Cloud Source Repos" };
 const NO_FOLDER = "(no folder data)";
@@ -15,6 +42,10 @@ const ICON = {
     '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M2 4.4a1.2 1.2 0 0 1 1.2-1.2h2.5l1.4 1.6h5.7A1.2 1.2 0 0 1 14 6v5.6a1.2 1.2 0 0 1-1.2 1.2H3.2A1.2 1.2 0 0 1 2 11.6V4.4Z"/></svg>',
   branch:
     '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M4.5 6v6M4.5 11c0-2.8 2.2-4.6 5-4.6"/><circle cx="4.5" cy="3.6" r="1.9" fill="currentColor" stroke="none"/><circle cx="11.4" cy="5.4" r="1.9" fill="currentColor" stroke="none"/></svg>',
+  tag:
+    '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M7.6 2H3.2A1.2 1.2 0 0 0 2 3.2v4.4c0 .32.13.62.35.85l5.6 5.6a1.2 1.2 0 0 0 1.7 0l4.3-4.3a1.2 1.2 0 0 0 0-1.7l-5.6-5.6A1.2 1.2 0 0 0 7.6 2Z"/><circle cx="5.2" cy="5.2" r="1" fill="currentColor" stroke="none"/></svg>',
+  copy:
+    '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.4"/><path d="M10.5 5.5v-1a1.4 1.4 0 0 0-1.4-1.4H3.9A1.4 1.4 0 0 0 2.5 4.5v5.2a1.4 1.4 0 0 0 1.4 1.4h1"/></svg>',
   caret:
     '<svg class="ic caret" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6 3.5 11 8l-5 4.5V3.5Z"/></svg>',
   search:
@@ -34,9 +65,25 @@ const el = {
   exportPdf: $("export-pdf"),
   exportPptx: $("export-pptx"),
   scopeLine: $("scope-line"),
-  feedView: $("feed-view"),
-  comparePanel: $("compare-panel"),
+  tipCard: $("tip-card"),
+  layout: $("layout"),
+  sidebar: $("sidebar"),
+  panelActivity: $("panel-activity"),
+  panelSummary: $("panel-summary"),
+  panelCompare: $("panel-compare"),
+  panelLookup: $("panel-lookup"),
+  compareRepo: $("compare-repo"),
   compareScope: $("compare-scope"),
+  sumRepo: $("sum-repo"),
+  sumBranch: $("sum-branch"),
+  sumFolder: $("sum-folder"),
+  sumRun: $("sum-run"),
+  sumCsv: $("sum-csv"),
+  sumScope: $("sum-scope"),
+  sumBody: $("sum-body"),
+  lkSha: $("lk-sha"),
+  lkRun: $("lk-run"),
+  lkBody: $("lk-body"),
   compareBase: $("compare-base"),
   compareHead: $("compare-head"),
   compareRun: $("compare-run"),
@@ -46,7 +93,6 @@ const el = {
   compareSub: $("compare-sub"),
   compareStatus: $("compare-status"),
   compareLink: $("compare-link"),
-  compareExit: $("compare-exit"),
   compareExportPdf: $("compare-export-pdf"),
   compareExportPptx: $("compare-export-pptx"),
   compareStats: $("compare-stats"),
@@ -85,6 +131,9 @@ const state = {
   author: null,
   // Non-null puts the pane into branch-comparison mode instead of the feed.
   compare: null,
+  tab: "activity",
+  summary: null,
+  lookup: null,
 };
 
 /** Folders a commit touched, with an explicit bucket when we have no data. */
@@ -279,11 +328,14 @@ function onDataLoaded() {
   for (const c of state.data.commits) c.is_revert = isRevert(c);
   annotateChurn(state.data.commits);
 
+  // A tab opened before the feed landed will have empty pickers; fill them now.
+  initSummaryTab();
+  initCompareTab();
+
   // A refresh can retire options the user had selected.
   pruneSelections();
   buildFilters();
   render();
-  loadBranchesForCompare();
 }
 
 /* ---------- filters ---------- */
@@ -455,17 +507,10 @@ function pruneSelections() {
 }
 
 function select(dimension, key) {
-  const repoBefore = state.repo;
   state[dimension] = key;
   pruneSelections();
   buildFilters();
   render();
-  // The compare pickers list every branch of the selected repo, so they have to
-  // be refetched when that selection moves.
-  if (state.repo !== repoBefore) {
-    exitCompare();
-    loadBranchesForCompare();
-  }
 }
 
 function buildFilters() {
@@ -587,6 +632,9 @@ function renderStats(commits) {
     ["Active branches", branches.size],
     ["Contributors", authors.size],
     ["Files changed", filesChanged.toLocaleString()],
+    // Counts distinct tag names on the visible commits, so a zero here answers
+    // "why am I seeing no tags?" without hunting through the feed.
+    ["Tags", new Set(commits.flatMap((c) => c.tags || [])).size],
     ["Not on default branch", offDefault],
     ["Reverts", commits.filter((c) => c.is_revert).length],
   ];
@@ -662,6 +710,14 @@ function commitNode(c) {
         .join("")
     : "";
 
+  // Tags pointing at this exact commit — the release marker, if any.
+  const tagChips = (c.tags || [])
+    .map(
+      (tagName) =>
+        `<span class="chip tag" title="${escapeAttr(`Tag: ${tagName}`)}">${ICON.tag}<span class="txt">${escapeHtml(tagName)}</span></span>`
+    )
+    .join("");
+
   const fileCount = c.files_changed
     ? `<span class="files" title="${c.files_truncated ? "At least " : ""}${c.files_changed} file${c.files_changed === 1 ? "" : "s"} changed">${c.files_changed} file${c.files_changed === 1 ? "" : "s"}${c.files_truncated ? "+" : ""}</span>`
     : "";
@@ -687,13 +743,14 @@ function commitNode(c) {
         ${revertBadge}
         ${churnBadge}
       </div>
-      <div class="chips">${folderChips}${branchChips}</div>
+      <div class="chips">${tagChips}${folderChips}${branchChips}</div>
       ${body}
     </div>
     <div class="commit-side">
       <time class="when" datetime="${escapeAttr(c.date || "")}" title="${escapeAttr(absoluteTime(c.date))}">${relativeTime(c.date)}</time>
       <span class="side-row">
-        <a class="sha" href="${escapeAttr(c.url)}" target="_blank" rel="noopener" title="View commit ${escapeAttr(c.sha || "")}">${escapeHtml((c.sha || "").slice(0, 7))}</a>
+        <a class="sha" href="${escapeAttr(c.url)}" target="_blank" rel="noopener" title="Open commit ${escapeAttr(c.sha || "")}">${escapeHtml((c.sha || "").slice(0, 7))}</a>
+        <button type="button" class="copy-sha" data-sha="${escapeAttr(c.sha || "")}" title="Copy full hash ${escapeAttr(c.sha || "")}" aria-label="Copy full commit hash">${ICON.copy}</button>
         ${fileCount}
       </span>
     </div>`;
@@ -736,6 +793,7 @@ function render() {
     el.search.value.trim() && `“${el.search.value.trim()}”`,
   ].filter(Boolean);
   el.scopeLine.textContent = crumbs.join("  ›  ");
+  renderTipCard(commits);
 
   el.feed.innerHTML = "";
   if (!commits.length) {
@@ -829,35 +887,59 @@ function stateNode(title, hint) {
 
 const FILE_STATUS_ORDER = { added: 0, modified: 1, renamed: 2, copied: 3, changed: 4, removed: 5 };
 
-async function loadBranchesForCompare() {
-  const repoKey = state.repo;
-  el.comparePanel.classList.toggle("dimmed", !repoKey);
-
-  if (!repoKey) {
-    el.compareScope.textContent = "Select a single repository above to compare its branches.";
-    el.compareBase.innerHTML = "";
-    el.compareHead.innerHTML = "";
-    el.compareRun.disabled = true;
-    el.compareSwap.disabled = true;
-    return;
+/* Repo, base and head all live in this tab now, so the comparison no longer
+ * depends on whatever the Activity sidebar happens to have selected. */
+/* The configured repositories, from the feed when it has loaded and from
+ * /api/config otherwise. The other tabs must not sit empty just because the
+ * Activity feed is still in flight, or failed. */
+function repoOptions() {
+  if (state.data?.repos?.length) {
+    return state.data.repos.map((r) => ({ key: r.key, name: r.full_name }));
   }
+  const cfg = state.config;
+  if (!cfg) return [];
+  return [
+    ...(cfg.repos || []).map((name) => ({ key: `github:${name}`, name })),
+    ...(cfg.csr_repos || []).map((r) => ({ key: r.key, name: `${r.project}/${r.repo}` })),
+  ];
+}
 
-  el.compareScope.textContent = `in ${repoNameOf(repoKey)}`;
+function fillRepoSelect(select, selected) {
+  const repos = repoOptions();
+  select.innerHTML = repos
+    .map(
+      (r) =>
+        `<option value="${escapeAttr(r.key)}"${r.key === selected ? " selected" : ""}>${escapeHtml(r.name)}</option>`
+    )
+    .join("");
+  return select.value || null;
+}
+
+async function fetchBranches(repoKey) {
+  const res = await fetch(`/api/branches?key=${encodeURIComponent(repoKey)}`);
+  const body = await res.json();
+  if (!res.ok) throw new Error(body.detail || res.statusText);
+  return body;
+}
+
+async function loadBranchesForCompare() {
+  const repoKey = el.compareRepo.value;
+  if (!repoKey) return;
+
+  el.compareScope.textContent = `Loading branches for ${repoNameOf(repoKey)}…`;
   el.compareRun.disabled = true;
-  el.compareBase.innerHTML = '<option>Loading…</option>';
+  el.compareSwap.disabled = true;
+  el.compareBase.innerHTML = "";
   el.compareHead.innerHTML = "";
 
   try {
-    const res = await fetch(`/api/branches?key=${encodeURIComponent(repoKey)}`);
-    const body = await res.json();
-    if (!res.ok) throw new Error(body.detail || res.statusText);
-
+    const body = await fetchBranches(repoKey);
     const names = body.branches || [];
+
     if (names.length < 2) {
-      el.compareScope.textContent = `${repoNameOf(repoKey)} has only one branch — nothing to compare.`;
-      el.compareBase.innerHTML = "";
-      el.compareRun.disabled = true;
-      el.compareSwap.disabled = true;
+      el.compareScope.textContent = `${repoNameOf(repoKey)} has ${
+        names.length === 1 ? "only one branch" : "no branches"
+      } — nothing to compare.`;
       return;
     }
 
@@ -867,24 +949,20 @@ async function loadBranchesForCompare() {
     el.compareBase.innerHTML = options;
     el.compareHead.innerHTML = options;
 
-    // Default to "what would merging X into the default branch bring?", which is
-    // the question people almost always mean.
-    const fallback = body.default_branch && names.includes(body.default_branch) ? body.default_branch : names[0];
+    // Default to "what would merging X into the default branch bring?".
+    const fallback = names.includes(body.default_branch) ? body.default_branch : names[0];
     el.compareBase.value = fallback;
     el.compareHead.value = names.find((n) => n !== fallback) || names[0];
+    el.compareScope.textContent = `${names.length} branches in ${repoNameOf(repoKey)}`;
     el.compareRun.disabled = false;
     el.compareSwap.disabled = false;
   } catch (err) {
     el.compareScope.textContent = `Could not list branches: ${err.message}`;
-    el.compareBase.innerHTML = "";
-    el.compareHead.innerHTML = "";
-    el.compareRun.disabled = true;
-    el.compareSwap.disabled = true;
   }
 }
 
 async function runCompare() {
-  const repoKey = state.repo;
+  const repoKey = el.compareRepo.value;
   const base = el.compareBase.value;
   const head = el.compareHead.value;
   if (!repoKey || !base || !head) return;
@@ -917,15 +995,13 @@ async function runCompare() {
 
 function exitCompare() {
   state.compare = null;
-  el.compareView.classList.add("hidden");
-  el.feedView.classList.remove("hidden");
+  el.compareView?.classList.add("hidden");
 }
 
 function renderCompare() {
   const c = state.compare;
   if (!c) return;
 
-  el.feedView.classList.add("hidden");
   el.compareView.classList.remove("hidden");
 
   el.compareHeading.textContent = `${c.base}  ←  ${c.head}`;
@@ -1050,6 +1126,502 @@ function renderCompare() {
     box.appendChild(note);
   }
   el.compareBody.appendChild(box);
+}
+
+/* ---------- commit hash + tag readout ---------- */
+
+async function copyText(text, button) {
+  const done = (ok) => {
+    button.classList.toggle("copied", ok);
+    button.classList.toggle("failed", !ok);
+    button.title = ok ? "Copied" : "Could not copy — select the hash and copy manually";
+    setTimeout(() => {
+      button.classList.remove("copied", "failed");
+      button.title = `Copy full hash ${text}`;
+    }, 1400);
+  };
+  try {
+    await navigator.clipboard.writeText(text);
+    done(true);
+  } catch {
+    // Clipboard access is refused on insecure origins and without a gesture;
+    // fall back rather than failing silently.
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      done(ok);
+    } catch {
+      done(false);
+    }
+  }
+}
+
+/* One delegated listener rather than one per row — the feed is re-rendered on
+ * every filter change, and per-row handlers would leak with it. */
+function handleCopyClick(event) {
+  const button = event.target.closest?.(".copy-sha");
+  if (!button) return;
+  event.preventDefault();
+  copyText(button.dataset.sha || "", button);
+}
+
+/* The head of the current selection: which commit a branch + folder is sitting
+ * on right now, its full hash, and the release it belongs to. */
+function renderTipCard(commits) {
+  if (!commits.length || state.compare) {
+    el.tipCard.classList.add("hidden");
+    return;
+  }
+
+  const tip = commits[0]; // visibleCommits() is newest-first
+  const scope = [
+    state.branch ? `branch ${state.branch}` : null,
+    state.folder ? splitFolderKey(state.folder).folder : null,
+    !state.branch && !state.folder && state.repo ? repoNameOf(state.repo) : null,
+  ].filter(Boolean);
+
+  // Nearest tag at or before the tip, scanning down the visible list.
+  const tagIndex = commits.findIndex((c) => (c.tags || []).length);
+  const tagged = tagIndex >= 0 ? commits[tagIndex] : null;
+
+  const tagsHere = (tip.tags || []).length
+    ? (tip.tags || [])
+        .map((n) => `<span class="chip tag">${ICON.tag}<span class="txt">${escapeHtml(n)}</span></span>`)
+        .join("")
+    : `<span class="muted">no tag on this commit</span>`;
+
+  let nearest = "";
+  if (tagged && tagIndex > 0) {
+    nearest = `<div class="tip-row">
+        <span class="tip-label">Most recent tag</span>
+        <span class="tip-value">
+          <span class="chip tag">${ICON.tag}<span class="txt">${escapeHtml((tagged.tags || [])[0])}</span></span>
+          <span class="muted">${tagIndex} commit${tagIndex === 1 ? "" : "s"} back, at ${escapeHtml(tagged.sha.slice(0, 7))}</span>
+        </span>
+      </div>`;
+  } else if (!tagged) {
+    // "None in this range" would be misleading if the repository has no tags at
+    // all — it implies widening the date range would turn some up.
+    const repoKeys = new Set(commits.map((c) => c.repo_key));
+    const tagsInScope = [...repoKeys].reduce(
+      (n, key) => n + Object.keys(state.data.tags?.[key] || {}).length,
+      0
+    );
+    const names = [...repoKeys].map(repoNameOf).join(", ");
+    nearest = `<div class="tip-row">
+        <span class="tip-label">Most recent tag</span>
+        <span class="tip-value muted">${
+          tagsInScope
+            ? "none in the loaded date range — widen it to reach further back"
+            : `${escapeHtml(names)} has no tags`
+        }</span>
+      </div>`;
+  }
+
+  el.tipCard.classList.remove("hidden");
+  el.tipCard.innerHTML = `
+    <div class="tip-head">
+      <h3>Latest commit${scope.length ? ` · ${escapeHtml(scope.join(" · "))}` : ""}</h3>
+      <span class="muted">${escapeHtml(relativeTime(tip.date))}</span>
+    </div>
+    <div class="tip-row">
+      <span class="tip-label">Commit hash</span>
+      <span class="tip-value">
+        <code class="full-sha">${escapeHtml(tip.sha)}</code>
+        <button type="button" class="copy-sha" data-sha="${escapeAttr(tip.sha)}" title="Copy full hash ${escapeAttr(tip.sha)}" aria-label="Copy full commit hash">${ICON.copy}</button>
+        <a class="btn tiny" href="${escapeAttr(tip.url)}" target="_blank" rel="noopener">Open</a>
+      </span>
+    </div>
+    <div class="tip-row">
+      <span class="tip-label">Tag here</span>
+      <span class="tip-value">${tagsHere}</span>
+    </div>
+    ${nearest}
+    <div class="tip-row">
+      <span class="tip-label">Message</span>
+      <span class="tip-value">${escapeHtml(tip.title)} <span class="muted">— ${escapeHtml(tip.author_name)}</span></span>
+    </div>`;
+}
+
+/* ---------- tabs ---------- */
+
+const TABS = {
+  activity: { panel: () => el.panelActivity, sidebar: true },
+  summary: { panel: () => el.panelSummary, sidebar: false, onShow: initSummaryTab },
+  compare: { panel: () => el.panelCompare, sidebar: false, onShow: initCompareTab },
+  lookup: { panel: () => el.panelLookup, sidebar: false, onShow: () => el.lkSha.focus?.() },
+};
+
+function showTab(name) {
+  const tab = TABS[name] || TABS.activity;
+  state.tab = name in TABS ? name : "activity";
+
+  for (const [key, def] of Object.entries(TABS)) {
+    def.panel().classList.toggle("hidden", key !== state.tab);
+    const button = $(`tab-${key}`);
+    if (button) {
+      button.classList.toggle("is-active", key === state.tab);
+      button.setAttribute("aria-selected", String(key === state.tab));
+    }
+  }
+  // Only the activity feed is driven by the sidebar filters; the other tabs
+  // carry their own pickers, so the sidebar would just be dead weight.
+  el.sidebar.classList.toggle("hidden", !tab.sidebar);
+  el.layout.classList.toggle("no-sidebar", !tab.sidebar);
+  tab.onShow?.();
+}
+
+function initCompareTab() {
+  if (el.compareRepo.options.length || !repoOptions().length) return;
+  fillRepoSelect(el.compareRepo, state.repo);
+  loadBranchesForCompare();
+}
+
+/* ---------- summary table ---------- */
+
+function initSummaryTab() {
+  if (el.sumRepo.options.length || !repoOptions().length) return;
+  fillRepoSelect(el.sumRepo, state.repo);
+  loadBranchesForSummary();
+}
+
+async function loadBranchesForSummary() {
+  const repoKey = el.sumRepo.value;
+  if (!repoKey) return;
+  el.sumBranch.innerHTML = "<option>Loading…</option>";
+  el.sumRun.disabled = true;
+  try {
+    const body = await fetchBranches(repoKey);
+    const names = body.branches || [];
+    el.sumBranch.innerHTML = names
+      .map((n) => `<option value="${escapeAttr(n)}">${escapeHtml(n)}</option>`)
+      .join("");
+    if (names.includes(body.default_branch)) el.sumBranch.value = body.default_branch;
+    el.sumRun.disabled = !names.length;
+    // Folders are only known once a branch has been read, so start permissive.
+    el.sumFolder.innerHTML = '<option value="">All folders</option>';
+  } catch (err) {
+    el.sumBranch.innerHTML = "";
+    el.sumScope.textContent = `Could not list branches: ${err.message}`;
+  }
+}
+
+async function runSummary() {
+  const repoKey = el.sumRepo.value;
+  const branch = el.sumBranch.value;
+  if (!repoKey || !branch) return;
+
+  el.sumRun.disabled = true;
+  el.sumRun.textContent = "Loading…";
+  try {
+    const params = new URLSearchParams({ key: repoKey, branch });
+    if (el.sumFolder.value) params.set("folder", el.sumFolder.value);
+    if (el.dateFrom.value) params.set("since", el.dateFrom.value);
+    if (el.dateTo.value) params.set("until", el.dateTo.value);
+    if (!el.dateFrom.value) params.set("days", "14");
+
+    const res = await fetch(`/api/summary?${params}`);
+    const body = await res.json();
+    if (!res.ok) {
+      el.sumBody.replaceChildren(stateNode("Could not build the summary", body.detail || res.statusText));
+      return;
+    }
+    state.summary = body;
+    renderSummary();
+  } catch (err) {
+    el.sumBody.replaceChildren(stateNode("Could not build the summary", err.message));
+  } finally {
+    el.sumRun.disabled = false;
+    el.sumRun.textContent = "Show summary";
+  }
+}
+
+function renderSummary() {
+  const s = state.summary;
+  if (!s) return;
+
+  // Repopulate the folder picker from what this branch actually contains,
+  // keeping the current choice if it still exists.
+  const chosen = el.sumFolder.value;
+  el.sumFolder.innerHTML =
+    '<option value="">All folders</option>' +
+    (s.folders_available || [])
+      .map((f) => `<option value="${escapeAttr(f)}">${escapeHtml(f)}</option>`)
+      .join("");
+  if ((s.folders_available || []).includes(chosen)) el.sumFolder.value = chosen;
+
+  el.sumScope.textContent =
+    `${s.repo} › ${s.branch}${s.folder ? ` › ${s.folder}` : ""} · ` +
+    `${s.row_count} commit${s.row_count === 1 ? "" : "s"}, ${s.tagged_rows} tagged · ` +
+    `${rangeLabel()}` +
+    (s.capped ? ` · showing the newest ${s.limit} commits on this branch` : "");
+
+  if (!s.rows.length) {
+    el.sumBody.replaceChildren(
+      stateNode(
+        "No commits match",
+        s.folder
+          ? `Nothing touched “${s.folder}” on ${s.branch} in this date range.`
+          : `Nothing was committed on ${s.branch} in this date range. Widen the dates in the header.`
+      )
+    );
+    return;
+  }
+
+  // One row per commit; a commit with two tags gets one line per tag so the
+  // tag columns never have to hold a list.
+  const rows = [];
+  for (const r of s.rows) {
+    const tags = r.tags.length ? r.tags : [null];
+    tags.forEach((tag, i) => {
+      rows.push(`
+        <tr${i ? ' class="tag-continuation"' : ""}>
+          <td class="mono">${
+            i
+              ? ""
+              : `<a href="${escapeAttr(r.url)}" target="_blank" rel="noopener">${escapeHtml(r.sha.slice(0, 10))}</a>
+                 <button type="button" class="copy-sha" data-sha="${escapeAttr(r.sha)}" title="Copy full hash ${escapeAttr(r.sha)}" aria-label="Copy full commit hash">${ICON.copy}</button>`
+          }</td>
+          <td>${i ? "" : escapeHtml(r.author_name)}</td>
+          <td class="mono nowrap">${i ? "" : escapeHtml(fmtStamp(r.date))}</td>
+          <td>${
+            tag
+              ? `<span class="chip tag">${ICON.tag}<span class="txt">${escapeHtml(tag.name)}</span></span>`
+              : '<span class="muted">—</span>'
+          }</td>
+          <td>${
+            tag
+              ? tag.annotated
+                ? escapeHtml(tag.tagger_name || "unknown")
+                : '<span class="muted" title="A lightweight tag is only a ref: git stores no author or date for it">lightweight</span>'
+              : '<span class="muted">—</span>'
+          }</td>
+          <td class="mono nowrap">${
+            tag && tag.tagger_date ? escapeHtml(fmtStamp(tag.tagger_date)) : '<span class="muted">—</span>'
+          }</td>
+          <td>${i ? "" : escapeHtml(r.title)}</td>
+        </tr>`);
+    });
+  }
+
+  const box = document.createElement("div");
+  box.className = "table-scroll";
+  box.innerHTML = `
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Commit hash</th><th>Commit creator</th><th>Commit date</th>
+          <th>Tag</th><th>Tag creator</th><th>Tag date</th><th>Message</th>
+        </tr>
+      </thead>
+      <tbody>${rows.join("")}</tbody>
+    </table>`;
+  el.sumBody.replaceChildren(box);
+}
+
+/** Local, unambiguous, and sortable as text — good for a dense table. */
+function fmtStamp(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso).slice(0, 19);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function summaryCsv() {
+  const s = state.summary;
+  if (!s?.rows?.length) return;
+  const cell = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const lines = [
+    ["commit_hash", "commit_creator", "commit_date", "tag", "tag_creator", "tag_date", "message"]
+      .map(cell)
+      .join(","),
+  ];
+  for (const r of s.rows) {
+    for (const tag of r.tags.length ? r.tags : [null]) {
+      lines.push(
+        [
+          r.sha,
+          r.author_name,
+          r.date,
+          tag?.name || "",
+          tag ? (tag.annotated ? tag.tagger_name || "" : "lightweight (no tagger)") : "",
+          tag?.tagger_date || "",
+          r.title,
+        ]
+          .map(cell)
+          .join(",")
+      );
+    }
+  }
+  const name = `summary_${s.repo.replace(/\W+/g, "-")}_${s.branch.replace(/\W+/g, "-")}.csv`;
+  downloadBlob(new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" }), name);
+}
+
+function downloadBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = name;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+/* ---------- find a commit ---------- */
+
+async function runLookup() {
+  const raw = el.lkSha.value.trim();
+  if (!raw) return;
+
+  el.lkRun.disabled = true;
+  el.lkRun.textContent = "Searching…";
+  el.lkBody.replaceChildren(stateNode("Searching…", "Checking every configured repository."));
+  try {
+    const res = await fetch(`/api/lookup?sha=${encodeURIComponent(raw)}`);
+    const body = await res.json();
+    if (!res.ok) {
+      el.lkBody.replaceChildren(stateNode("Could not look that up", body.detail || res.statusText));
+      return;
+    }
+    state.lookup = body;
+    renderLookup();
+  } catch (err) {
+    el.lkBody.replaceChildren(stateNode("Could not look that up", err.message));
+  } finally {
+    el.lkRun.disabled = false;
+    el.lkRun.textContent = "Find commit";
+  }
+}
+
+function renderLookup() {
+  const d = state.lookup;
+  if (!d) return;
+
+  if (!d.found) {
+    el.lkBody.replaceChildren(
+      stateNode(
+        "No repository holds that commit",
+        `Searched ${d.searched} configured repositor${d.searched === 1 ? "y" : "ies"} for ${d.sha}. ` +
+          "Check the hash, or add the repository to config.yaml."
+      )
+    );
+    return;
+  }
+
+  el.lkBody.replaceChildren(...d.matches.map(lookupCard));
+}
+
+function lookupCard(m) {
+  const box = document.createElement("section");
+  box.className = "lookup-card";
+
+  const tagRows = m.tags.length
+    ? m.tags
+        .map(
+          (t) => `
+        <div class="tip-row">
+          <span class="tip-label">${escapeHtml(t.name)}</span>
+          <span class="tip-value">
+            ${
+              t.annotated
+                ? `tagged by <strong>${escapeHtml(t.tagger_name || "unknown")}</strong> on ${escapeHtml(fmtStamp(t.tagger_date))}`
+                : '<span class="muted">lightweight tag — git records no creator or date for it</span>'
+            }
+            ${t.message ? `<span class="muted">· ${escapeHtml(t.message)}</span>` : ""}
+          </span>
+        </div>`
+        )
+        .join("")
+    : `<div class="tip-row"><span class="tip-label">Tags</span><span class="tip-value muted">none on this commit${
+        m.nearest_tag
+          ? ` · nearest earlier tag <strong>${escapeHtml(m.nearest_tag.name)}</strong>, ${m.nearest_tag.commits_after} commit${m.nearest_tag.commits_after === 1 ? "" : "s"} before it`
+          : ""
+      }</span></div>`;
+
+  // A bar per branch showing how far along that branch the commit sits.
+  const branchRows = m.branches.length
+    ? m.branches
+        .map((b) => {
+          const pct =
+            b.total_commits && b.position ? Math.max(2, Math.round((b.position / b.total_commits) * 100)) : null;
+          return `
+        <tr>
+          <td>
+            <span class="chip branch${b.is_default ? " is-default" : ""}">${ICON.branch}<span class="txt">${escapeHtml(b.name)}</span></span>
+            ${b.is_head ? '<span class="status-badge is-ahead">at head</span>' : ""}
+          </td>
+          <td class="num">${b.distance_to_head}</td>
+          <td class="num">${b.position ?? "—"}${b.total_commits ? ` <span class="muted">of ${b.total_commits}</span>` : ""}</td>
+          <td class="graph-cell">
+            ${
+              pct === null
+                ? '<span class="muted">—</span>'
+                : `<div class="graph-bar" title="${b.position} of ${b.total_commits} commits on ${escapeHtml(b.name)}"><span style="width:${pct}%"></span></div>`
+            }
+          </td>
+        </tr>`;
+        })
+        .join("")
+    : `<tr><td colspan="4" class="muted">No branch in this repository contains the commit — it may be unreachable (on a deleted branch, or only inside a pull request).</td></tr>`;
+
+  box.innerHTML = `
+    <div class="lookup-head">
+      <div>
+        <h3>${escapeHtml(m.repo)}</h3>
+        <p class="muted">${escapeHtml(m.title)}</p>
+      </div>
+      <span class="chip source ${escapeAttr(m.provider)}">${escapeHtml(PROVIDER_LABEL[m.provider] || m.provider)}</span>
+    </div>
+
+    <div class="tip-row">
+      <span class="tip-label">Commit hash</span>
+      <span class="tip-value">
+        <code class="full-sha">${escapeHtml(m.sha)}</code>
+        <button type="button" class="copy-sha" data-sha="${escapeAttr(m.sha)}" title="Copy full hash ${escapeAttr(m.sha)}" aria-label="Copy full commit hash">${ICON.copy}</button>
+        <a class="btn tiny" href="${escapeAttr(m.url)}" target="_blank" rel="noopener">Open</a>
+      </span>
+    </div>
+    <div class="tip-row">
+      <span class="tip-label">Authored</span>
+      <span class="tip-value">${escapeHtml(m.author_name)} on ${escapeHtml(fmtStamp(m.date))}</span>
+    </div>
+    <div class="tip-row">
+      <span class="tip-label">Changes</span>
+      <span class="tip-value">${m.files_changed} file${m.files_changed === 1 ? "" : "s"}${
+        m.additions != null ? ` · +${m.additions} −${m.deletions}` : ""
+      }${m.parents.length ? ` · parent ${escapeHtml(m.parents.map((p) => p.slice(0, 7)).join(", "))}` : " · root commit"}</span>
+    </div>
+    ${tagRows}
+
+    <h4 class="lookup-sub">Position in the graph</h4>
+    <div class="table-scroll">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Branch</th>
+            <th class="num" title="Commits added on this branch since this one">Commits since</th>
+            <th class="num" title="This commit's ordinal from the root of the branch">Position</th>
+            <th>Progress along branch</th>
+          </tr>
+        </thead>
+        <tbody>${branchRows}</tbody>
+      </table>
+    </div>
+    ${
+      m.branches_unprobed
+        ? `<p class="muted note">${m.branches_unprobed} further branches were not checked — only the first ${m.branches_probed} were probed.</p>`
+        : ""
+    }`;
+  return box;
 }
 
 /* ---------- report export ---------- */
@@ -1177,62 +1749,89 @@ async function exportReport(format) {
 function syncTopbarHeight() {
   const h = el.topbar?.offsetHeight;
   if (h) document.documentElement.style.setProperty("--topbar-h", `${h}px`);
+  // The tab bar sticks below the topbar, so everything else that sticks has to
+  // clear both. Measured rather than assumed, since the topbar wraps.
+  const tabs = document.querySelector?.(".tabs");
+  if (tabs?.offsetHeight) {
+    document.documentElement.style.setProperty("--tabs-h", `${tabs.offsetHeight}px`);
+  }
 }
 window.addEventListener("resize", syncTopbarHeight);
 syncTopbarHeight();
 
-el.refresh.addEventListener("click", () => load({ refresh: true }));
-el.preset.addEventListener("change", () => {
+/* Tabs are wired FIRST and defensively: navigation between views must survive
+ * any one control below being absent. */
+for (const name of Object.keys(TABS)) {
+  on($(`tab-${name}`), "click", () => showTab(name));
+}
+
+on(el.refresh, "click", () => load({ refresh: true }));
+on(el.preset, "change", () => {
   applyPreset(el.preset.value);
   load();
 });
 // Editing either date by hand is what "custom" means — no need to pick it first.
 for (const input of [el.dateFrom, el.dateTo]) {
-  input.addEventListener("change", () => {
+  on(input, "change", () => {
     el.preset.value = "custom";
     load();
   });
 }
-el.dateClear.addEventListener("click", () => {
+on(el.dateClear, "click", () => {
   el.dateTo.value = "";
   el.preset.value = "custom";
   load();
 });
-el.compareRun.addEventListener("click", runCompare);
-el.compareExit.addEventListener("click", exitCompare);
-el.compareSwap.addEventListener("click", () => {
+
+on(el.compareRepo, "change", () => {
+  exitCompare();
+  loadBranchesForCompare();
+});
+on(el.compareRun, "click", runCompare);
+on(el.compareSwap, "click", () => {
   const base = el.compareBase.value;
   el.compareBase.value = el.compareHead.value;
   el.compareHead.value = base;
   if (state.compare) runCompare();
 });
-el.compareExportPdf.addEventListener("click", () => exportReport("pdf"));
-el.compareExportPptx.addEventListener("click", () => exportReport("pptx"));
-el.exportPdf.addEventListener("click", () => exportReport("pdf"));
-el.exportPptx.addEventListener("click", () => exportReport("pptx"));
-el.search.addEventListener("input", render);
-el.branchSearch.addEventListener("input", buildFilters);
-el.folderSearch.addEventListener("input", buildFilters);
-el.scopeCommits.addEventListener("change", render);
-el.groupBy.addEventListener("change", render);
-el.reset.addEventListener("click", () => {
-  exitCompare();
-  state.provider = null;
-  state.repo = null;
-  state.folder = null;
-  state.branch = null;
-  state.author = null;
-  el.search.value = "";
-  el.branchSearch.value = "";
-  el.folderSearch.value = "";
-  el.scopeCommits.value = "all";
-  el.groupBy.value = "day";
-  buildFilters();
-  render();
+on(el.compareExportPdf, "click", () => exportReport("pdf"));
+on(el.compareExportPptx, "click", () => exportReport("pptx"));
+
+on(el.sumRepo, "change", loadBranchesForSummary);
+on(el.sumRun, "click", runSummary);
+on(el.sumCsv, "click", summaryCsv);
+// Changing branch or folder re-runs immediately once a table is on screen.
+for (const control of [el.sumBranch, el.sumFolder]) {
+  on(control, "change", () => {
+    if (state.summary) runSummary();
+  });
+}
+
+on(el.lkRun, "click", runLookup);
+on(el.lkSha, "keydown", (event) => {
+  if (event.key === "Enter") runLookup();
 });
+
+on(el.exportPdf, "click", () => exportReport("pdf"));
+on(el.exportPptx, "click", () => exportReport("pptx"));
+on(document, "click", handleCopyClick);
+
+console.info(`[dashboard] build ${APP_BUILD}`);
 
 (async function init() {
   const cfg = await fetch("/api/config").then((r) => r.json());
+  state.config = cfg;
+
+  // A cached script paired with a fresh page is the one failure that makes every
+  // control inert at once; say so plainly rather than letting it look like a bug.
+  if (cfg.app_version && LOADED_VERSION && cfg.app_version !== LOADED_VERSION) {
+    showBanner(
+      "<strong>You are running a cached copy of this page.</strong> " +
+        "Reload to pick up the current version " +
+        `(loaded <code>${escapeHtml(LOADED_VERSION)}</code>, server has <code>${escapeHtml(cfg.app_version)}</code>).`,
+      true
+    );
+  }
   // Seed the range from the configured default lookback.
   const seed = String(cfg.defaults.days);
   el.preset.value = [...el.preset.options].some((o) => o.value === seed) ? seed : "custom";

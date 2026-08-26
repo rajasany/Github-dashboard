@@ -25,6 +25,8 @@ class RepoResult:
     private: bool = False
     commits: list[dict[str, Any]] = field(default_factory=list)
     errors: list[dict[str, str]] = field(default_factory=list)
+    # commit sha -> tag names pointing at it, for the whole repo.
+    tags: dict[str, list[str]] = field(default_factory=dict)
 
     def meta(self, branches_active: int) -> dict[str, Any]:
         return {
@@ -37,7 +39,37 @@ class RepoResult:
             "branches_shown": self.branches_shown,
             "branches_active": branches_active,
             "private": self.private,
+            "tags_total": sum(len(v) for v in self.tags.values()),
         }
+
+
+def make_tag(
+    *,
+    name: str,
+    commit_sha: str,
+    annotated: bool,
+    tagger_name: str | None = None,
+    tagger_email: str | None = None,
+    tagger_date: str | None = None,
+    message: str | None = None,
+) -> dict[str, Any]:
+    """One tag, normalised across providers.
+
+    Only *annotated* tags carry a tagger and a creation date — a lightweight tag
+    is just a ref pointing at a commit, with no object of its own and therefore
+    no author or timestamp anywhere in the repository. We report that honestly
+    rather than substituting the commit's own author, which would look like data
+    but answer a different question.
+    """
+    return {
+        "name": name,
+        "commit_sha": commit_sha,
+        "annotated": annotated,
+        "tagger_name": tagger_name or None,
+        "tagger_email": tagger_email or None,
+        "tagger_date": tagger_date or None,
+        "message": (message or "").strip() or None,
+    }
 
 
 def make_commit(
@@ -72,6 +104,8 @@ def make_commit(
         "date": date,
         "url": url,
         "branches": [branch],
+        # Tag names pointing at this exact commit; filled in by the feed.
+        "tags": [],
         # Populated when folder tracking is on; `folders` is derived from `paths`
         # later so a config change doesn't require re-fetching.
         "paths": paths or [],

@@ -10,11 +10,11 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from . import compare, report
+from . import compare, lookup, report, summary
 from .config import load_settings
 from .csr import GitMirror
 from .feed import build_feed, enrich_commit_folders
@@ -69,9 +69,43 @@ app = FastAPI(title="Repo Change Dashboard", version="0.2.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+@app.middleware("http")
+async def no_stale_assets(request, call_next):
+    """Make the browser revalidate the page and its scripts on every load.
+
+    Without a Cache-Control header browsers fall back to heuristic caching, and
+    can happily pair a freshly-edited index.html with a cached app.js from a
+    previous version — which presents as "the new UI is there but nothing in it
+    responds". ETags still make the revalidation a cheap 304.
+    """
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
+
+
+def _asset_version(name: str) -> str:
+    """A short fingerprint of a static file, from its size and mtime."""
+    try:
+        stat = (STATIC_DIR / name).stat()
+    except OSError:
+        return "0"
+    return f"{int(stat.st_mtime)}-{stat.st_size}"
+
+
 @app.get("/", include_in_schema=False)
-async def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+async def index() -> HTMLResponse:
+    """Serve the shell with fingerprinted asset URLs.
+
+    Cache-Control alone proved insufficient: a browser holding a heuristically
+    fresh copy of /static/app.js can pair it with a new index.html and never
+    revalidate, which presents as a UI whose controls are all inert. Changing the
+    URL when the file changes removes the browser's discretion entirely.
+    """
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    html = html.replace("/static/app.js", f"/static/app.js?v={_asset_version('app.js')}")
+    html = html.replace("/static/styles.css", f"/static/styles.css?v={_asset_version('styles.css')}")
+    return HTMLResponse(html)
 
 
 @app.get("/api/config")
@@ -79,6 +113,8 @@ async def get_config() -> dict:
     """What the UI needs to render before any provider call happens."""
     return {
         "configured": settings.configured,
+        # Lets the page detect that it is itself a cached copy — see app.js.
+        "app_version": _asset_version("app.js"),
         "has_token": bool(settings.token),
         "repos": settings.repos,
         "csr_repos": [{"project": r.project, "repo": r.repo, "key": r.key} for r in settings.csr_repos],
@@ -179,6 +215,57 @@ async def get_feed(
             until_dt=until_dt,
             commits_per_branch=commits_per_branch or settings.commits_per_branch,
         )
+    except GitHubError as exc:
+        raise HTTPException(status_code=exc.status or 502, detail=exc.message) from exc
+
+
+@app.get("/api/summary")
+async def get_summary(
+    key: str = Query(description="Repo key, e.g. github:owner/repo"),
+    branch: str = Query(description="Branch to tabulate"),
+    folder: str = Query(default=None, description="Restrict to commits touching this folder"),
+    days: int = Query(default=None, ge=1, le=3650),
+    since: str = Query(default=None, description="Start date, YYYY-MM-DD (UTC)."),
+    until: str = Query(default=None, description="End date, YYYY-MM-DD (UTC), inclusive."),
+    limit: int = Query(default=100, ge=1, le=300, description="Max commits scanned on the branch."),
+) -> dict:
+    """One row per commit on a branch, with full tag metadata."""
+    assert gh_client is not None and mirror is not None and store is not None
+
+    if key not in set(settings.all_keys()):
+        raise HTTPException(status_code=400, detail=f"Unknown repository: {key}")
+
+    since_dt, until_dt = _resolve_window(days, since, until)
+    try:
+        return await summary.build_summary(
+            settings,
+            gh_client,
+            mirror,
+            store,
+            repo_key=key,
+            branch=branch,
+            folder=folder or None,
+            since_dt=since_dt,
+            until_dt=until_dt,
+            limit=limit,
+        )
+    except summary.SummaryError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/lookup")
+async def get_lookup(
+    sha: str = Query(description="Commit hash (4–40 hex chars) or a commit URL"),
+) -> dict:
+    """Which repository and branches hold a commit, and where it sits in each."""
+    assert gh_client is not None and mirror is not None
+
+    if not settings.configured:
+        raise HTTPException(status_code=400, detail="No repositories configured.")
+    try:
+        return await lookup.lookup_commit(settings, gh_client, mirror, sha)
+    except lookup.LookupError_ as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except GitHubError as exc:
         raise HTTPException(status_code=exc.status or 502, detail=exc.message) from exc
 

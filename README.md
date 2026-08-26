@@ -78,6 +78,8 @@ Consequences worth knowing:
   does not, measured from their merge base.
 - **Date range** — pick a period preset or type explicit From / To dates. Leaving
   **To** empty means "everything after this date, through to now".
+- **Commit hashes and tags** — full copyable hash per commit, tag chips, and a
+  "latest commit" card for the selected branch and folder.
 - **Reports** — export exactly what is on screen as a PDF or as PowerPoint slides.
 - **Rate-limit readout** for GitHub in the header.
 - Per-repo failures are reported in a banner without taking the rest of the feed down.
@@ -155,6 +157,8 @@ a `+` on the file count and may under-report folders.
 | --- | --- |
 | `GET /api/config` | Tracked repos, providers, and defaults, for the UI to bootstrap. |
 | `GET /api/feed?since=2026-07-01&until=2026-08-05&key=…&refresh=false` | The merged feed. `since`/`until` are UTC calendar dates; `until` is inclusive and may be omitted for "through to now". `days=N` still works as a lookback when `since` is absent. `key` may repeat; values are `github:owner/repo` or `csr:project/repo`. |
+| `GET /api/summary?key=…&branch=…&folder=…&since=…&limit=100` | One row per commit on a branch, with full tag metadata. |
+| `GET /api/lookup?sha=…` | Which repos and branches hold a commit, and its position in each. |
 | `GET /api/branches?key=github:owner/repo` | Every branch of one repository, for the compare pickers. |
 | `GET /api/compare?key=…&base=main&head=feature/x` | Three-dot comparison: commits, changed files, ahead/behind, merge base. |
 | `POST /api/report` | `{format: "pdf"\|"pptx", criteria: {…}, commits: [...]}` → the document as a file download. |
@@ -170,6 +174,8 @@ a `+` on the file count and may under-report folders.
 | [app/paths.py](app/paths.py) | Changed paths → owning folder/service. |
 | [app/store.py](app/store.py) | SQLite cache of commit → file paths. |
 | [app/report.py](app/report.py) | Rollup + PDF and PowerPoint generation. |
+| [app/summary.py](app/summary.py) | Repo + branch + folder → the commit/tag table. |
+| [app/lookup.py](app/lookup.py) | Hash → repo, branches, graph position. |
 | [app/compare.py](app/compare.py) | Branch comparison for both providers. |
 | [app/feed.py](app/feed.py) | Merges providers, dedupes by `(repo, sha)`, derives folders. |
 | [app/main.py](app/main.py) | Routes. |
@@ -277,6 +283,103 @@ report and the dashboard cannot disagree. Downloads are named
 Above 400 commits the detail table is cut and the report **says so** on the page —
 the totals and breakdowns still cover every commit.
 
+## Tabs
+
+| Tab | What it answers |
+| --- | --- |
+| **Activity** | What changed recently, across every repo and branch — the filtered feed. |
+| **Summary table** | For one repo + branch + folder: every commit with its tag, in a flat table. |
+| **Compare branches** | What one branch has that another does not, from their merge base. |
+| **Find a commit** | Given a hash: which repo and branches hold it, and how far each has moved on. |
+
+The sidebar filters drive the Activity feed only; the other three tabs carry their own
+pickers, so the sidebar folds away on them. The date range in the header applies to
+Activity and to the Summary table.
+
+## Summary table
+
+Pick a **repository**, a **branch** and optionally a **service / folder**. The table has
+one row per commit:
+
+| Commit hash | Commit creator | Commit date | Tag | Tag creator | Tag date | Message |
+| --- | --- | --- | --- | --- | --- | --- |
+| `f6b73f0f41` ⧉ | rajasany | 2026-08-07 18:58 | `v0.9` | lightweight | — | first commit |
+
+- The hash is a link to the commit plus a copy button for the full 40 characters.
+- A commit carrying two tags gets one line per tag, so the tag columns never hold a list.
+- **CSV** exports exactly the rows on screen.
+- Only the chosen branch is queried, so this costs one page of commits — not one call per
+  branch the way the feed does.
+
+**On "Tag creator" and "Tag date":** only *annotated* tags (`git tag -a`) have them. A
+lightweight tag (`git tag v1`) is just a ref pointing at a commit — git stores no author
+and no timestamp for it anywhere. Those rows read **lightweight** rather than borrowing
+the commit's own author and date, which would look like an answer to a question nobody
+asked. `psf/requests`, for instance, uses lightweight tags throughout; `git/git` uses
+annotated ones and shows a real tagger for each.
+
+## Find a commit
+
+Paste a commit hash — full, abbreviated to as few as 4 characters, or a whole commit URL —
+and every configured repository is searched in parallel.
+
+```
+acme/shop                                                    GitHub
+Commit hash  abc1234abc1234abc1234abc1234abc1234abc12  [copy] [Open]
+Authored     alice on 2026-08-04 15:30
+Changes      3 files · +40 −5 · parent dddddddd
+v1.5         tagged by Tagger Person on 2026-08-04 17:30 · milestone
+
+Position in the graph
+  Branch            Commits since   Position    Progress along branch
+  main (default)                7   13 of 20    ▓▓▓▓▓▓▓░░░
+  dev  at head                  0   13 of 13    ▓▓▓▓▓▓▓▓▓▓
+```
+
+- **Commits since** is how far that branch has moved on past this commit.
+- **Position** is the commit's ordinal from the root of that branch, so it reads as
+  "13 of 20". A commit sits at a *different* depth on each branch that contains it,
+  which is why this is per-branch rather than a single number.
+- GitHub has no "which branches contain this commit" endpoint, so containment is
+  established with one three-dot comparison per branch: `behind_by == 0` means the commit
+  is an ancestor. Past 25 branches the probe stops and the card says how many were skipped.
+- Total commits on a branch come from the page count of the commits endpoint; the CSR
+  provider gets exact counts from `git rev-list` instead.
+- **Nearest earlier tag** is shown for CSR repositories, where `git describe` makes it
+  free. The GitHub REST API has no equivalent, so that line is omitted rather than
+  guessed at.
+
+## Commit hashes and tags
+
+Every commit row carries its short hash as a link plus a **copy button** that puts the
+**full 40-character hash** on the clipboard. Tags pointing at a commit appear as amber
+chips beside the service and branch chips.
+
+Above the feed, a **Latest commit** card answers "where is this branch and folder right
+now?" for whatever is selected:
+
+```
+Latest commit · branch main · services/auth          3h ago
+Commit hash    dd125701459136e6baa94f887e4c18ebc8c8774a  [copy] [Open]
+Tag here       no tag on this commit
+Most recent tag  v0.1.0   1 commit back, at dfd03c5
+Message        auth: token refresh — Dev One
+```
+
+- **Tag here** lists tags on that exact commit; **Most recent tag** appears only when the
+  tip itself is untagged, and states how far back the last tagged commit is.
+- "N commits back" is counted **within the loaded date range**, not over all history —
+  widen the range if you need to reach further.
+- Annotated tags are dereferenced to the commit they point at. Without that they would
+  resolve to the tag object's own SHA and never match a commit; both providers handle it
+  (`/tags` does it server-side, `%(*objectname)` does it in git).
+- Tags are read per repository — GitHub `/repos/{o}/{r}/tags`, CSR
+  `git for-each-ref refs/tags` — so the full set is available even when the tagged commit
+  falls outside the current date window.
+
+Reports carry this too: a **Tagged commits** table with full hashes, a `Tag` column and a
+12-character `Commit` column in the detail table, and a `Tags` figure in the summary.
+
 ## Reading the commit feed
 
 Each row is one commit, deduped across branches:
@@ -323,7 +426,8 @@ other rule hard-codes a colour.
 
 ```bash
 .venv/bin/python tests/test_paths.py    # changed paths -> owning folder     (16 checks)
-.venv/bin/python tests/test_report.py   # date window + report rollup        (46 checks)
+.venv/bin/python tests/test_report.py   # date window + report rollup        (57 checks)
+.venv/bin/python tests/test_lookup.py   # tag metadata, summary, lookup      (43 checks)
 .venv/bin/python tests/test_compare.py  # branch comparison, real git repo   (25 checks)
 node tests/ui_cascade.test.js          # selection, rendering, escaping      (39 checks)
 ```
