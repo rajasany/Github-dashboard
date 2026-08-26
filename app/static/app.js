@@ -915,6 +915,12 @@ function fillRepoSelect(select, selected) {
   return select.value || null;
 }
 
+/* Config can hide branches from every picker; report how many, so a short list
+ * is never quietly short. */
+function hiddenBranchNote(body) {
+  return body?.hidden ? ` · ${body.hidden} hidden by branch_exclude` : "";
+}
+
 async function fetchBranches(repoKey) {
   const res = await fetch(`/api/branches?key=${encodeURIComponent(repoKey)}`);
   const body = await res.json();
@@ -939,7 +945,7 @@ async function loadBranchesForCompare() {
     if (names.length < 2) {
       el.compareScope.textContent = `${repoNameOf(repoKey)} has ${
         names.length === 1 ? "only one branch" : "no branches"
-      } — nothing to compare.`;
+      } — nothing to compare.${hiddenBranchNote(body)}`;
       return;
     }
 
@@ -953,7 +959,9 @@ async function loadBranchesForCompare() {
     const fallback = names.includes(body.default_branch) ? body.default_branch : names[0];
     el.compareBase.value = fallback;
     el.compareHead.value = names.find((n) => n !== fallback) || names[0];
-    el.compareScope.textContent = `${names.length} branches in ${repoNameOf(repoKey)}`;
+    el.compareScope.textContent =
+      `${names.length} branch${names.length === 1 ? "" : "es"} in ${repoNameOf(repoKey)}` +
+      hiddenBranchNote(body);
     el.compareRun.disabled = false;
     el.compareSwap.disabled = false;
   } catch (err) {
@@ -1305,6 +1313,7 @@ async function loadBranchesForSummary() {
       .join("");
     if (names.includes(body.default_branch)) el.sumBranch.value = body.default_branch;
     el.sumRun.disabled = !names.length;
+    state.summaryBranchNote = hiddenBranchNote(body);
     // Folders are only known once a branch has been read, so start permissive.
     el.sumFolder.innerHTML = '<option value="">All folders</option>';
   } catch (err) {
@@ -1361,7 +1370,8 @@ function renderSummary() {
     `${s.repo} › ${s.branch}${s.folder ? ` › ${s.folder}` : ""} · ` +
     `${s.row_count} commit${s.row_count === 1 ? "" : "s"}, ${s.tagged_rows} tagged · ` +
     `${rangeLabel()}` +
-    (s.capped ? ` · showing the newest ${s.limit} commits on this branch` : "");
+    (s.capped ? ` · showing the newest ${s.limit} commits on this branch` : "") +
+    (state.summaryBranchNote || "");
 
   if (!s.rows.length) {
     el.sumBody.replaceChildren(

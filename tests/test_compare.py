@@ -19,7 +19,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app import compare  # noqa: E402
+from app import compare
+from app import csr
+from app.github import GitHubClient  # noqa: E402
 from app.config import load_settings  # noqa: E402
 from app.csr import GitMirror  # noqa: E402
 
@@ -151,12 +153,92 @@ async def run_csr(repo_path: Path, cache: Path) -> None:
         check("unknown branch rejected", "no-such-branch" in str(exc), True)
 
 
+
+async def run_branch_filtering(root: Path) -> None:
+    """The branch pickers must honour the same include/exclude config the feed does."""
+    print("\n=== branch filtering in the pickers ===")
+
+    repo_dir = root / "branchy"
+    repo_dir.mkdir()
+    env = {"PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": str(repo_dir)}
+    run = lambda cmd: subprocess.run(cmd, cwd=repo_dir, check=True, capture_output=True, env=env)  # noqa: E731
+    run(["git", "init", "-q", "-b", "main"])
+    run(["git", "config", "user.email", "t@e.test"])
+    run(["git", "config", "user.name", "Dev"])
+    (repo_dir / "a.txt").write_text("a\n")
+    run(["git", "add", "-A"])
+    run(["git", "commit", "-qm", "base"])
+    for branch in ["dev", "release/1.0", "dependabot/npm/lodash", "dependabot/pip/urllib3", "feature/x"]:
+        run(["git", "branch", branch])
+
+    @dataclass(frozen=True)
+    class Branchy:
+        project: str = "demo"
+        repo: str = "branchy"
+
+        @property
+        def key(self) -> str:
+            return "csr:demo/branchy"
+
+        @property
+        def name(self) -> str:
+            return "demo/branchy"
+
+        @property
+        def clone_url(self) -> str:
+            return f"file://{repo_dir}"
+
+        @property
+        def web_url(self) -> str:
+            return "https://example.test"
+
+        def commit_url(self, sha: str) -> str:
+            return f"https://example.test/{sha}"
+
+    settings = load_settings()
+    settings.repos = []
+    settings.csr_repos = [Branchy()]
+    settings.gcloud_token = "unused-for-file-urls"
+    settings.mirror_dir = root / "branchy-mirror"
+
+    gh = GitHubClient(settings)
+    mirror = csr.GitMirror(settings)
+
+    async def names(include, exclude):
+        settings.branch_include, settings.branch_exclude = include, exclude
+        return await compare.list_branches(settings, gh, mirror, "csr:demo/branchy")
+
+    everything = await names([], [])
+    check("with no filters every branch is offered", everything["branches"],
+          ["dependabot/npm/lodash", "dependabot/pip/urllib3", "dev", "feature/x", "main", "release/1.0"])
+    check("nothing reported hidden", everything["hidden"], 0)
+
+    filtered = await names([], ["dependabot/*"])
+    check("branch_exclude is applied, as in the feed", filtered["branches"],
+          ["dev", "feature/x", "main", "release/1.0"])
+    check("the hidden count is reported, not silent", filtered["hidden"], 2)
+    check("the total is still reported", filtered["branches_total"], 6)
+
+    included = await names(["main", "release/*"], [])
+    check("branch_include narrows to the allow-list", included["branches"], ["main", "release/1.0"])
+    check("and reports the rest as hidden", included["hidden"], 4)
+
+    # A glob broad enough to hide the default branch is far likelier to be a
+    # mistake than an intent, so the default survives and the picker is usable.
+    everything_hidden = await names([], ["*"])
+    check("the default branch survives an all-excluding glob", everything_hidden["branches"], ["main"])
+    check("and the rest are counted as hidden", everything_hidden["hidden"], 5)
+
+    await gh.aclose()
+
+
 def main() -> int:
     test_helpers()
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         repo = build_repo(root)
         asyncio.run(run_csr(repo, root / "mirrors"))
+        asyncio.run(run_branch_filtering(root))
     print(f"\n{'ALL PASS' if not FAILURES else f'{len(FAILURES)} FAILURES: ' + ', '.join(FAILURES)}")
     return 1 if FAILURES else 0
 

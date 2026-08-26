@@ -21,7 +21,7 @@ from typing import Any
 from .config import CsrRepo, Settings
 from .csr import CsrError, GitMirror, _FLD, _LOG_FORMAT, _REC
 from .github import GitHubClient, GitHubError
-from .models import make_commit
+from .models import branch_allowed, make_commit
 from .paths import derive_folders
 
 # GitHub returns at most 250 commits and 300 files per compare; git is unbounded
@@ -262,8 +262,13 @@ async def list_branches(
     mirror: GitMirror,
     repo_key: str,
 ) -> dict[str, Any]:
-    """Every branch of one repo — the compare pickers need all of them, not just
-    the ones with commits inside the current date window."""
+    """Every branch of one repo, minus the ones config filters out.
+
+    `branch_include` / `branch_exclude` are honoured here exactly as the activity
+    feed honours them, so a branch hidden from the feed cannot reappear in the
+    Summary or Compare pickers. The count of what was filtered is returned too —
+    a shorter list should never be silently shorter.
+    """
     if repo_key.startswith("github:"):
         full_name = repo_key.split(":", 1)[1]
         try:
@@ -272,20 +277,34 @@ async def list_branches(
             )
         except GitHubError as exc:
             raise CompareError(exc.message) from exc
-        names = sorted(b.get("name", "") for b in branches if b.get("name"))
-        return {"repo_key": repo_key, "branches": names, "default_branch": meta.get("default_branch")}
+        all_names = sorted(b.get("name", "") for b in branches if b.get("name"))
+        default = (meta or {}).get("default_branch")
+    else:
+        repo = next((r for r in settings.csr_repos if r.key == repo_key), None)
+        if repo is None:
+            raise CompareError(f"Unknown repository: {repo_key}")
+        try:
+            path = await mirror.sync(repo.key, repo.clone_url)
+            pairs = await mirror.branches(path)
+            default = await mirror.default_branch(path)
+        except CsrError as exc:
+            raise CompareError(str(exc)) from exc
+        all_names = sorted(name for name, _ in pairs)
 
-    repo = next((r for r in settings.csr_repos if r.key == repo_key), None)
-    if repo is None:
-        raise CompareError(f"Unknown repository: {repo_key}")
-    try:
-        path = await mirror.sync(repo.key, repo.clone_url)
-        pairs = await mirror.branches(path)
-        default = await mirror.default_branch(path)
-    except CsrError as exc:
-        raise CompareError(str(exc)) from exc
+    allowed = [
+        n for n in all_names if branch_allowed(n, settings.branch_include, settings.branch_exclude)
+    ]
+    # The default branch is the one people compare and tabulate against; if a
+    # pattern would hide it, that is far more likely a mistake in the globs than
+    # an intention, so keep it and say nothing is missing.
+    if default and default in all_names and default not in allowed:
+        allowed.insert(0, default)
+        allowed.sort()
+
     return {
         "repo_key": repo_key,
-        "branches": sorted(name for name, _ in pairs),
+        "branches": allowed,
+        "branches_total": len(all_names),
+        "hidden": len(all_names) - len(allowed),
         "default_branch": default,
     }
