@@ -736,7 +736,8 @@ S.lookup = {
       { name: "main", is_default: true, distance_to_head: 7, is_head: false, total_commits: 20, position: 13 },
       { name: "dev", is_default: false, distance_to_head: 0, is_head: true, total_commits: 13, position: 13 },
     ],
-    branches_probed: 2, branches_unprobed: 0,
+    branches_probed: 2, branches_unprobed: 0, branches_failed: [],
+    folders: ["backend", "web"],
     tags: [{ name: "v1.5", annotated: true, tagger_name: "Tagger Person",
              tagger_date: "2026-08-04T12:00:00Z", message: "milestone" }],
     nearest_tag: null, default_branch: "main",
@@ -752,7 +753,31 @@ check("reports position within the branch", /13.*of 20/.test(lkCard), true);
 check("marks the branch where it is the head", /at head/.test(lkCard), true);
 check("shows tag creator and tag date",
   /Tagger Person/.test(lkCard) && lkCard.includes(api.fmtStamp("2026-08-04T12:00:00Z")), true);
-check("draws a progress track", /class="graph-bar"/.test(lkCard), true);
+check("draws a position track with a marker",
+  /class="graph-bar"/.test(lkCard) && /graph-marker/.test(lkCard), true);
+check("branch is surfaced at the top, not only in the table",
+  /Branch<\/span>[\s\S]*?class="chip branch/.test(lkCard), true);
+check("folders are surfaced", /Service \/ folder<\/span>[\s\S]*?class="chip folder/.test(lkCard), true);
+check("both folder names shown", /backend/.test(lkCard) && /web/.test(lkCard), true);
+
+// A failed probe must not be reported as "not on any branch".
+S.lookup = {
+  ...S.lookup,
+  matches: [{ ...S.lookup.matches[0], branches: [], branches_failed: ["main", "dev"] }],
+};
+api.renderLookup();
+const failCard = els.get("lk-body").children[0].innerHTML;
+check("a failed probe says so", /2 branch probe\(s\) failed/.test(failCard), true);
+check("and does not claim the commit is unreachable",
+  /No branch in this repository contains/.test(failCard), false);
+
+S.lookup = {
+  ...S.lookup,
+  matches: [{ ...S.lookup.matches[0], branches: [], branches_failed: [] }],
+};
+api.renderLookup();
+check("a genuine miss still reads as unreachable",
+  /No branch in this repository contains/.test(els.get("lk-body").children[0].innerHTML), true);
 
 S.lookup = { query: "zzz", sha: "zzz", found: false, searched: 3, matches: [], errors: [] };
 api.renderLookup();

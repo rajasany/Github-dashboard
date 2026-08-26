@@ -723,7 +723,11 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
 .file-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .file-table th {
   position: sticky;
-  top: calc(var(--topbar-h) + var(--tabs-h));
+  /* `.table-scroll` sets overflow-x, which makes overflow-y compute to auto —
+     so this box is a scroll container and `top` resolves inside it, not
+     against the page. Any page-level offset here pushes the header down
+     into the middle of the table. */
+  top: 0;
   z-index: 1;
   text-align: left;
   padding: 8px 12px;
@@ -916,7 +920,11 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
 .data-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .data-table th {
   position: sticky;
-  top: calc(var(--topbar-h) + var(--tabs-h));
+  /* `.table-scroll` sets overflow-x, which makes overflow-y compute to auto —
+     so this box is a scroll container and `top` resolves inside it, not
+     against the page. Any page-level offset here pushes the header down
+     into the middle of the table. */
+  top: 0;
   z-index: 1;
   text-align: left;
   padding: 8px 12px;
@@ -977,18 +985,47 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
 
 /* How far along a branch the commit sits — position, not magnitude, so it is a
    track with a marker rather than a bar chart to be compared across rows. */
-.graph-cell { min-width: 160px; }
+.graph-cell { min-width: 170px; padding-top: 12px !important; padding-bottom: 12px !important; }
 .graph-bar {
   position: relative;
-  height: 7px;
+  height: 8px;
   border-radius: 999px;
   background: var(--surface-2);
   border: 1px solid var(--border);
-  overflow: hidden;
+  /* No `overflow: hidden` — the marker is taller than the track by design, and
+     clipping it made the whole position indicator invisible. */
 }
 .graph-bar span {
   display: block;
   height: 100%;
   background: var(--accent);
   border-radius: 999px;
+}
+
+/* Position along a branch: a full-width track with a marker, because this is a
+   position and not a magnitude — a filled bar would read as "8 of 8 is bigger". */
+.graph-bar .graph-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent-soft);
+}
+.graph-bar .graph-marker {
+  position: absolute;
+  top: 50%;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--surface);
+  /* Centred on its position; the inline `left` is clamped so a commit at the
+     very start or the very end still shows a whole dot. */
+  transform: translate(-50%, -50%);
+}
+.graph-legend {
+  display: block;
+  margin-top: 3px;
+  font-size: 10px;
+  letter-spacing: 0.03em;
+  color: var(--muted);
 }

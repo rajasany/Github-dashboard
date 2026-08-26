@@ -1314,6 +1314,9 @@ async function loadBranchesForSummary() {
     if (names.includes(body.default_branch)) el.sumBranch.value = body.default_branch;
     el.sumRun.disabled = !names.length;
     state.summaryBranchNote = hiddenBranchNote(body);
+    // Run immediately: the folder picker can only list this branch's folders
+    // once the branch has been read, and an empty picker looks broken.
+    if (names.length) runSummary();
     // Folders are only known once a branch has been read, so start permissive.
     el.sumFolder.innerHTML = '<option value="">All folders</option>';
   } catch (err) {
@@ -1561,8 +1564,12 @@ function lookupCard(m) {
   const branchRows = m.branches.length
     ? m.branches
         .map((b) => {
+          // A filled bar reads as magnitude; this is a *position*, so the track
+          // is drawn full width with a marker where the commit sits.
           const pct =
-            b.total_commits && b.position ? Math.max(2, Math.round((b.position / b.total_commits) * 100)) : null;
+            b.total_commits && b.position
+              ? Math.min(100, Math.max(0, (b.position / b.total_commits) * 100))
+              : null;
           return `
         <tr>
           <td>
@@ -1574,14 +1581,50 @@ function lookupCard(m) {
           <td class="graph-cell">
             ${
               pct === null
-                ? '<span class="muted">—</span>'
-                : `<div class="graph-bar" title="${b.position} of ${b.total_commits} commits on ${escapeHtml(b.name)}"><span style="width:${pct}%"></span></div>`
+                ? '<span class="muted">unknown</span>'
+                : `<div class="graph-bar" title="${b.position} of ${b.total_commits} commits on ${escapeHtml(b.name)} — ${b.distance_to_head} since">
+                     <span class="graph-fill" style="width:${pct.toFixed(1)}%"></span>
+                     <span class="graph-marker" style="left:clamp(6px, ${pct.toFixed(1)}%, calc(100% - 6px))"></span>
+                   </div>
+                   <span class="graph-legend">root${b.is_head ? " → HEAD (here)" : " → HEAD"}</span>`
             }
           </td>
         </tr>`;
         })
         .join("")
-    : `<tr><td colspan="4" class="muted">No branch in this repository contains the commit — it may be unreachable (on a deleted branch, or only inside a pull request).</td></tr>`;
+    : `<tr><td colspan="4" class="muted">${
+        m.branches_failed?.length
+          ? `Could not determine containment — ${m.branches_failed.length} branch probe(s) failed. Try again; if it persists the API may be rate limited.`
+          : "No branch in this repository contains the commit — it may be unreachable (on a deleted branch, or only inside a pull request)."
+      }</td></tr>`;
+
+  // The two questions people open this tab for — which branch, which service —
+  // answered at the top rather than only inside the position table.
+  const branchChips = m.branches.length
+    ? m.branches
+        .map(
+          (b) =>
+            `<span class="chip branch${b.is_default ? " is-default" : ""}" title="${escapeAttr(
+              b.is_head ? `${b.name} — this commit is the tip` : `${b.name} — ${b.distance_to_head} commits since`
+            )}">${ICON.branch}<span class="txt">${escapeHtml(b.name)}</span></span>`
+        )
+        .join("")
+    : `<span class="muted">${
+        m.branches_failed?.length
+          ? "could not be determined"
+          : "not reachable from any branch"
+      }</span>`;
+
+  const folderChips = (m.folders || []).length
+    ? m.folders
+        .map(
+          (f) =>
+            `<span class="chip folder${f === "(repo root)" ? " unknown" : ""}">${
+              f === "(repo root)" ? "" : ICON.folder
+            }<span class="txt">${escapeHtml(f)}</span></span>`
+        )
+        .join("")
+    : '<span class="muted">no folder data for this commit</span>';
 
   box.innerHTML = `
     <div class="lookup-head">
@@ -1590,6 +1633,15 @@ function lookupCard(m) {
         <p class="muted">${escapeHtml(m.title)}</p>
       </div>
       <span class="chip source ${escapeAttr(m.provider)}">${escapeHtml(PROVIDER_LABEL[m.provider] || m.provider)}</span>
+    </div>
+
+    <div class="tip-row">
+      <span class="tip-label">Branch</span>
+      <span class="tip-value">${branchChips}</span>
+    </div>
+    <div class="tip-row">
+      <span class="tip-label">Service / folder</span>
+      <span class="tip-value">${folderChips}</span>
     </div>
 
     <div class="tip-row">
@@ -1812,9 +1864,7 @@ on(el.sumRun, "click", runSummary);
 on(el.sumCsv, "click", summaryCsv);
 // Changing branch or folder re-runs immediately once a table is on screen.
 for (const control of [el.sumBranch, el.sumFolder]) {
-  on(control, "change", () => {
-    if (state.summary) runSummary();
-  });
+  on(control, "change", runSummary);
 }
 
 on(el.lkRun, "click", runLookup);

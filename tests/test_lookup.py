@@ -219,6 +219,16 @@ async def main() -> int:
         check("default branch flagged", branches["main"]["is_default"], True)
         check("not the head of either", [b["is_head"] for b in match["branches"]], [False, False])
         check("carries its lightweight tag", [t["name"] for t in match["tags"]], ["lightweight-1"])
+        check("reports the folders the commit touched", match["folders"], ["svc"])
+        check("reports no failed probes when all succeeded", match["branches_failed"], [])
+
+        # A commit touching two folders must list both.
+        multi = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "main"], capture_output=True, text=True
+        ).stdout.strip()
+        multi_hit = await lookup.lookup_commit(settings, gh, mirror, multi)
+        check("a root-level change is bucketed, not dropped",
+              multi_hit["matches"][0]["folders"], ["other"])
 
         # A commit that IS a branch tip.
         tip = subprocess.run(

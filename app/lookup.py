@@ -22,6 +22,7 @@ from typing import Any
 from . import csr as csr_provider
 from . import github as github_provider
 from .config import Settings
+from .paths import derive_folders
 
 SHA_RE = re.compile(r"^[0-9a-fA-F]{4,40}$")
 
@@ -49,7 +50,7 @@ def normalise_sha(raw: str) -> str:
 
 
 async def _lookup_github(
-    client: github_provider.GitHubClient, full_name: str, sha: str
+    client: github_provider.GitHubClient, full_name: str, sha: str, settings: Settings
 ) -> dict[str, Any] | None:
     key = f"github:{full_name}"
     try:
@@ -70,10 +71,15 @@ async def _lookup_github(
     names = [b.get("name") for b in branch_list if b.get("name")]
     probed, truncated = names[:MAX_BRANCHES_PROBED], max(0, len(names) - MAX_BRANCHES_PROBED)
 
+    failed: list[str] = []
+
     async def probe(branch: str) -> dict[str, Any] | None:
         try:
             cmp_ = await client.get_compare(full_name, full_sha, branch)
         except github_provider.GitHubError:
+            # A failed probe is not the same as "the branch does not contain it";
+            # record it so the UI never implies an answer we did not get.
+            failed.append(branch)
             return None
         # behind_by counts commits the *base* has that the head lacks. Zero means
         # this commit is reachable from the branch tip.
@@ -94,6 +100,13 @@ async def _lookup_github(
     found.sort(key=lambda b: (not b["is_default"], b["distance_to_head"], b["name"]))
 
     tags_by_sha = await client.list_tag_details(full_name)
+    paths = [f.get("filename", "") for f in (commit.get("files") or []) if isinstance(f, dict)]
+    folders = derive_folders(
+        [p for p in paths if p],
+        settings.folder_depth,
+        settings.folder_paths,
+        settings.folder_exclude,
+    )
     author = (commit.get("commit") or {}).get("author") or {}
     gh_author = commit.get("author") or {}
     stats = commit.get("stats") or {}
@@ -116,9 +129,11 @@ async def _lookup_github(
         "files_changed": len(commit.get("files") or []),
         "additions": stats.get("additions"),
         "deletions": stats.get("deletions"),
+        "folders": folders,
         "branches": found,
         "branches_probed": len(probed),
         "branches_unprobed": truncated,
+        "branches_failed": failed,
         "tags": tags_by_sha.get(full_sha, []),
         "nearest_tag": None,  # no cheap "describe" equivalent on the REST API
         "default_branch": default_branch,
@@ -182,14 +197,19 @@ async def _lookup_csr(
 
     numstat = await git(["show", "--numstat", "--format=", full_sha])
     adds = dels = files = 0
+    changed_paths: list[str] = []
     for line in numstat.splitlines():
         parts = line.split("\t")
         if len(parts) >= 3:
             files += 1
+            changed_paths.append(parts[-1])
             if parts[0].isdigit():
                 adds += int(parts[0])
             if parts[1].isdigit():
                 dels += int(parts[1])
+    folders = derive_folders(
+        changed_paths, settings.folder_depth, settings.folder_paths, settings.folder_exclude
+    )
 
     return {
         "provider": "csr",
@@ -209,9 +229,11 @@ async def _lookup_csr(
         "files_changed": files,
         "additions": adds,
         "deletions": dels,
+        "folders": folders,
         "branches": found,
         "branches_probed": len(branch_names),
         "branches_unprobed": 0,
+        "branches_failed": [],
         "tags": tags_by_sha.get(full_sha, []),
         "nearest_tag": nearest,
         "default_branch": default_branch,
@@ -227,7 +249,7 @@ async def lookup_commit(
     """Search every configured repository for the commit, in parallel."""
     sha = normalise_sha(raw_sha)
 
-    tasks = [_lookup_github(gh_client, name, sha) for name in settings.repos]
+    tasks = [_lookup_github(gh_client, name, sha, settings) for name in settings.repos]
     tasks += [_lookup_csr(mirror, repo, sha, settings) for repo in settings.csr_repos]
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
