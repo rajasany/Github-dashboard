@@ -133,6 +133,7 @@ vm.runInContext(
      buildFilters, foldersOf, select, pruneSelections, commitNode, render,
      showTab, TABS, renderSummary, renderLookup, fmtStamp,
      escapeAttr, escapeHtml, applyPreset, isoDay, rangeLabel, currentCriteria,
+     cherryChip, tagButton, openTagDialog, renderOrder,
      renderTipCard,
      renderCompare, compareCriteria, exitCompare };`,
   context
@@ -848,6 +849,118 @@ console.log("\n=== 26. timestamp formatting ===");
 check("pads to a sortable local stamp", /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(api.fmtStamp("2026-08-04T10:00:00Z")), true);
 check("empty input yields empty output", api.fmtStamp(null), "");
 check("unparseable input is not invented", api.fmtStamp("not-a-date"), "not-a-date");
+
+
+console.log("\n=== 27. cherry-pick indicators ===");
+const recorded = { is_cherry_pick: true, source_sha: "9fceb02d0ae598e95dc970b74767f19372d61af8", evidence: "recorded" };
+const mentioned = { is_cherry_pick: true, source_sha: null, evidence: "mentioned" };
+const clean = { is_cherry_pick: false, source_sha: null, evidence: null };
+
+check("no chip for an ordinary commit", api.cherryChip(clean), "");
+check("no chip when the field is absent", api.cherryChip(undefined), "");
+check("a recorded pick shows the source hash", /cherry-pick 9fceb02/.test(api.cherryChip(recorded)), true);
+check("a recorded pick is not marked weak", /is-weak/.test(api.cherryChip(recorded)), false);
+check("a mention is marked weak", /is-weak/.test(api.cherryChip(mentioned)), true);
+check("a mention shows a question mark, not a fabricated hash",
+  /cherry-pick\?/.test(api.cherryChip(mentioned)), true);
+check("the tooltip explains a recorded pick",
+  /recorded by git cherry-pick -x/.test(api.cherryChip(recorded)), true);
+check("the tooltip explains the weaker case",
+  /git recorded no source commit/.test(api.cherryChip(mentioned)), true);
+
+// It must reach the feed rows, the summary table, the lookup card and the timeline.
+reset();
+DATA.commits[0].cherry_pick = recorded;
+check("feed row carries the chip",
+  /class="chip cherry"/.test(api.commitNode(DATA.commits[0]).innerHTML), true);
+DATA.commits[0].cherry_pick = clean;
+
+S.summary = {
+  repo_key: SHOP, repo: "acme/shop", branch: "main", folder: null, limit: 100, capped: false,
+  commits_scanned: 1, row_count: 1, tagged_rows: 0, folders_available: [],
+  rows: [{ sha: "a".repeat(40), url: "#", author_name: "alice", date: "2026-08-04T10:00:00Z",
+           title: "picked", folders: [], files_changed: 1, tags: [], cherry_pick: recorded }],
+};
+api.renderSummary();
+check("summary row carries the chip",
+  /class="chip cherry"/.test(els.get("sum-body").children[0].innerHTML), true);
+
+S.lookup = { ...S.lookup, found: true, matches: [{ ...lookupFixture, cherry_pick: recorded }] };
+api.renderLookup();
+const cpCard = els.get("lk-body").children[0].innerHTML;
+check("lookup card has a dedicated row", /Cherry-pick<\/span>/.test(cpCard), true);
+check("and shows the full source hash",
+  /9fceb02d0ae598e95dc970b74767f19372d61af8/.test(cpCard), true);
+
+S.lookup = { ...S.lookup, found: true, matches: [{ ...lookupFixture, cherry_pick: mentioned }] };
+api.renderLookup();
+check("an unrecorded source says so, rather than showing nothing",
+  /source not recorded/.test(els.get("lk-body").children[0].innerHTML), true);
+
+S.lookup = { ...S.lookup, found: true, matches: [{ ...lookupFixture, cherry_pick: clean }] };
+api.renderLookup();
+check("no cherry-pick row on an ordinary commit",
+  /Cherry-pick<\/span>/.test(els.get("lk-body").children[0].innerHTML), false);
+
+
+console.log("\n=== 28. create-tag reachable from every commit view ===");
+check("the button carries its own repository context",
+  /data-repo-key="github:acme\/shop"/.test(api.tagButton("github:acme/shop", "acme/shop", "abc123", "t")), true);
+check("and the full sha", /data-sha="abc123"/.test(api.tagButton("github:acme/shop", "acme/shop", "abc123", "t")), true);
+check("no button without a repository", api.tagButton("", "x", "abc123", "t"), "");
+check("no button without a commit", api.tagButton("github:a/b", "a/b", "", "t"), "");
+
+// Summary table
+S.summary = {
+  repo_key: SHOP, repo: "acme/shop", branch: "main", folder: null, limit: 100, capped: false,
+  commits_scanned: 1, row_count: 1, tagged_rows: 0, folders_available: [],
+  rows: [{ sha: "a".repeat(40), url: "#", author_name: "alice", date: "2026-08-04T10:00:00Z",
+           title: "row", folders: [], files_changed: 1, tags: [], cherry_pick: null }],
+};
+api.renderSummary();
+const sumHtml2 = els.get("sum-body").children[0].innerHTML;
+check("summary row offers Tag…", /class="btn tiny create-tag"/.test(sumHtml2), true);
+check("summary button names the repo", /data-repo="acme\/shop"/.test(sumHtml2), true);
+
+// Find a commit
+S.lookup = { ...S.lookup, found: true, matches: [{ ...lookupFixture, cherry_pick: null }] };
+api.renderLookup();
+const lkHtml2 = els.get("lk-body").children[0].innerHTML;
+check("lookup card offers Tag…", /create-tag/.test(lkHtml2), true);
+check("lookup button carries that match's repo",
+  new RegExp(`data-repo-key="${SHOP.replace("/", "\\/")}"`).test(lkHtml2), true);
+check("and that commit's full sha",
+  /data-sha="abc1234abc1234abc1234abc1234abc1234abc12"/.test(lkHtml2), true);
+
+// Order commits
+S.order = {
+  repo_key: PAY, repo: "gcp-proj/pay", provider: "csr", branch: "master",
+  branches_available: ["master"], default_branch: "master", total_commits: 4,
+  ordered_by: "ancestry", date_order_differs: false, problems: [], rejected: [], count: 2,
+  commits: [
+    { sha: "b".repeat(40), url: "#", title: "newer", author_name: "carol",
+      date: "2026-08-05T10:00:00Z", position: 4, distance_to_head: 0, tags: [],
+      cherry_pick: null, rank: 1, is_latest: true },
+    { sha: "c".repeat(40), url: "#", title: "older", author_name: "carol",
+      date: "2026-08-01T10:00:00Z", position: 1, distance_to_head: 3, tags: [],
+      cherry_pick: null, rank: 2, is_latest: false },
+  ],
+};
+api.renderOrder();
+const ordHtml = els.get("ord-body").children[0].innerHTML;
+check("every timeline entry offers Tag…", (ordHtml.match(/create-tag/g) || []).length, 2);
+check("order buttons carry the list's repo",
+  new RegExp(`data-repo-key="${PAY.replace("/", "\\/")}"`).test(ordHtml), true);
+
+// The dialog must accept context from any of them, not read the summary.
+S.summary = null;
+api.openTagDialog({ repoKey: PAY, repo: "gcp-proj/pay", sha: "d".repeat(40), title: "from lookup" });
+check("the dialog opens without a summary loaded", S.tagTarget?.repo_key, PAY);
+check("and targets the commit it was given", S.tagTarget?.sha, "d".repeat(40));
+check("the dialog shows that repository",
+  /gcp-proj\/pay/.test(els.get("tag-target").innerHTML), true);
+api.openTagDialog({ repoKey: "", sha: "" });
+check("an incomplete target is ignored", S.tagTarget?.repo_key, PAY);
 
 console.log(allOk ? "\nALL PASS" : "\nSOME FAILURES");
 process.exit(allOk ? 0 : 1);

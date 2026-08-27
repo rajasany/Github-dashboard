@@ -111,6 +111,10 @@
     </aside>
 
     <section class="content">
+      <!-- Staged tags are app-wide: you can create one from any tab, so the strip
+           sits above the panels rather than inside the one that made it. -->
+      <section id="staged-strip" class="staged-strip hidden" aria-label="Tags staged locally"></section>
+
       <!-- ============ Compare branches ============ -->
       <div id="panel-compare" class="tab-panel hidden">
         <section class="picker-bar">
@@ -173,7 +177,6 @@
           </div>
         </section>
         <p id="sum-scope" class="scope-line"></p>
-        <section id="staged-strip" class="staged-strip hidden" aria-label="Tags staged locally"></section>
         <div id="sum-body">
           <div class="state">
             <p class="state-title">Pick a repository and branch</p>

@@ -7,6 +7,7 @@ where a commit came from.
 from __future__ import annotations
 
 import fnmatch
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -41,6 +42,39 @@ class RepoResult:
             "private": self.private,
             "tags_total": sum(len(v) for v in self.tags.values()),
         }
+
+
+# `git cherry-pick -x` appends this line; it is the only trace a cherry-pick
+# leaves in the commit itself.
+_CHERRY_RECORDED = re.compile(
+    r"\(cherry[ -]?picked from commit\s+([0-9a-fA-F]{7,40})\s*\)", re.IGNORECASE
+)
+# A hand-written mention. Weaker evidence, reported as such.
+_CHERRY_MENTIONED = re.compile(r"\bcherry[- ]?pick(?:ed|ing)?\b", re.IGNORECASE)
+
+
+def detect_cherry_pick(message: str) -> dict[str, Any]:
+    """Whether a commit says it is a cherry-pick, and how strongly.
+
+    Only `git cherry-pick -x` records the source commit; a plain `git cherry-pick`
+    leaves *no* trace in the commit object at all, so an absence here is not
+    evidence that a commit is original. The two confidence levels are kept apart
+    so the UI never presents a passing mention as a recorded provenance.
+    """
+    text = message or ""
+
+    recorded = _CHERRY_RECORDED.search(text)
+    if recorded:
+        return {
+            "is_cherry_pick": True,
+            "source_sha": recorded.group(1).lower(),
+            "evidence": "recorded",
+        }
+
+    if _CHERRY_MENTIONED.search(text):
+        return {"is_cherry_pick": True, "source_sha": None, "evidence": "mentioned"}
+
+    return {"is_cherry_pick": False, "source_sha": None, "evidence": None}
 
 
 def make_tag(
@@ -106,6 +140,7 @@ def make_commit(
         "branches": [branch],
         # Tag names pointing at this exact commit; filled in by the feed.
         "tags": [],
+        "cherry_pick": detect_cherry_pick(message),
         # Populated when folder tracking is on; `folders` is derived from `paths`
         # later so a config change doesn't require re-fetching.
         "paths": paths or [],

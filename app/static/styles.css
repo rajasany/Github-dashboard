@@ -1213,3 +1213,23 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
 }
 .order-meta .full-sha { font: 11px var(--mono); }
 .order-meta .sep { opacity: 0.45; }
+
+/* Cherry-picked commits. A recorded provenance (`cherry-pick -x`) is stated
+   plainly; a mere mention in the message is dashed, to show it is weaker. */
+.chip.cherry {
+  border-color: transparent;
+  background: #fdf1e7;
+  color: #8a4b12;
+  font-weight: 600;
+}
+.chip.cherry.is-weak {
+  background: transparent;
+  border: 1px dashed #d3a878;
+  color: #8a4b12;
+  font-weight: 400;
+}
+
+/* Tag actions sit alongside their context in each tab. */
+.lookup-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.order-actions { margin-left: auto; flex-shrink: 0; }
+.order-head { row-gap: 6px; }

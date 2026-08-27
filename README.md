@@ -328,6 +328,28 @@ the commit's own author and date, which would look like an answer to a question 
 asked. `psf/requests`, for instance, uses lightweight tags throughout; `git/git` uses
 annotated ones and shows a real tagger for each.
 
+## Cherry-picks
+
+Every tab that lists commits — Activity, Compare, Summary table, Find a commit, Order
+commits — marks a commit that says it is a cherry-pick, with a 🍒 chip.
+
+Two confidence levels, kept apart deliberately:
+
+| Chip | Meaning |
+| --- | --- |
+| `cherry-pick 9fceb02` (solid) | `git cherry-pick -x` recorded the source commit in the message. Reliable, and the source hash is shown. |
+| `cherry-pick?` (dashed) | The message merely *mentions* a cherry-pick. Flagged, but no source was recorded, so none is invented. |
+
+**The important caveat: a plain `git cherry-pick` records nothing at all.** The trailer
+only exists when `-x` was used. So the absence of a chip is *not* evidence that a commit
+is original — it means git has nothing to say either way. Detecting those would need
+patch-ID comparison across branches, which the GitHub API cannot do at all and which is
+expensive even locally.
+
+Detection is on the commit message, so it works identically for GitHub and CSR.
+"None of your current commits are cherry-picks" is a real answer, not a broken feature —
+verified against a fixture containing a genuine `cherry-pick -x` commit.
+
 ## Order commits
 
 Paste a list of commit hashes — one per line, comma separated, bulleted, short hashes,
@@ -367,13 +389,17 @@ dates disagree — rather than quietly presenting one as the other.
 
 ## Creating tags
 
-From the **Summary table**, each row has a **Tag…** button. The flow is two steps on
-purpose, because a tag on a shared remote is awkward to retract:
+A **Tag…** button sits on every commit you can see: each row of the **Summary table**,
+each result in **Find a commit**, and each entry in **Order commits**. The button carries
+its own repository, so it works the same from any tab. The flow is two steps on purpose,
+because a tag on a shared remote is awkward to retract:
 
 1. **Create locally.** Name the tag, add a comment, review a confirmation showing the
    exact commit and repository, then create. This writes **only** to this app's local
    store (`.cache/staged-tags.sqlite3`). Nothing leaves the machine.
-2. **Push.** Staged tags appear in a strip above the table marked *local only*, with
+2. **Push.** Staged tags appear in a strip at the top of the page — visible from every
+   tab, since a tag staged in one place must be pushable from anywhere — marked
+   *local only*, with
    **Push…** and **Discard**. Push asks for a second confirmation naming the remote,
    then creates the tag there.
 
@@ -545,6 +571,7 @@ other rule hard-codes a colour.
 .venv/bin/python tests/test_lookup.py   # tag metadata, summary, lookup      (47 checks)
 .venv/bin/python tests/test_tagging.py  # staging, pushing, tag branches     (58 checks)
 .venv/bin/python tests/test_ordering.py # parsing and ordering a list        (30 checks)
+.venv/bin/python tests/test_cherrypick.py # cherry-pick detection            (24 checks)
 .venv/bin/python tests/test_compare.py  # branch comparison, real git repo   (25 checks)
 node tests/ui_cascade.test.js          # selection, rendering, escaping      (39 checks)
 ```

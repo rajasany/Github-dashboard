@@ -16,6 +16,7 @@ from . import csr as csr_provider
 from . import github as github_provider
 from .config import Settings
 from .lookup import normalise_sha
+from .models import detect_cherry_pick
 
 # A paste of more than this is almost certainly a mistake, and on GitHub it
 # would cost two API calls per commit.
@@ -253,6 +254,7 @@ async def _order_github(
             "sha": full_sha,
             "url": commit.get("html_url"),
             "title": ((commit.get("commit") or {}).get("message") or "").split("\n", 1)[0],
+            "cherry_pick": detect_cherry_pick((commit.get("commit") or {}).get("message") or ""),
             "author_name": author.get("name") or gh_author.get("login") or "unknown",
             "author_login": gh_author.get("login"),
             "date": author.get("date"),
@@ -320,13 +322,16 @@ async def _order_csr(
                 continue
 
         distance = int((await git(["rev-list", "--count", f"{full_sha}..{target}"])).strip() or 0) if target else None
-        raw = await git(["show", "-s", f"--format=%an{csr_provider._FLD}%aI{csr_provider._FLD}%s", full_sha])  # noqa: SLF001
+        # %B, not %s: the "(cherry picked from commit …)" trailer lives in the body.
+        raw = await git(["show", "-s", f"--format=%an{csr_provider._FLD}%aI{csr_provider._FLD}%B", full_sha])  # noqa: SLF001
         bits = (raw.split(csr_provider._FLD) + ["", "", ""])[:3]
+        message = bits[2]
 
         found.append({
             "sha": full_sha,
             "url": repo.commit_url(full_sha),
-            "title": bits[2].strip(),
+            "title": message.strip().split("\n", 1)[0],
+            "cherry_pick": detect_cherry_pick(message),
             "author_name": bits[0].strip(),
             "author_login": None,
             "date": bits[1].strip(),

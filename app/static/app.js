@@ -46,6 +46,8 @@ const ICON = {
     '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M7.6 2H3.2A1.2 1.2 0 0 0 2 3.2v4.4c0 .32.13.62.35.85l5.6 5.6a1.2 1.2 0 0 0 1.7 0l4.3-4.3a1.2 1.2 0 0 0 0-1.7l-5.6-5.6A1.2 1.2 0 0 0 7.6 2Z"/><circle cx="5.2" cy="5.2" r="1" fill="currentColor" stroke="none"/></svg>',
   copy:
     '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.4"/><path d="M10.5 5.5v-1a1.4 1.4 0 0 0-1.4-1.4H3.9A1.4 1.4 0 0 0 2.5 4.5v5.2a1.4 1.4 0 0 0 1.4 1.4h1"/></svg>',
+  cherry:
+    '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M12.5 2.5c-3 .6-5 2.4-6 4.6M12.5 2.5c.4 1.6.1 3-.6 4.2"/><circle cx="4.6" cy="10.4" r="2.6" fill="currentColor" stroke="none"/><circle cx="11" cy="11.6" r="2.4" fill="currentColor" stroke="none"/></svg>',
   caret:
     '<svg class="ic caret" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6 3.5 11 8l-5 4.5V3.5Z"/></svg>',
   search:
@@ -696,6 +698,21 @@ function renderStats(commits) {
     .join("");
 }
 
+/* A cherry-pick can only be detected from what git records. `git cherry-pick -x`
+ * writes the source commit into the message; a plain cherry-pick writes nothing
+ * at all, so the absence of this chip never means a commit is original. The two
+ * confidence levels are kept visually distinct. */
+function cherryChip(cp) {
+  if (!cp?.is_cherry_pick) return "";
+  const recorded = cp.evidence === "recorded";
+  const title = recorded
+    ? `Cherry-picked from ${cp.source_sha} — recorded by git cherry-pick -x`
+    : "The commit message mentions a cherry-pick, but git recorded no source commit";
+  return `<span class="chip cherry${recorded ? "" : " is-weak"}" title="${escapeAttr(title)}">${
+    ICON.cherry
+  }<span class="txt">cherry-pick${recorded ? ` ${escapeHtml(cp.source_sha.slice(0, 7))}` : "?"}</span></span>`;
+}
+
 function absoluteTime(iso) {
   if (!iso) return "";
   return new Date(iso).toLocaleString(undefined, {
@@ -782,7 +799,7 @@ function commitNode(c) {
         ${revertBadge}
         ${churnBadge}
       </div>
-      <div class="chips">${tagChips}${folderChips}${branchChips}</div>
+      <div class="chips">${cherryChip(c.cherry_pick)}${tagChips}${folderChips}${branchChips}</div>
       ${body}
     </div>
     <div class="commit-side">
@@ -1464,11 +1481,11 @@ function renderSummary() {
           <td class="mono nowrap">${
             tag && tag.tagger_date ? escapeHtml(fmtStamp(tag.tagger_date)) : '<span class="muted">—</span>'
           }</td>
-          <td>${i ? "" : escapeHtml(r.title)}</td>
+          <td>${i ? "" : `${cherryChip(r.cherry_pick)}${escapeHtml(r.title)}`}</td>
           <td>${
             i
               ? ""
-              : `<button type="button" class="btn tiny create-tag" data-sha="${escapeAttr(r.sha)}" data-title="${escapeAttr(r.title)}">Tag…</button>`
+              : tagButton(s.repo_key, s.repo, r.sha, r.title)
           }</td>
         </tr>`);
     });
@@ -1593,15 +1610,26 @@ function _clipText(text, limit) {
   return s.length <= limit ? s : `${s.slice(0, limit - 1)}…`;
 }
 
-function openTagDialog(rowSha, rowTitle) {
-  const s = state.summary;
-  if (!s) return;
-  state.tagTarget = { repo_key: s.repo_key, repo: s.repo, sha: rowSha, title: rowTitle };
+/* Takes the repository explicitly rather than reading whichever tab happens to
+ * be loaded, so the same dialog serves the Summary table, Find a commit and
+ * Order commits. */
+/* One button, usable from any tab: it carries its own repository context. */
+function tagButton(repoKey, repo, sha, title, extraClass = "tiny") {
+  if (!repoKey || !sha) return "";
+  return `<button type="button" class="btn ${extraClass} create-tag"
+    data-repo-key="${escapeAttr(repoKey)}" data-repo="${escapeAttr(repo || "")}"
+    data-sha="${escapeAttr(sha)}" data-title="${escapeAttr(title || "")}"
+    title="Create a tag on ${escapeAttr(sha.slice(0, 10))}">Tag…</button>`;
+}
+
+function openTagDialog({ repoKey, repo, sha, title }) {
+  if (!repoKey || !sha) return;
+  state.tagTarget = { repo_key: repoKey, repo, sha, title: title || "" };
 
   el.tagTarget.innerHTML = `
-    <div class="tip-row"><span class="tip-label">Repository</span><span class="tip-value">${escapeHtml(s.repo)}</span></div>
-    <div class="tip-row"><span class="tip-label">Commit</span><span class="tip-value"><code class="full-sha">${escapeHtml(rowSha)}</code></span></div>
-    <div class="tip-row"><span class="tip-label">Message</span><span class="tip-value">${escapeHtml(rowTitle)}</span></div>`;
+    <div class="tip-row"><span class="tip-label">Repository</span><span class="tip-value">${escapeHtml(repo || repoKey)}</span></div>
+    <div class="tip-row"><span class="tip-label">Commit</span><span class="tip-value"><code class="full-sha">${escapeHtml(sha)}</code></span></div>
+    <div class="tip-row"><span class="tip-label">Message</span><span class="tip-value">${escapeHtml(title || "")}</span></div>`;
 
   el.tagName.value = "";
   el.tagMessage.value = "";
@@ -1723,7 +1751,14 @@ function handleTagClicks(event) {
   const discard = event.target.closest?.(".discard-tag");
   if (discard) return discardStaged(discard.dataset.id);
   const create = event.target.closest?.(".create-tag");
-  if (create) return openTagDialog(create.dataset.sha, create.dataset.title || "");
+  if (create) {
+    return openTagDialog({
+      repoKey: create.dataset.repoKey,
+      repo: create.dataset.repo,
+      sha: create.dataset.sha,
+      title: create.dataset.title,
+    });
+  }
 }
 
 /* ---------- tags overview ---------- */
@@ -2081,7 +2116,10 @@ function lookupCard(m) {
         <h3>${escapeHtml(m.repo)}</h3>
         <p class="muted">${escapeHtml(m.title)}</p>
       </div>
-      <span class="chip source ${escapeAttr(m.provider)}">${escapeHtml(PROVIDER_LABEL[m.provider] || m.provider)}</span>
+      <div class="lookup-actions">
+        <span class="chip source ${escapeAttr(m.provider)}">${escapeHtml(PROVIDER_LABEL[m.provider] || m.provider)}</span>
+        ${tagButton(m.repo_key, m.repo, m.sha, m.title)}
+      </div>
     </div>
 
     <div class="tip-row">
@@ -2101,6 +2139,18 @@ function lookupCard(m) {
         <a class="btn tiny" href="${escapeAttr(m.url)}" target="_blank" rel="noopener">Open</a>
       </span>
     </div>
+    ${
+      m.cherry_pick?.is_cherry_pick
+        ? `<div class="tip-row">
+             <span class="tip-label">Cherry-pick</span>
+             <span class="tip-value">${cherryChip(m.cherry_pick)}${
+               m.cherry_pick.source_sha
+                 ? ` <span class="muted">from</span> <code class="full-sha">${escapeHtml(m.cherry_pick.source_sha)}</code>`
+                 : ' <span class="muted">source not recorded — the message mentions one, but git stored no reference</span>'
+             }</span>
+           </div>`
+        : ""
+    }
     <div class="tip-row">
       <span class="tip-label">Authored</span>
       <span class="tip-value">${escapeHtml(m.author_name)} on ${escapeHtml(fmtStamp(m.date))}</span>
@@ -2514,7 +2564,8 @@ function renderOrder() {
             <div class="order-head">
               ${c.is_latest ? '<span class="status-badge is-ahead">Latest</span>' : `<span class="order-rank">#${c.rank}</span>`}
               <a class="order-title" href="${escapeAttr(c.url)}" target="_blank" rel="noopener">${escapeHtml(c.title)}</a>
-              ${tags}
+              ${cherryChip(c.cherry_pick)}${tags}
+              <span class="order-actions">${tagButton(d.repo_key, d.repo, c.sha, c.title)}</span>
             </div>
             <div class="order-meta">
               <code class="full-sha">${escapeHtml(c.sha)}</code>

@@ -22,6 +22,7 @@ from typing import Any
 from . import csr as csr_provider
 from . import github as github_provider
 from .config import Settings
+from .models import detect_cherry_pick
 from .paths import changed_directories, derive_folders
 
 SHA_RE = re.compile(r"^[0-9a-fA-F]{4,40}$")
@@ -162,6 +163,7 @@ async def _lookup_github(
         "url": commit.get("html_url"),
         "title": ((commit.get("commit") or {}).get("message") or "").split("\n", 1)[0],
         "body": "\n".join(((commit.get("commit") or {}).get("message") or "").split("\n")[1:]).strip(),
+        "cherry_pick": detect_cherry_pick((commit.get("commit") or {}).get("message") or ""),
         "author_name": author.get("name") or gh_author.get("login") or "unknown",
         "author_login": gh_author.get("login"),
         "author_email": author.get("email"),
@@ -297,6 +299,7 @@ async def _lookup_csr(
         "url": repo.commit_url(full_sha),
         "title": subject.strip(),
         "body": body.strip(),
+        "cherry_pick": detect_cherry_pick(f"{subject}\n{body}"),
         "author_name": an.strip(),
         "author_login": None,
         "author_email": ae.strip(),

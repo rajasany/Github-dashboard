@@ -109,6 +109,7 @@ async def build_summary(
                 "date": commit["date"],
                 "title": commit["title"],
                 "folders": commit.get("folders") or [],
+                "cherry_pick": commit.get("cherry_pick"),
                 "files_changed": commit.get("files_changed") or 0,
                 "tags": tags,
             }
