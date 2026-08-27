@@ -51,6 +51,7 @@
     <button class="tab" id="tab-compare" data-tab="compare" role="tab" aria-selected="false">Compare branches</button>
     <button class="tab" id="tab-lookup" data-tab="lookup" role="tab" aria-selected="false">Find a commit</button>
     <button class="tab" id="tab-tags" data-tab="tags" role="tab" aria-selected="false">Tags</button>
+    <button class="tab" id="tab-order" data-tab="order" role="tab" aria-selected="false">Order commits</button>
   </nav>
 
   <div id="banner" class="banner hidden"></div>
@@ -210,6 +211,34 @@
         </section>
         <p id="tags-scope" class="scope-line"></p>
         <div id="tags-body"></div>
+      </div>
+
+      <!-- ============ Order a list of commits ============ -->
+      <div id="panel-order" class="tab-panel hidden">
+        <section class="picker-bar order-bar">
+          <label class="field block grow">
+            <span>Commit list</span>
+            <textarea id="ord-input" class="input" rows="5" spellcheck="false"
+              placeholder="Paste commit hashes — one per line, or comma separated.&#10;Full or short hashes and commit URLs both work."></textarea>
+          </label>
+          <div class="order-side">
+            <label class="field block">
+              <span>Repository</span>
+              <select id="ord-repo"><option value="">Detect from the commits</option></select>
+            </label>
+            <label class="field block">
+              <span>Branch</span>
+              <select id="ord-branch"><option value="">Default branch</option></select>
+            </label>
+            <div class="picker-actions">
+              <button id="ord-run" class="btn primary">Validate &amp; order</button>
+              <button id="ord-clear" class="btn tiny">Clear</button>
+            </div>
+          </div>
+        </section>
+        <p id="ord-scope" class="scope-line"></p>
+        <div id="ord-problems"></div>
+        <div id="ord-body"></div>
       </div>
 
       <!-- ============ Activity feed ============ -->

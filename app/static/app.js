@@ -85,6 +85,15 @@ const el = {
   lkRun: $("lk-run"),
   lkBody: $("lk-body"),
   panelTags: $("panel-tags"),
+  panelOrder: $("panel-order"),
+  ordInput: $("ord-input"),
+  ordRepo: $("ord-repo"),
+  ordBranch: $("ord-branch"),
+  ordRun: $("ord-run"),
+  ordClear: $("ord-clear"),
+  ordScope: $("ord-scope"),
+  ordProblems: $("ord-problems"),
+  ordBody: $("ord-body"),
   tagsRepo: $("tags-repo"),
   tagsScope: $("tags-scope"),
   tagsRefresh: $("tags-refresh"),
@@ -159,6 +168,7 @@ const state = {
   summary: null,
   lookup: null,
   tags: null,
+  order: null,
   staged: [],
   // The row a tag is being created for, and the tag queued for pushing.
   tagTarget: null,
@@ -1295,6 +1305,7 @@ const TABS = {
   compare: { panel: () => el.panelCompare, sidebar: false, onShow: initCompareTab },
   lookup: { panel: () => el.panelLookup, sidebar: false, onShow: () => el.lkSha.focus?.() },
   tags: { panel: () => el.panelTags, sidebar: false, onShow: initTagsTab },
+  order: { panel: () => el.panelOrder, sidebar: false, onShow: initOrderTab },
 };
 
 function showTab(name) {
@@ -2300,3 +2311,175 @@ console.info(`[dashboard] build ${APP_BUILD}`);
   state.noToken = cfg.repos.length > 0 && !cfg.has_token;
   load();
 })();
+
+/* ---------- order a pasted commit list ---------- */
+
+function initOrderTab() {
+  if (el.ordRepo.options.length <= 1 && repoOptions().length) {
+    el.ordRepo.innerHTML =
+      '<option value="">Detect from the commits</option>' +
+      repoOptions()
+        .map((r) => `<option value="${escapeAttr(r.key)}">${escapeHtml(r.name)}</option>`)
+        .join("");
+  }
+  el.ordInput.focus?.();
+}
+
+async function loadBranchesForOrder() {
+  const repoKey = el.ordRepo.value;
+  // With no repository chosen the branch is settled server-side, once the
+  // commits reveal which repository they belong to.
+  if (!repoKey) {
+    el.ordBranch.innerHTML = '<option value="">Default branch</option>';
+    return;
+  }
+  try {
+    const body = await fetchBranches(repoKey);
+    el.ordBranch.innerHTML =
+      '<option value="">Default branch</option>' +
+      (body.branches || [])
+        .map((n) => `<option value="${escapeAttr(n)}">${escapeHtml(n)}</option>`)
+        .join("");
+  } catch {
+    el.ordBranch.innerHTML = '<option value="">Default branch</option>';
+  }
+}
+
+async function runOrder() {
+  const text = el.ordInput.value.trim();
+  if (!text) {
+    el.ordScope.textContent = "Paste some commit hashes first.";
+    return;
+  }
+
+  el.ordRun.disabled = true;
+  el.ordRun.textContent = "Checking…";
+  el.ordBody.replaceChildren(stateNode("Checking each commit…", "Resolving the repository, then placing each commit on the branch."));
+  el.ordProblems.replaceChildren();
+
+  try {
+    const res = await fetch("/api/commits/order", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commits: text,
+        repo_key: el.ordRepo.value || null,
+        branch: el.ordBranch.value || null,
+      }),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      el.ordScope.textContent = "";
+      el.ordBody.replaceChildren(stateNode("Could not order that list", body.detail || res.statusText));
+      return;
+    }
+    state.order = body;
+    renderOrder();
+  } catch (err) {
+    el.ordBody.replaceChildren(stateNode("Could not order that list", err.message));
+  } finally {
+    el.ordRun.disabled = false;
+    el.ordRun.textContent = "Validate & order";
+  }
+}
+
+function renderOrder() {
+  const d = state.order;
+  if (!d) return;
+
+  el.ordScope.textContent =
+    `${d.repo} › ${d.branch || "(no branch)"} · ${d.count} commit${d.count === 1 ? "" : "s"} placed` +
+    (d.total_commits ? ` on a branch of ${d.total_commits}` : "") +
+    ` · ordered by ${d.ordered_by === "ancestry" ? "position in history" : "date"}`;
+
+  // Anything that did not make it into the list is stated, never dropped quietly.
+  const notes = [];
+  if (d.problems.length) {
+    notes.push(`
+      <div class="order-problems">
+        <h4>${d.problems.length} commit${d.problems.length === 1 ? "" : "s"} excluded</h4>
+        <ul>${d.problems.map((p) => `<li><code>${escapeHtml(p.sha)}</code> — ${escapeHtml(p.reason)}</li>`).join("")}</ul>
+      </div>`);
+  }
+  if (d.rejected.length) {
+    notes.push(`
+      <div class="order-problems muted-box">
+        <h4>${d.rejected.length} input${d.rejected.length === 1 ? "" : "s"} ignored</h4>
+        <ul>${d.rejected.map((r) => `<li><code>${escapeHtml(r.input)}</code> — ${escapeHtml(r.reason)}</li>`).join("")}</ul>
+      </div>`);
+  }
+  if (d.date_order_differs) {
+    notes.push(`
+      <div class="order-problems warn-box">
+        <h4>Commit dates disagree with history order</h4>
+        <p>These are listed by their position in the branch, which is the real order
+        they were applied. A rebase or cherry-pick can leave the author dates out of
+        step, so sorting by date here would mislead.</p>
+      </div>`);
+  }
+  el.ordProblems.innerHTML = notes.join("");
+
+  if (!d.commits.length) {
+    el.ordBody.replaceChildren(
+      stateNode("Nothing left to show", "Every commit in the list was excluded — see the reasons above.")
+    );
+    return;
+  }
+
+  const rows = d.commits
+    .map((c, i) => {
+      const gap =
+        i > 0 && c.position !== null && d.commits[i - 1].position !== null
+          ? d.commits[i - 1].position - c.position - 1
+          : 0;
+      const gapRow =
+        gap > 0
+          ? `<li class="order-gap"><span class="order-rail"></span><span class="muted">${gap} other commit${gap === 1 ? "" : "s"} in between</span></li>`
+          : "";
+
+      const tags = (c.tags || [])
+        .map((t) => `<span class="chip tag">${ICON.tag}<span class="txt">${escapeHtml(t.name)}</span></span>`)
+        .join("");
+
+      return `${gapRow}
+        <li class="order-item${c.is_latest ? " is-latest" : ""}">
+          <span class="order-rail"><span class="order-dot"></span></span>
+          <div class="order-card">
+            <div class="order-head">
+              ${c.is_latest ? '<span class="status-badge is-ahead">Latest</span>' : `<span class="order-rank">#${c.rank}</span>`}
+              <a class="order-title" href="${escapeAttr(c.url)}" target="_blank" rel="noopener">${escapeHtml(c.title)}</a>
+              ${tags}
+            </div>
+            <div class="order-meta">
+              <code class="full-sha">${escapeHtml(c.sha)}</code>
+              <button type="button" class="copy-sha" data-sha="${escapeAttr(c.sha)}" title="Copy full hash ${escapeAttr(c.sha)}" aria-label="Copy full commit hash">${ICON.copy}</button>
+              <span>${escapeHtml(c.author_name)}</span>
+              <span class="sep">·</span>
+              <span>${escapeHtml(fmtStamp(c.date))}</span>
+              <span class="sep">·</span>
+              <span>${
+                c.position !== null
+                  ? `position ${c.position}${d.total_commits ? ` of ${d.total_commits}` : ""} · ${c.distance_to_head} since head`
+                  : '<span class="muted">position unknown</span>'
+              }</span>
+            </div>
+          </div>
+        </li>`;
+    })
+    .join("");
+
+  const box = document.createElement("div");
+  box.className = "order-timeline";
+  box.innerHTML = `<ul class="order-list">${rows}</ul>`;
+  el.ordBody.replaceChildren(box);
+}
+
+on(el.ordRun, "click", runOrder);
+on(el.ordRepo, "change", loadBranchesForOrder);
+on(el.ordClear, "click", () => {
+  el.ordInput.value = "";
+  el.ordScope.textContent = "";
+  el.ordProblems.replaceChildren();
+  el.ordBody.replaceChildren();
+  state.order = null;
+});

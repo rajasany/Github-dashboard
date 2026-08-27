@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from . import compare, lookup, report, summary, tagging
+from . import compare, lookup, ordering, report, summary, tagging
 from .config import load_settings
 from .csr import GitMirror
 from .feed import build_feed, enrich_commit_folders
@@ -352,6 +352,33 @@ async def tags_overview(
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return await tagging.tag_overview(settings, gh_client, mirror, tag_store, enrich)
+
+
+class OrderRequest(BaseModel):
+    commits: str = Field(min_length=1, max_length=20000)
+    repo_key: str | None = None
+    branch: str | None = None
+
+
+@app.post("/api/commits/order")
+async def order_commits(body: OrderRequest) -> dict:
+    """Validate a pasted commit list and order it newest-first along one branch."""
+    assert gh_client is not None and mirror is not None
+
+    if not settings.configured:
+        raise HTTPException(status_code=400, detail="No repositories configured.")
+    if body.repo_key and body.repo_key not in set(settings.all_keys()):
+        raise HTTPException(status_code=400, detail=f"Unknown repository: {body.repo_key}")
+
+    try:
+        return await ordering.order_commits(
+            settings, gh_client, mirror,
+            raw=body.commits, repo_key=body.repo_key, branch=body.branch,
+        )
+    except ordering.OrderError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except GitHubError as exc:
+        raise HTTPException(status_code=exc.status or 502, detail=exc.message) from exc
 
 
 @app.get("/api/branches")

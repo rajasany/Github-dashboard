@@ -159,6 +159,7 @@ a `+` on the file count and may under-report folders.
 | `GET /api/config` | Tracked repos, providers, and defaults, for the UI to bootstrap. |
 | `GET /api/feed?since=2026-07-01&until=2026-08-05&key=…&refresh=false` | The merged feed. `since`/`until` are UTC calendar dates; `until` is inclusive and may be omitted for "through to now". `days=N` still works as a lookback when `since` is absent. `key` may repeat; values are `github:owner/repo` or `csr:project/repo`. |
 | `GET /api/summary?key=…&branch=…&folder=…&since=…&limit=100` | One row per commit on a branch, with full tag metadata. |
+| `POST /api/commits/order` | `{commits, repo_key?, branch?}` → the list validated and ordered newest-first. |
 | `GET /api/lookup?sha=…` | Which repos and branches hold a commit, and its position in each. |
 | `GET /api/tags/overview?key=…` | One repo's tags with the folders and branches of each. Omit `key` for a cross-repo listing without branch data. |
 | `POST /api/tags/stage` | `{repo_key, sha, name, message}` → stage a tag locally. Writes nothing to the remote. |
@@ -182,6 +183,7 @@ a `+` on the file count and may under-report folders.
 | [app/summary.py](app/summary.py) | Repo + branch + folder → the commit/tag table. |
 | [app/lookup.py](app/lookup.py) | Hash → repo, branches, graph position. |
 | [app/tagging.py](app/tagging.py) | Tag staging, pushing, and the tag overview. |
+| [app/ordering.py](app/ordering.py) | Parse a commit list, validate it, order by ancestry. |
 | [app/compare.py](app/compare.py) | Branch comparison for both providers. |
 | [app/feed.py](app/feed.py) | Merges providers, dedupes by `(repo, sha)`, derives folders. |
 | [app/main.py](app/main.py) | Routes. |
@@ -298,6 +300,7 @@ the totals and breakdowns still cover every commit.
 | **Compare branches** | What one branch has that another does not, from their merge base. |
 | **Find a commit** | Given a hash: which repo and branches hold it, and how far each has moved on. |
 | **Tags** | Every tag in every repo, grouped by the service / folder its commit touched. |
+| **Order commits** | Paste a list of commits; it validates and orders them newest-first. |
 
 The sidebar filters drive the Activity feed only; the other three tabs carry their own
 pickers, so the sidebar folds away on them. The date range in the header applies to
@@ -324,6 +327,43 @@ and no timestamp for it anywhere. Those rows read **lightweight** rather than bo
 the commit's own author and date, which would look like an answer to a question nobody
 asked. `psf/requests`, for instance, uses lightweight tags throughout; `git/git` uses
 annotated ones and shows a real tagger for each.
+
+## Order commits
+
+Paste a list of commit hashes — one per line, comma separated, bulleted, short hashes,
+or full commit URLs. The screen validates the list and lays it out newest-first on a
+timeline, with the newest marked **Latest**.
+
+```
+●  Latest  branch restriction                            ← newest
+   e224c189f7f8892e4b604f0c10b829c3e9e02088
+   rajasany · 2026-08-26 21:49 · position 10 of 13 · 3 since head
+●  #2      Commit hash and tag changes
+   659b1095b5cd46b8062117e9abb436c20115aff8
+   rajasany · 2026-08-26 20:50 · position 9 of 13 · 4 since head
+│          4 other commits in between
+●  #3      Dashboard addition
+   …
+```
+
+Each entry carries the full hash (copyable), the author, the creation time, any tags on
+that commit, and its position in the branch. Gaps in the chain are shown, so you can see
+how far apart two commits in the list actually are.
+
+**Validation.** The repository is settled by the first commit that resolves; every other
+commit is then checked against it. A commit from a *different* repository is excluded and
+says where it actually lives (`not in rajasany/Github-dashboard — it is in
+rajasany/Insurance`). A commit that exists but is not on the chosen branch is excluded
+and says so. Unreadable input and duplicates are listed separately as ignored. Nothing is
+dropped silently.
+
+You can pin the repository and branch with the two dropdowns; left alone, the repository
+is detected from the commits and the default branch is used.
+
+**Ordering is by position in history, not by timestamp.** Author dates can be rewritten
+by a rebase or a cherry-pick, so sorting by date can put commits in an order they were
+never applied in. Where the two disagree the ancestry order wins and a note says the
+dates disagree — rather than quietly presenting one as the other.
 
 ## Creating tags
 
@@ -492,6 +532,7 @@ other rule hard-codes a colour.
 .venv/bin/python tests/test_report.py   # date window + report rollup        (57 checks)
 .venv/bin/python tests/test_lookup.py   # tag metadata, summary, lookup      (47 checks)
 .venv/bin/python tests/test_tagging.py  # staging, pushing, tag branches     (58 checks)
+.venv/bin/python tests/test_ordering.py # parsing and ordering a list        (30 checks)
 .venv/bin/python tests/test_compare.py  # branch comparison, real git repo   (25 checks)
 node tests/ui_cascade.test.js          # selection, rendering, escaping      (39 checks)
 ```

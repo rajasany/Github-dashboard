@@ -1118,3 +1118,98 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
   font-size: 12px;
   font-weight: 500;
 }
+
+/* ---------- order a commit list ---------- */
+
+.order-bar { align-items: stretch; }
+.order-bar .field.block.grow { flex: 2 1 380px; }
+.order-bar textarea.input { width: 100%; font: 12.5px/1.6 var(--mono); resize: vertical; }
+.order-side { display: flex; flex-direction: column; gap: 8px; flex: 1 1 220px; min-width: 200px; }
+.order-side .picker-actions { margin-top: auto; }
+
+.order-problems {
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  border: 1px solid var(--border);
+  border-left: 3px solid #a3323b;
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.order-problems.muted-box { border-left-color: var(--border); }
+.order-problems.warn-box { border-left-color: var(--amber); }
+.order-problems h4 { margin: 0 0 6px; font-size: 12.5px; font-weight: 650; }
+.order-problems ul { margin: 0; padding-left: 18px; font-size: 12.5px; color: var(--muted); }
+.order-problems li { margin: 2px 0; }
+.order-problems p { margin: 0; font-size: 12.5px; color: var(--muted); line-height: 1.55; }
+.order-problems code { font: 11.5px var(--mono); color: var(--text); }
+
+.order-list { list-style: none; margin: 0; padding: 0; }
+.order-item, .order-gap { display: flex; gap: 12px; align-items: stretch; }
+
+/* The rail is one continuous line down the list; each item draws its own dot. */
+.order-rail {
+  position: relative;
+  flex: 0 0 14px;
+  display: flex;
+  justify-content: center;
+}
+.order-rail::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--border);
+}
+.order-list > li:first-child .order-rail::before { top: 18px; }
+.order-list > li:last-child .order-rail::before { bottom: calc(100% - 18px); }
+
+.order-dot {
+  position: relative;
+  margin-top: 13px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 2px solid var(--muted);
+}
+.order-item.is-latest .order-dot {
+  background: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-soft);
+}
+
+.order-gap { min-height: 26px; align-items: center; }
+.order-gap .muted { font-size: 11.5px; padding: 2px 0; }
+
+.order-card {
+  flex: 1;
+  min-width: 0;
+  margin-bottom: 10px;
+  padding: 10px 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.order-item.is-latest .order-card { border-color: var(--accent); background: var(--accent-soft); }
+
+.order-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.order-rank {
+  font: 11px var(--mono);
+  color: var(--muted);
+  min-width: 22px;
+}
+.order-title { font-size: 13.5px; font-weight: 600; color: inherit; text-decoration: none; overflow-wrap: anywhere; }
+.order-title:hover { color: var(--accent-ink); text-decoration: underline; }
+
+.order-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 7px;
+  margin-top: 5px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.order-meta .full-sha { font: 11px var(--mono); }
+.order-meta .sep { opacity: 0.45; }
