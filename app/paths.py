@@ -72,3 +72,37 @@ def derive_folders(
         }
 
     return sorted(out)
+
+
+def changed_directories(paths: list[str], exclude: list[str]) -> list[str]:
+    """The directories the changed files actually sit in.
+
+    This is deliberately *not* `derive_folders`. That one rolls a path up to a
+    service bucket (`app/static/app.js` -> `app`) so activity can be grouped;
+    this one answers the different question "where was this commit made", and a
+    commit confined to `app/static` should say `app/static`, not `app`.
+
+    A parent appears only when a file sits directly in it, so `app` and
+    `app/static` both showing means files were changed in both.
+    """
+    normalised = [p.strip().strip("/") for p in exclude]
+    out: set[str] = set()
+
+    for raw in paths:
+        path = (raw or "").strip().strip("/")
+        if not path:
+            continue
+        segments = path.split("/")
+        directory = "/".join(segments[:-1])
+        if not directory:
+            out.add(ROOT_LABEL)
+            continue
+        if any(
+            fnmatch.fnmatch(directory, pat) or any(fnmatch.fnmatch(s, pat) for s in directory.split("/"))
+            for pat in normalised
+        ):
+            continue
+        out.add(directory)
+
+    # Root last: it is the least specific answer, so it should not lead.
+    return sorted(out, key=lambda d: (d == ROOT_LABEL, d))

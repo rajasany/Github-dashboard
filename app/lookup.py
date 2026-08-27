@@ -22,7 +22,7 @@ from typing import Any
 from . import csr as csr_provider
 from . import github as github_provider
 from .config import Settings
-from .paths import derive_folders
+from .paths import changed_directories, derive_folders
 
 SHA_RE = re.compile(r"^[0-9a-fA-F]{4,40}$")
 
@@ -101,12 +101,13 @@ async def _lookup_github(
 
     tags_by_sha = await client.list_tag_details(full_name)
     paths = [f.get("filename", "") for f in (commit.get("files") or []) if isinstance(f, dict)]
+    paths = [p for p in paths if p]
     folders = derive_folders(
-        [p for p in paths if p],
-        settings.folder_depth,
-        settings.folder_paths,
-        settings.folder_exclude,
+        paths, settings.folder_depth, settings.folder_paths, settings.folder_exclude
     )
+    # The directories the files actually live in — what you want when inspecting
+    # one commit, as opposed to the service bucket used for grouping.
+    directories = changed_directories(paths, settings.folder_exclude)
     author = (commit.get("commit") or {}).get("author") or {}
     gh_author = commit.get("author") or {}
     stats = commit.get("stats") or {}
@@ -130,6 +131,7 @@ async def _lookup_github(
         "additions": stats.get("additions"),
         "deletions": stats.get("deletions"),
         "folders": folders,
+        "directories": directories,
         "branches": found,
         "branches_probed": len(probed),
         "branches_unprobed": truncated,
@@ -210,6 +212,7 @@ async def _lookup_csr(
     folders = derive_folders(
         changed_paths, settings.folder_depth, settings.folder_paths, settings.folder_exclude
     )
+    directories = changed_directories(changed_paths, settings.folder_exclude)
 
     return {
         "provider": "csr",
@@ -230,6 +233,7 @@ async def _lookup_csr(
         "additions": adds,
         "deletions": dels,
         "folders": folders,
+        "directories": directories,
         "branches": found,
         "branches_probed": len(branch_names),
         "branches_unprobed": 0,

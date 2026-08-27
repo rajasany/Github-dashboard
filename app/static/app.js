@@ -1999,13 +1999,17 @@ function lookupCard(m) {
           : "not reachable from any branch"
       }</span>`;
 
-  const folderChips = (m.folders || []).length
-    ? m.folders
+  /* The directories the files actually sit in — `app/static`, not the `app`
+   * service bucket. Inspecting one commit is a different question from grouping
+   * activity, so it gets the more specific answer. */
+  const dirs = m.directories?.length ? m.directories : m.folders || [];
+  const folderChips = dirs.length
+    ? dirs
         .map(
           (f) =>
-            `<span class="chip folder${f === "(repo root)" ? " unknown" : ""}">${
-              f === "(repo root)" ? "" : ICON.folder
-            }<span class="txt">${escapeHtml(f)}</span></span>`
+            `<span class="chip folder${f === "(repo root)" ? " unknown" : ""}" title="${escapeAttr(
+              f === "(repo root)" ? "Files at the top level of the repository" : `Files changed in ${f}/`
+            )}">${f === "(repo root)" ? "" : ICON.folder}<span class="txt">${escapeHtml(f)}</span></span>`
         )
         .join("")
     : '<span class="muted">no folder data for this commit</span>';
@@ -2024,7 +2028,7 @@ function lookupCard(m) {
       <span class="tip-value">${branchChips}</span>
     </div>
     <div class="tip-row">
-      <span class="tip-label">Service / folder</span>
+      <span class="tip-label">Folder${dirs.length > 1 ? "s" : ""} changed</span>
       <span class="tip-value">${folderChips}</span>
     </div>
 

@@ -439,6 +439,12 @@ Position in the graph
   dev  at head                  0   13 of 13    ▓▓▓▓▓▓▓▓▓▓
 ```
 
+- **Folders changed** are the directories the files actually sit in. This is
+  deliberately *more specific* than the service/folder used elsewhere: a commit
+  confined to `app/static/app.js` reports **`app/static`**, not the `app` bucket the
+  Activity feed groups by. Inspecting one commit and grouping activity are different
+  questions, so they get different answers. A commit spanning directories lists each
+  one, and `(repo root)` sorts last as the least specific.
 - **Commits since** is how far that branch has moved on past this commit.
 - **Position** is the commit's ordinal from the root of that branch, so it reads as
   "13 of 20". A commit sits at a *different* depth on each branch that contains it,
@@ -528,7 +534,7 @@ other rule hard-codes a colour.
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_paths.py    # changed paths -> owning folder     (16 checks)
+.venv/bin/python tests/test_paths.py    # folder rollup + exact dirs         (26 checks)
 .venv/bin/python tests/test_report.py   # date window + report rollup        (57 checks)
 .venv/bin/python tests/test_lookup.py   # tag metadata, summary, lookup      (47 checks)
 .venv/bin/python tests/test_tagging.py  # staging, pushing, tag branches     (58 checks)

@@ -738,6 +738,7 @@ S.lookup = {
     ],
     branches_probed: 2, branches_unprobed: 0, branches_failed: [],
     folders: ["backend", "web"],
+    directories: ["backend/api", "web/src"],
     tags: [{ name: "v1.5", annotated: true, tagger_name: "Tagger Person",
              tagger_date: "2026-08-04T12:00:00Z", message: "milestone" }],
     nearest_tag: null, default_branch: "main",
@@ -757,8 +758,32 @@ check("draws a position track with a marker",
   /class="graph-bar"/.test(lkCard) && /graph-marker/.test(lkCard), true);
 check("branch is surfaced at the top, not only in the table",
   /Branch<\/span>[\s\S]*?class="chip branch/.test(lkCard), true);
-check("folders are surfaced", /Service \/ folder<\/span>[\s\S]*?class="chip folder/.test(lkCard), true);
+check("folders are surfaced", /Folders? changed<\/span>[\s\S]*?class="chip folder/.test(lkCard), true);
 check("both folder names shown", /backend/.test(lkCard) && /web/.test(lkCard), true);
+// The single-commit view must show where the files actually are, not the
+// coarser service bucket used for grouping elsewhere.
+check("shows the exact directories, not the service rollup",
+  /backend\/api/.test(lkCard) && /web\/src/.test(lkCard), true);
+check("the label pluralises for several folders", /Folders changed/.test(lkCard), true);
+
+S.lookup = {
+  ...S.lookup,
+  matches: [{ ...S.lookup.matches[0], directories: ["app/static"], folders: ["app"] }],
+};
+api.renderLookup();
+const oneDir = els.get("lk-body").children[0].innerHTML;
+check("a single-folder commit names that folder", /app\/static/.test(oneDir), true);
+check("and not its parent bucket alone", /class="txt">app<\/span>/.test(oneDir), false);
+check("the label is singular for one folder", /Folder changed/.test(oneDir), true);
+
+// Older payloads without `directories` must still render something.
+S.lookup = {
+  ...S.lookup,
+  matches: [{ ...S.lookup.matches[0], directories: undefined, folders: ["legacy"] }],
+};
+api.renderLookup();
+check("falls back to folders when directories are absent",
+  /legacy/.test(els.get("lk-body").children[0].innerHTML), true);
 
 // A failed probe must not be reported as "not on any branch".
 S.lookup = {

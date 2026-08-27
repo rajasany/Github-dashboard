@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.paths import ROOT_LABEL, derive_folders  # noqa: E402
+from app.paths import ROOT_LABEL, changed_directories, derive_folders  # noqa: E402
 
 CASES: list[tuple[str, list[str], int, list[str], list[str], list[str]]] = [
     # label, paths, depth, patterns, exclude, expected
@@ -68,6 +68,58 @@ CASES: list[tuple[str, list[str], int, list[str], list[str], list[str]]] = [
 ]
 
 
+DIR_CASES: list[tuple[str, list[str], list[str], list[str]]] = [
+    # label, paths, exclude, expected
+    (
+        "a commit confined to one deep folder names that folder, not its parent",
+        ["app/static/app.js", "app/static/index.html"],
+        [],
+        ["app/static"],
+    ),
+    (
+        "a commit spanning folders names each one",
+        ["app/compare.py", "app/static/app.js", "tests/test_compare.py"],
+        [],
+        ["app", "app/static", "tests"],
+    ),
+    ("root-level files report the repo root", ["README.md"], [], [ROOT_LABEL]),
+    (
+        "the repo root sorts last, being the least specific",
+        ["README.md", "app/x.py"],
+        [],
+        ["app", ROOT_LABEL],
+    ),
+    ("excluded directories are dropped", ["api/__pycache__/x.pyc", "api/main.py"], ["__pycache__"], ["api"]),
+    ("the deepest directory is kept", ["a/b/c/d.py"], [], ["a/b/c"]),
+    ("duplicates collapse", ["x/a.py", "x/b.py", "x/c.py"], [], ["x"]),
+    ("empty input yields nothing", [], [], []),
+    ("blank and slash-prefixed paths are tolerated", ["", "  ", "/x/y.py"], [], ["x"]),
+]
+
+
+def test_directories() -> None:
+    print("\n=== exact directories (single-commit view) ===")
+    failures = 0
+    for label, paths, exclude, expected in DIR_CASES:
+        got = changed_directories(paths, exclude)
+        ok = got == expected
+        print(f"{'PASS' if ok else 'FAIL'}  {label}")
+        if not ok:
+            print(f"        got  {got}\n        want {expected}")
+            failures += 1
+
+    # The two functions answer different questions and must not be conflated.
+    paths = ["app/static/app.js"]
+    exact = changed_directories(paths, [])
+    rollup = derive_folders(paths, 1, [], [])
+    ok = exact == ["app/static"] and rollup == ["app"]
+    print(f"{'PASS' if ok else 'FAIL'}  the service rollup stays coarse while the directory stays exact")
+    if not ok:
+        print(f"        exact={exact} rollup={rollup}")
+        failures += 1
+    return failures
+
+
 def main() -> int:
     failures = 0
     for label, paths, depth, patterns, exclude, expected in CASES:
@@ -79,8 +131,11 @@ def main() -> int:
             print(f"        got  {got}\n        want {expected}")
             failures += 1
 
-    print(f"\n{len(CASES) - failures}/{len(CASES)} passed")
-    return 1 if failures else 0
+    dir_failures = test_directories()
+    total = len(CASES) + len(DIR_CASES) + 1
+    passed = total - failures - dir_failures
+    print(f"\n{passed}/{total} passed")
+    return 1 if (failures or dir_failures) else 0
 
 
 if __name__ == "__main__":
