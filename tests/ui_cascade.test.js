@@ -739,11 +739,19 @@ S.lookup = {
     branches_probed: 2, branches_unprobed: 0, branches_failed: [],
     folders: ["backend", "web"],
     directories: ["backend/api", "web/src"],
+    folder_positions: [
+      { folder: "backend/api", branch: "main", position: 3, total: 4, capped: false, note: null },
+      { folder: "web/src", branch: "main", position: 1, total: 9, capped: false, note: null },
+      { folder: "(repo root)", branch: "main", position: null, total: null, capped: false,
+        note: "root-level files are not a directory" },
+    ],
+    folders_unpositioned: 0,
     tags: [{ name: "v1.5", annotated: true, tagger_name: "Tagger Person",
              tagger_date: "2026-08-04T12:00:00Z", message: "milestone" }],
     nearest_tag: null, default_branch: "main",
   }],
 };
+const lookupFixture = JSON.parse(JSON.stringify(S.lookup.matches[0]));
 api.renderLookup();
 const lkCard = els.get("lk-body").children[0].innerHTML;
 check("names the repository", /acme\/shop/.test(lkCard), true);
@@ -775,6 +783,33 @@ const oneDir = els.get("lk-body").children[0].innerHTML;
 check("a single-folder commit names that folder", /app\/static/.test(oneDir), true);
 check("and not its parent bucket alone", /class="txt">app<\/span>/.test(oneDir), false);
 check("the label is singular for one folder", /Folder changed/.test(oneDir), true);
+
+// Position within a folder is a different measure from position in the branch,
+// and both must be present and separately labelled.
+S.lookup = { ...S.lookup, matches: [lookupFixture] };
+api.renderLookup();
+const posCard = els.get("lk-body").children[0].innerHTML;
+check("the branch-wide section is labelled as such", /Position in the branch/.test(posCard), true);
+check("a separate per-folder section exists", /Position within each folder/.test(posCard), true);
+check("the folder section names the branch it counted on", /on main/.test(posCard), true);
+check("a folder position is shown against that folder's own total",
+  /3 <span class="muted">of 4</.test(posCard), true);
+check("a second folder gets its own, different total",
+  /1 <span class="muted">of 9</.test(posCard), true);
+check("the branch-wide total is still 20, not a folder total",
+  /13.*of 20/.test(posCard), true);
+check("the repo root says why it has no folder position",
+  /root-level files are not a directory/.test(posCard), true);
+
+S.lookup = {
+  ...S.lookup,
+  matches: [{ ...lookupFixture,
+    folder_positions: [{ folder: "big", branch: "main", position: 7, total: 500, capped: true, note: null }] }],
+};
+api.renderLookup();
+const cappedCard = els.get("lk-body").children[0].innerHTML;
+check("a capped total is marked as a lower bound", /of 500\+/.test(cappedCard), true);
+check("and explained", /lower bound/.test(cappedCard), true);
 
 // Older payloads without `directories` must still render something.
 S.lookup = {

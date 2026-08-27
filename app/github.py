@@ -276,6 +276,34 @@ async def count_branch_commits(client: GitHubClient, full_name: str, branch: str
     return len(body) if isinstance(body, list) else None
 
 
+async def commit_shas_for_path(
+    client: GitHubClient,
+    full_name: str,
+    branch: str,
+    path: str,
+    max_pages: int = 5,
+) -> tuple[list[str], bool]:
+    """Every commit on `branch` that touched `path`, newest first.
+
+    Returned as (shas, capped). `capped` is True when the history was longer than
+    max_pages, in which case the caller must not present the count as complete.
+    Enumerating is exact; the alternative — counting by date — misplaces commits
+    whose author date was rewritten by a rebase.
+    """
+    shas: list[str] = []
+    for page in range(1, max_pages + 1):
+        batch = await client._get(  # noqa: SLF001
+            f"/repos/{full_name}/commits",
+            {"sha": branch, "path": path, "per_page": 100, "page": page},
+        )
+        if not isinstance(batch, list) or not batch:
+            return shas, False
+        shas.extend(c["sha"] for c in batch if isinstance(c, dict) and c.get("sha"))
+        if len(batch) < 100:
+            return shas, False
+    return shas, True
+
+
 def _commit_from_api(raw: dict[str, Any], repo_key: str, repo_name: str, branch: str) -> dict[str, Any]:
     commit = raw.get("commit") or {}
     author = commit.get("author") or {}

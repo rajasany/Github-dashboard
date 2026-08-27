@@ -1917,6 +1917,67 @@ function renderLookup() {
   el.lkBody.replaceChildren(...d.matches.map(lookupCard));
 }
 
+/* Where the commit sits among the commits that touched *that folder* — counted
+ * over that directory's history alone, not the repository's. The two can differ
+ * sharply: a folder touched rarely will place the same commit much later in its
+ * own history than in the branch as a whole. */
+function folderPositionSection(m) {
+  const entries = (m.folder_positions || []).filter((f) => f.position !== null || f.note);
+  if (!entries.length) return "";
+
+  const rows = entries
+    .map((f) => {
+      if (f.position === null) {
+        return `<tr>
+          <td><span class="chip folder${f.folder === "(repo root)" ? " unknown" : ""}">${
+            f.folder === "(repo root)" ? "" : ICON.folder
+          }<span class="txt">${escapeHtml(f.folder)}</span></span></td>
+          <td colspan="2" class="muted">${escapeHtml(f.note || "not counted")}</td>
+        </tr>`;
+      }
+      const pct = f.total ? Math.min(100, Math.max(0, (f.position / f.total) * 100)) : null;
+      return `<tr>
+        <td><span class="chip folder">${ICON.folder}<span class="txt">${escapeHtml(f.folder)}</span></span></td>
+        <td class="num">${f.position} <span class="muted">of ${f.total}${f.capped ? "+" : ""}</span></td>
+        <td class="graph-cell">${
+          pct === null
+            ? '<span class="muted">—</span>'
+            : `<div class="graph-bar" title="${f.position} of ${f.total} commits that touched ${escapeAttr(f.folder)}">
+                 <span class="graph-fill" style="width:${pct.toFixed(1)}%"></span>
+                 <span class="graph-marker" style="left:clamp(6px, ${pct.toFixed(1)}%, calc(100% - 6px))"></span>
+               </div>`
+        }</td>
+      </tr>`;
+    })
+    .join("");
+
+  const branch = entries.find((f) => f.branch)?.branch;
+  return `
+    <h4 class="lookup-sub">Position within each folder${branch ? ` <span class="muted">on ${escapeHtml(branch)}</span>` : ""}</h4>
+    <div class="table-scroll">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Folder</th>
+            <th class="num" title="Counted only over commits that touched this folder">Position in folder</th>
+            <th>Progress through the folder's history</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    ${
+      m.folders_unpositioned
+        ? `<p class="muted note">${m.folders_unpositioned} further folder(s) were not counted.</p>`
+        : ""
+    }
+    ${
+      entries.some((f) => f.capped)
+        ? '<p class="muted note">A “+” means the folder\u2019s history was longer than the range searched, so the total is a lower bound.</p>'
+        : ""
+    }`;
+}
+
 function lookupCard(m) {
   const box = document.createElement("section");
   box.className = "lookup-card";
@@ -2052,7 +2113,7 @@ function lookupCard(m) {
     </div>
     ${tagRows}
 
-    <h4 class="lookup-sub">Position in the graph</h4>
+    <h4 class="lookup-sub">Position in the branch</h4>
     <div class="table-scroll">
       <table class="data-table">
         <thead>
@@ -2070,7 +2131,8 @@ function lookupCard(m) {
       m.branches_unprobed
         ? `<p class="muted note">${m.branches_unprobed} further branches were not checked — only the first ${m.branches_probed} were probed.</p>`
         : ""
-    }`;
+    }
+    ${folderPositionSection(m)}`;
   return box;
 }
 

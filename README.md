@@ -445,6 +445,12 @@ Position in the graph
   Activity feed groups by. Inspecting one commit and grouping activity are different
   questions, so they get different answers. A commit spanning directories lists each
   one, and `(repo root)` sorts last as the least specific.
+- **Position within each folder** is counted over *that directory's own history*,
+  not the repository's. A commit can be 9 of 15 on `main` but 5 of 11 in `tests/`,
+  because only 11 commits ever touched `tests/`. The two tables are labelled
+  separately — *Position in the branch* and *Position within each folder* — so the
+  numbers can never be mistaken for each other. Root-level files are not a
+  directory, so they report why rather than a number.
 - **Commits since** is how far that branch has moved on past this commit.
 - **Position** is the commit's ordinal from the root of that branch, so it reads as
   "13 of 20". A commit sits at a *different* depth on each branch that contains it,

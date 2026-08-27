@@ -220,6 +220,16 @@ async def main() -> int:
         check("not the head of either", [b["is_head"] for b in match["branches"]], [False, False])
         check("carries its lightweight tag", [t["name"] for t in match["tags"]], ["lightweight-1"])
         check("reports the folders the commit touched", match["folders"], ["svc"])
+
+        # Position within a folder is counted over that folder's history alone.
+        # In the fixture: main has 3 commits, of which 2 touched svc/ and 1
+        # touched other/. The shared root commit is svc's 1st, not main's 1st
+        # of 3 measured over everything.
+        by_folder = {f["folder"]: f for f in match["folder_positions"]}
+        check("folder position is scoped to that folder",
+              (by_folder["svc"]["position"], by_folder["svc"]["total"]), (1, 2))
+        check("it is counted on a named branch", by_folder["svc"]["branch"], "main")
+        check("nothing was capped", by_folder["svc"]["capped"], False)
         check("reports no failed probes when all succeeded", match["branches_failed"], [])
 
         # A commit touching two folders must list both.
@@ -229,6 +239,16 @@ async def main() -> int:
         multi_hit = await lookup.lookup_commit(settings, gh, mirror, multi)
         check("a root-level change is bucketed, not dropped",
               multi_hit["matches"][0]["folders"], ["other"])
+
+        # `other/` has a single commit, so its position there is 1 of 1 even
+        # though the same commit is 3 of 3 on the branch — the distinction the
+        # folder view exists to make.
+        other = {f["folder"]: f for f in multi_hit["matches"][0]["folder_positions"]}["other"]
+        branch_pos = multi_hit["matches"][0]["branches"][0]
+        check("position within a rarely-touched folder differs from the branch",
+              (other["position"], other["total"]), (1, 1))
+        check("while the branch-wide position is the whole history",
+              (branch_pos["position"], branch_pos["total_commits"]), (3, 3))
 
         # A commit that IS a branch tip.
         tip = subprocess.run(

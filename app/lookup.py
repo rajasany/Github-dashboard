@@ -30,6 +30,11 @@ SHA_RE = re.compile(r"^[0-9a-fA-F]{4,40}$")
 # hundreds of branches; past this we stop and say so.
 MAX_BRANCHES_PROBED = 25
 
+# Folder position is enumerated per directory the commit touched; both sides are
+# bounded so a commit spanning many directories cannot fan out unboundedly.
+MAX_FOLDERS_POSITIONED = 6
+MAX_FOLDER_PAGES = 5
+
 
 class LookupError_(Exception):
     pass
@@ -112,6 +117,43 @@ async def _lookup_github(
     gh_author = commit.get("author") or {}
     stats = commit.get("stats") or {}
 
+    # Where this commit sits *within each folder it touched* — a different
+    # question from its position in the branch as a whole. Counted only over
+    # commits that touched that directory.
+    folder_positions: list[dict[str, Any]] = []
+    primary = found[0]["name"] if found else default_branch
+    if primary:
+        async def in_folder(directory: str) -> dict[str, Any]:
+            path_filter = "" if directory == "(repo root)" else directory
+            if not path_filter:
+                # A path filter of "" would match the whole repository, which is
+                # the number we are trying not to report.
+                return {"folder": directory, "branch": primary, "position": None,
+                        "total": None, "capped": False,
+                        "note": "root-level files are not a directory"}
+            try:
+                shas_newest_first, capped = await github_provider.commit_shas_for_path(
+                    client, full_name, primary, path_filter, MAX_FOLDER_PAGES
+                )
+            except github_provider.GitHubError:
+                return {"folder": directory, "branch": primary, "position": None,
+                        "total": None, "capped": False, "note": "could not be counted"}
+
+            total = len(shas_newest_first)
+            try:
+                index = shas_newest_first.index(full_sha)
+            except ValueError:
+                return {"folder": directory, "branch": primary, "position": None,
+                        "total": total if not capped else None, "capped": capped,
+                        "note": "not found within the range searched" if capped else None}
+            # Newest first, so the oldest is position 1.
+            return {"folder": directory, "branch": primary, "position": total - index,
+                    "total": total, "capped": capped, "note": None}
+
+        folder_positions = list(
+            await asyncio.gather(*(in_folder(d) for d in directories[:MAX_FOLDERS_POSITIONED]))
+        )
+
     return {
         "provider": "github",
         "repo_key": key,
@@ -132,6 +174,8 @@ async def _lookup_github(
         "deletions": stats.get("deletions"),
         "folders": folders,
         "directories": directories,
+        "folder_positions": folder_positions,
+        "folders_unpositioned": max(0, len(directories) - MAX_FOLDERS_POSITIONED),
         "branches": found,
         "branches_probed": len(probed),
         "branches_unprobed": truncated,
@@ -214,6 +258,37 @@ async def _lookup_csr(
     )
     directories = changed_directories(changed_paths, settings.folder_exclude)
 
+    # git counts path-scoped history directly: commits touching <dir> that are
+    # reachable from this commit, over the same on that branch.
+    folder_positions: list[dict[str, Any]] = []
+    primary = found[0]["name"] if found else default_branch
+    if primary:
+        for directory in directories[:MAX_FOLDERS_POSITIONED]:
+            if directory == "(repo root)":
+                folder_positions.append({
+                    "folder": directory, "branch": primary, "position": None,
+                    "total": None, "capped": False,
+                    "note": "root-level files are not a directory",
+                })
+                continue
+            try:
+                position = int((await git(
+                    ["rev-list", "--count", full_sha, "--", directory]
+                )).strip() or 0)
+                total = int((await git(
+                    ["rev-list", "--count", primary, "--", directory]
+                )).strip() or 0)
+            except csr_provider.CsrError:
+                folder_positions.append({
+                    "folder": directory, "branch": primary, "position": None,
+                    "total": None, "capped": False, "note": "could not be counted",
+                })
+                continue
+            folder_positions.append({
+                "folder": directory, "branch": primary, "position": position,
+                "total": total, "capped": False, "note": None,
+            })
+
     return {
         "provider": "csr",
         "repo_key": repo.key,
@@ -234,6 +309,8 @@ async def _lookup_csr(
         "deletions": dels,
         "folders": folders,
         "directories": directories,
+        "folder_positions": folder_positions,
+        "folders_unpositioned": max(0, len(directories) - MAX_FOLDERS_POSITIONED),
         "branches": found,
         "branches_probed": len(branch_names),
         "branches_unprobed": 0,
