@@ -51,6 +51,8 @@ class TokenProvider:
         self._token: str | None = None
         self._fetched_at = 0.0
         self._lock = asyncio.Lock()
+        # "" means "looked and found none"; None means "not looked yet".
+        self._account: str | None = None
 
     async def get(self) -> str:
         if self.settings.gcloud_token:
@@ -80,6 +82,43 @@ class TokenProvider:
             self._token = out.decode().strip()
             self._fetched_at = time.monotonic()
             return self._token
+
+    async def active_account(self) -> str | None:
+        """The email of the gcloud account currently signed in, if any.
+
+        `gcloud config get-value account` is asked first: it is the account
+        gcloud itself would act as, and it stays quiet when nothing is set.
+        `gcloud auth list` is the fallback, and emits a warning about an unknown
+        filter key when there are no credentialed accounts at all.
+        """
+        if self._account is not None:
+            return self._account or None
+
+        async def run(args: list[str]) -> str:
+            proc = await asyncio.create_subprocess_exec(
+                *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            out, _ = await proc.communicate()
+            return out.decode().strip() if proc.returncode == 0 else ""
+
+        gcloud = shutil.which("gcloud")
+        if not gcloud:
+            self._account = ""
+            return None
+
+        if self.settings.gcloud_account:
+            self._account = self.settings.gcloud_account
+            return self._account
+
+        account = await run([gcloud, "config", "get-value", "account"])
+        if account.lower() in {"", "(unset)"}:
+            account = await run(
+                [gcloud, "auth", "list", "--filter=status:ACTIVE", "--format=value(account)"]
+            )
+        # A stray warning line would otherwise be mistaken for an address.
+        account = next((ln.strip() for ln in account.splitlines() if "@" in ln), "")
+        self._account = account
+        return account or None
 
     async def is_authenticated(self) -> bool:
         """Cheap local check — reads gcloud's credential store, no network call."""

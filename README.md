@@ -404,8 +404,22 @@ because a tag on a shared remote is awkward to retract:
    then creates the tag there.
 
 Tags are created **annotated**, so they carry a tagger and a date — a lightweight tag
-would leave those columns permanently blank. Set `TAGGER_NAME` / `TAGGER_EMAIL` in
-`.env` to be credited; without them tags are attributed to "Repo Change Dashboard".
+would leave those columns permanently blank.
+
+**Who the tag is attributed to**, in order of precedence:
+
+| Source | Where it comes from |
+| --- | --- |
+| `TAGGER_NAME` + `TAGGER_EMAIL` | `.env`, for a deliberate bot identity |
+| **The signed-in person** | CSR: `gcloud config get-value account`. GitHub: the token's owner via `GET /user` |
+| Fallback | `Repo Change Dashboard`, only when nothing else can be established |
+
+So a CSR tag is credited to whoever is signed in to gcloud, and a GitHub tag to whoever
+owns the token — no configuration required. The gcloud account gives only an email
+address, so the name is its local part verbatim (`person@example.com` → `person`); it is
+not prettified, because inventing "Person" would assert a human name the account never
+states. Where GitHub hides a profile email, its documented
+`id+login@users.noreply.github.com` form is used, which still routes to the account.
 
 Refused before anything happens: invalid git tag names (spaces, `~ ^ : ? *`, `..`,
 leading/trailing `.` `/` `-`, `.lock`), a name already staged, a name that already

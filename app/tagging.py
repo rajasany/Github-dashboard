@@ -23,6 +23,7 @@ from typing import Any
 from . import csr as csr_provider
 from . import github as github_provider
 from .config import Settings
+from .identity import resolve_tagger
 
 # git's own rules, trimmed to the cases a person is likely to hit.
 _BAD_TAG = re.compile(r"(^[./-])|([./]$)|(\.\.)|(@\{)|([\x00-\x20~^:?*\[\\])|(\.lock$)|(//)")
@@ -190,6 +191,9 @@ async def stage_tag(
                     f"“{name}” already exists in {repo_name}, on commit {tag['commit_sha'][:7]}."
                 )
 
+    who = await resolve_tagger(
+        settings, "csr" if not repo_key.startswith("github:") else "github", gh_client, mirror
+    )
     return store.add(
         repo_key=repo_key,
         repo=repo_name,
@@ -197,7 +201,7 @@ async def stage_tag(
         message=(message or "").strip(),
         sha=full_sha,
         commit_title=title,
-        tagger=settings.tagger_name or "Repo Change Dashboard",
+        tagger=who["name"],
     )
 
 
@@ -242,6 +246,8 @@ async def _push_github(
     if not settings.token:
         raise TagError("Pushing a tag to GitHub needs a GITHUB_TOKEN with write access.")
 
+    who = await resolve_tagger(settings, "github", gh_client=client)
+
     # Two calls: the annotated tag object, then the ref that points at it.
     tag_obj = await _gh_post(
         client,
@@ -252,8 +258,8 @@ async def _push_github(
             "object": staged["sha"],
             "type": "commit",
             "tagger": {
-                "name": settings.tagger_name or "Repo Change Dashboard",
-                "email": settings.tagger_email or "noreply@example.invalid",
+                "name": who["name"],
+                "email": who["email"],
                 "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             },
         },
@@ -300,11 +306,12 @@ async def _push_csr(
 
     # Identity for the annotated tag object, supplied per-invocation so nothing
     # depends on the machine's global git config.
+    who = await resolve_tagger(settings, "csr", mirror=mirror)
     ident = {
-        "GIT_COMMITTER_NAME": settings.tagger_name or "Repo Change Dashboard",
-        "GIT_COMMITTER_EMAIL": settings.tagger_email or "noreply@example.invalid",
-        "GIT_AUTHOR_NAME": settings.tagger_name or "Repo Change Dashboard",
-        "GIT_AUTHOR_EMAIL": settings.tagger_email or "noreply@example.invalid",
+        "GIT_COMMITTER_NAME": who["name"],
+        "GIT_COMMITTER_EMAIL": who["email"],
+        "GIT_AUTHOR_NAME": who["name"],
+        "GIT_AUTHOR_EMAIL": who["email"],
     }
     await mirror._git(  # noqa: SLF001
         ["-C", str(path), "-c", f"user.name={ident['GIT_COMMITTER_NAME']}",

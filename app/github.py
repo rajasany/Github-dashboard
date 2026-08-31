@@ -101,6 +101,16 @@ class GitHubClient:
         self.cache.set(cache_key, data)
         return data
 
+    async def get_authenticated_user(self) -> dict[str, Any]:
+        """Who the token belongs to. Empty dict when unauthenticated."""
+        if not self.settings.token:
+            return {}
+        try:
+            data = await self._get("/user")
+        except GitHubError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
     async def get_repo(self, full_name: str) -> dict[str, Any]:
         return await self._get(f"/repos/{full_name}")
 

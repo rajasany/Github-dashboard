@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app import csr as csr_provider  # noqa: E402
 from app import tagging  # noqa: E402
 from app.config import load_settings  # noqa: E402
+from app.identity import resolve_tagger  # noqa: E402
 from app.github import GitHubClient  # noqa: E402
 
 FAILURES: list[str] = []
@@ -256,10 +257,76 @@ async def test_flow(root: Path) -> None:
     await gh.aclose()
 
 
+async def test_identity(root: Path) -> None:
+    """With no TAGGER_* set, a CSR tag must be attributed to the signed-in
+    gcloud account rather than to the dashboard."""
+    print("\n=== tagger identity ===")
+
+    bare = root / "id-remote.git"
+    work = root / "id-work"
+    git(["init", "-q", "--bare", str(bare)])
+    git(["init", "-q", "-b", "main", str(work)])
+    git(["config", "user.email", "d@e.test"], work)
+    git(["config", "user.name", "Dev"], work)
+    (work / "a.txt").write_text("one\n")
+    git(["add", "-A"], work)
+    git(["commit", "-qm", "first"], work)
+    git(["remote", "add", "origin", str(bare)], work)
+    git(["push", "-q", "origin", "main"], work)
+
+    fixture = Fixture(bare=str(bare))
+    fixture.__class__.repo = "identity"
+    settings = load_settings()
+    settings.repos = []
+    settings.csr_repos = [fixture]
+    settings.gcloud_token = "unused-for-local-paths"
+    settings.mirror_dir = root / "id-mirror"
+    settings.tag_store_path = root / "id-tags.sqlite3"
+    # Deliberately unset: this is the reported bug's configuration.
+    settings.tagger_name = ""
+    settings.tagger_email = ""
+
+    gh = GitHubClient(settings)
+    mirror = csr_provider.GitMirror(settings)
+    store = tagging.TagStore(settings.tag_store_path)
+
+    # Stand in for a signed-in gcloud session.
+    mirror.tokens._account = "person@example.com"
+
+    who = await resolve_tagger(settings, "csr", mirror=mirror)
+    check("the gcloud account supplies the email", who["email"], "person@example.com")
+    check("and the name, verbatim from the local part", who["name"], "person")
+    check("the source is reported as gcloud", who["source"], "gcloud")
+
+    path = await mirror.sync(fixture.key, fixture.clone_url)
+    sha = git(["-C", str(path), "rev-parse", "main"])
+
+    staged = await tagging.stage_tag(settings, gh, mirror, store,
+                                     repo_key=fixture.key, sha=sha, name="v9.0.0", message="ident")
+    check("staging shows who it will be attributed to", staged["tagger"], "person")
+
+    await tagging.push_tag(settings, gh, mirror, store, staged["id"])
+    meta = git(["--git-dir", str(bare), "for-each-ref",
+                "--format=%(taggername)|%(taggeremail)", "refs/tags/v9.0.0"])
+    name, email = meta.split("|")
+    check("THE PUSHED TAG CARRIES THE SIGNED-IN PERSON", name, "person")
+    check("with their address", email, "<person@example.com>")
+    check("and not the dashboard", name == "Repo Change Dashboard", False)
+
+    # No account signed in at all: fall back, but say so.
+    mirror.tokens._account = ""
+    bare_who = await resolve_tagger(settings, "csr", mirror=mirror)
+    check("with nobody signed in it falls back", bare_who["source"], "fallback")
+    check("and names the dashboard, not a person", bare_who["name"], "Repo Change Dashboard")
+
+    await gh.aclose()
+
+
 def main() -> int:
     test_names()
     with tempfile.TemporaryDirectory() as tmp:
         asyncio.run(test_flow(Path(tmp)))
+        asyncio.run(test_identity(Path(tmp)))
     print(f"\n{'ALL PASS' if not FAILURES else f'{len(FAILURES)} FAILURES: ' + ', '.join(FAILURES)}")
     return 1 if FAILURES else 0
 
