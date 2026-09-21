@@ -15,11 +15,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from . import (
-    auth, bulk, compare, lookup, migration_sheet, migrations, naming, ordering, report,
-    spreadsheet, summary, tagging,
+    auth, bulk, compare, lookup, migration_sheet, migrations, naming, ordering, reference,
+    report, spreadsheet, summary, tagging,
 )
 from .config import load_settings
 from .csr import GitMirror
+from .db import Database
 from .feed import build_feed, enrich_commit_folders
 from .github import GitHubClient, GitHubError
 from .store import FileStore
@@ -32,6 +33,13 @@ mirror: GitMirror | None = None
 store: FileStore | None = None
 tag_store: tagging.TagStore | None = None
 migration_store: migrations.MigrationStore | None = None
+reference_store: reference.ReferenceStore | None = None
+database: Database | None = None
+# config.yaml only decides whether the tab exists; the lists come from the
+# database once it is running, so `settings.migrations` is replaced per request.
+migrations_enabled: bool = False
+# Set when the configured database could not be reached at startup.
+database_error: str = ""
 
 # Single-flight state for the local `gcloud auth login` flow. This app is a
 # localhost, single-user tool — the subprocess opens a browser and writes to
@@ -62,12 +70,41 @@ async def _run_gcloud_login() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global gh_client, mirror, store, tag_store, migration_store
+    global gh_client, mirror, store, tag_store, migration_store, reference_store, database
     gh_client = GitHubClient(settings)
     mirror = GitMirror(settings)
+    # The two git caches stay on SQLite: one is rebuildable derived data, the
+    # other stages tags against a local mirror. Neither is shared application
+    # state, so neither belongs in the configured database.
     store = FileStore(settings.store_path)
     tag_store = tagging.TagStore(settings.tag_store_path)
-    migration_store = migrations.MigrationStore(settings.migration_store_path)
+
+    global migrations_enabled
+    migrations_enabled = settings.migrations.enabled
+    if migrations_enabled:
+        database = Database(settings.database_url)
+        try:
+            database.verify()
+        except Exception as exc:  # noqa: BLE001 - reported, not fatal
+            # The rest of the dashboard reads git and needs no database, so an
+            # unreachable one disables the Migrations tab rather than the app,
+            # and the tab says exactly why.
+            global database_error
+            database_error = str(exc)
+            print(f"\n  *** Migrations tab unavailable ***\n  {database_error}\n", flush=True)
+            database.close()
+            database = None
+            yield
+            await gh_client.aclose()
+            return
+        print(f"  migration register: {database.describe}", flush=True)
+        migration_store = migrations.MigrationStore(database)
+        reference_store = reference.ReferenceStore(database)
+        # First run against an empty database: take the lists from config.yaml
+        # and the microservice file, once. After that the database is the source.
+        seeded = reference_store.seed(settings.migrations)
+        if seeded:
+            print(f"  seeded reference lists from config: {seeded}", flush=True)
     if settings.auth.dev_mode:
         scope = "ANY address" if settings.auth.dev_allow_remote else "loopback only"
         disabled = " — IGNORED, because auth.trusted_proxies is set" if settings.auth.trusted_proxies else ""
@@ -78,6 +115,8 @@ async def lifespan(app: FastAPI):
         )
     yield
     await gh_client.aclose()
+    if database is not None:
+        database.close()
 
 
 app = FastAPI(title="Repo Change Dashboard", version="0.2.0", lifespan=lifespan)
@@ -613,13 +652,48 @@ def current_user(request: Request) -> auth.User:
 
 
 def _require_migrations() -> migrations.MigrationStore:
-    if not settings.migrations.enabled:
+    if not migrations_enabled:
         raise HTTPException(
             status_code=404,
             detail="Migration requests are not enabled. Add a `migrations:` section to config.yaml.",
         )
-    assert migration_store is not None
+    if database_error:
+        raise HTTPException(status_code=503, detail=database_error)
+    assert migration_store is not None and reference_store is not None
+    # The domain functions validate against `settings.migrations`; point it at
+    # what the database currently holds, so an edit in the admin screen takes
+    # effect on the next request rather than the next restart.
+    live = reference_store.snapshot()
+    live.enabled = True
+    settings.migrations = live
     return migration_store
+
+
+def _refuse_if_frozen(store_: migrations.MigrationStore) -> None:
+    if store_.active_freeze():
+        raise HTTPException(
+            status_code=423,
+            detail="Record entry is frozen. An approver can lift the freeze.",
+        )
+
+
+def _editable(user: auth.User, row: dict[str, Any]) -> list[str]:
+    """Which fields this person may change on this record, right now.
+
+    A freeze makes that nothing at all. Computing it here rather than in the
+    client is what lets the form render a frozen record read-only without
+    knowing the rule.
+    """
+    assert migration_store is not None
+    if migration_store.active_freeze():
+        return []
+    return migrations.editable_fields(user, row)
+
+
+def _lists() -> migrations.MigrationConfig:
+    """The reference lists as they stand in the database right now."""
+    assert reference_store is not None
+    return reference_store.snapshot()
 
 
 @app.exception_handler(auth.AuthError)
@@ -643,7 +717,7 @@ async def migrations_meta(request: Request) -> dict:
     """Everything the tab needs to render: who you are, the lists, the field rules."""
     store_ = _require_migrations()
     user = current_user(request)
-    cfg = settings.migrations
+    cfg = _lists()
     freeze = store_.active_freeze()
 
     peer = request.client.host if request.client else None
@@ -674,10 +748,25 @@ async def migrations_meta(request: Request) -> dict:
             {"name": m.name, "repos": m.repos, "track_leads": m.track_leads}
             for m in cfg.microservices
         ],
+        "services_source": {
+            "file": str(cfg.microservices_file) if cfg.microservices_file else "",
+            "error": cfg.services_error,
+            "count": len(cfg.microservices),
+        },
         "statuses": [{"key": k, "label": v} for k, v in migrations.STATUS_LABELS.items()],
+        # The employee this caller is, if their address is on the list — the
+        # form uses it to fill Change Requestor in without being asked.
+        "me_employee": (
+            found.label if (found := cfg.employee_for(user.email)) else ""
+        ),
+        "employees": [
+            {"number": e.number, "name": e.name, "label": e.label} for e in cfg.employees
+        ],
+        "stages": [{"key": k, "label": v} for k, v in migrations.STAGE_TITLES.items()],
         "request_fields": list(migrations.REQUEST_KEYS),
         "freeze": freeze,
         "frozen": freeze is not None,
+        "permissions": migrations.permissions(user),
     }
 
 
@@ -729,6 +818,7 @@ async def migrations_list(
     sort: str = Query(default="sl_no"),
     dir: str = Query(default="desc"),
     include_inactive: bool = Query(default=False),
+    archived: bool = Query(default=False),
 ) -> dict:
     store_ = _require_migrations()
     user = current_user(request)
@@ -746,17 +836,20 @@ async def migrations_list(
         sort=sort,
         direction=dir,
         include_inactive=include_inactive,
+        archived=archived,
     )
     # The client renders from this, but never decides it — every write is
     # re-checked server-side in apply_changes.
     for row in rows:
-        row["editable"] = migrations.editable_fields(user, row)
+        row["editable"] = _editable(user, row)
     return {
         "rows": rows,
         "count": len(rows),
         "user": user.as_dict(),
         "sort": {"field": sort if sort in migrations.SORTABLE else "sl_no", "dir": dir},
         "sortable": list(migrations.SORTABLE),
+        "permissions": migrations.permissions(user),
+        # Kept for anything still reading the old key.
         "can_retire": user.has_any("approver", "admin"),
     }
 
@@ -767,7 +860,7 @@ async def migrations_create(request: Request, payload: dict[str, Any]) -> dict:
     user = current_user(request)
     auth.require_signed_in(user)
     row = migrations.create_record(settings, store_, user, payload or {})
-    row["editable"] = migrations.editable_fields(user, row)
+    row["editable"] = _editable(user, row)
     return row
 
 
@@ -777,8 +870,73 @@ async def migrations_update(request: Request, sl_no: int, payload: dict[str, Any
     user = current_user(request)
     auth.require_signed_in(user)
     row = migrations.apply_changes(settings, store_, user, sl_no, payload or {})
-    row["editable"] = migrations.editable_fields(user, row)
+    row["editable"] = _editable(user, row)
     return row
+
+
+def _bulk_ids(payload: dict[str, Any]) -> list[int]:
+    raw = payload.get("sl_nos") or payload.get("sl_no") or []
+    if isinstance(raw, (int, str)):
+        raw = [raw]
+    try:
+        return [int(value) for value in raw]
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="sl_nos must be record numbers.") from exc
+
+
+@app.post("/api/migrations/records/approve")
+async def migrations_approve(request: Request, payload: dict[str, Any]) -> dict:
+    """Approve several records for QA or production at once. Approvers and admins.
+
+    `{"sl_nos": [1, 2, 3], "stage": "qa" | "prod"}`. Records that cannot be
+    approved come back under `skipped` with a reason; the rest still go through.
+    """
+    store_ = _require_migrations()
+    user = current_user(request)
+    auth.require_role(user, "approver", "admin")
+
+    return migrations.approve_many(
+        settings, store_, user, _bulk_ids(payload),
+        str(payload.get("stage") or "qa"),
+        str(payload.get("planned") or ""),
+    )
+
+
+@app.post("/api/migrations/records/execute")
+async def migrations_execute(request: Request, payload: dict[str, Any]) -> dict:
+    """Record several records as migrated, to QA or production. DevOps and admins.
+
+    `{"sl_nos": [1, 2, 3], "stage": "qa" | "prod", "remarks": "..."}`. Remarks are
+    optional and applied to every record that moves; blank leaves each one's own.
+    """
+    store_ = _require_migrations()
+    user = current_user(request)
+    auth.require_role(user, "devops", "admin")
+
+    return migrations.execute_many(
+        settings, store_, user, _bulk_ids(payload),
+        str(payload.get("stage") or "qa"),
+        str(payload.get("remarks") or ""),
+    )
+
+
+@app.post("/api/migrations/records/archive")
+async def migrations_archive(request: Request, payload: dict[str, Any]) -> dict:
+    """File away records that reached production. Approvers and admins.
+
+    `{"sl_nos": [1, 2, 3]}`. Archiving cannot be undone: an archived record
+    leaves the register, can no longer be changed or deleted, and is read only
+    through the archive view.
+    """
+    store_ = _require_migrations()
+    user = current_user(request)
+    auth.require_role(user, "approver", "admin")
+    _refuse_if_frozen(store_)
+
+    result = store_.archive(_bulk_ids(payload), user)
+    if not result["archived"] and not result["skipped"]:
+        raise HTTPException(status_code=422, detail="No records were selected.")
+    return result
 
 
 @app.post("/api/migrations/records/{sl_no}/active")
@@ -790,10 +948,13 @@ async def migrations_set_active(request: Request, sl_no: int, payload: dict[str,
     store_ = _require_migrations()
     user = current_user(request)
     auth.require_role(user, "approver", "admin")
+    # Retiring a record changes it, so a freeze stops it as it stops every other
+    # change. Deleting was already refused; this was the gap.
+    _refuse_if_frozen(store_)
 
     active = bool(payload.get("active", True))
     row = store_.set_active(sl_no, active, user)
-    row["editable"] = migrations.editable_fields(user, row)
+    row["editable"] = _editable(user, row)
     return row
 
 
@@ -808,11 +969,7 @@ async def migrations_delete(request: Request, sl_no: int) -> dict:
     user = current_user(request)
     auth.require_role(user, "approver", "admin")
 
-    if store_.active_freeze():
-        raise HTTPException(
-            status_code=423,
-            detail="Record entry is frozen. An approver can lift the freeze.",
-        )
+    _refuse_if_frozen(store_)
     if store_.get(sl_no) is None:
         raise HTTPException(status_code=404, detail=f"No record with SL# {sl_no}.")
     store_.delete(sl_no)
@@ -833,7 +990,7 @@ async def migrations_template(request: Request) -> Response:
     _require_migrations()
     auth.require_signed_in(current_user(request))
     return Response(
-        content=migration_sheet.build_template(settings.migrations),
+        content=migration_sheet.build_template(_lists()),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": 'attachment; filename="migration-requests-template.xlsx"'},
     )
@@ -865,7 +1022,7 @@ async def migrations_upload(
     except spreadsheet.SheetError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    results = migration_sheet.check_rows(sheet["rows"], settings.migrations)
+    results = migration_sheet.check_rows(sheet["rows"], _lists())
     valid = [r for r in results if r["ok"]]
 
     created: list[dict[str, Any]] = []
@@ -961,6 +1118,7 @@ async def migrations_export(
     sort: str = Query(default="sl_no"),
     dir: str = Query(default="desc"),
     include_inactive: bool = Query(default=False),
+    archived: bool = Query(default=False),
 ) -> Response:
     """The full register as CSV — every field, including the role-gated ones."""
     import csv as _csv
@@ -973,16 +1131,19 @@ async def migrations_export(
         release=release, microservice=microservice,
         migration_path=migration_path, status=status,
         created_from=since, created_to=until, sort=sort, direction=dir,
-        include_inactive=include_inactive,
+        include_inactive=include_inactive, archived=archived,
     )
 
     buffer = _io.StringIO()
     writer = _csv.writer(buffer)
-    writer.writerow([f.label for f in migrations.FIELDS] + ["Status", "Active"])
+    writer.writerow(
+        [f.label for f in migrations.FIELDS] + ["Status", "Active", "Archived", "Archived By"]
+    )
     for row in rows:
         writer.writerow(
             [row.get(f.key, "") for f in migrations.FIELDS]
-            + [row["status_label"], "Yes" if row["active"] else "No"]
+            + [row["status_label"], "Yes" if row["active"] else "No",
+               row["archived_at"], row["archived_by"]]
         )
 
     return Response(
@@ -990,3 +1151,94 @@ async def migrations_export(
         media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="migration-requests.csv"'},
     )
+
+
+# --------------------------------------------------------------------------- #
+# Reference lists (the migration form's dropdowns)
+# --------------------------------------------------------------------------- #
+
+
+@app.exception_handler(reference.ReferenceError)
+async def _reference_error(request: Request, exc: reference.ReferenceError) -> Response:
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse({"detail": str(exc)}, status_code=exc.status)
+
+
+def _require_reference(request: Request) -> reference.ReferenceStore:
+    """Editing the lists is an administrative act — approvers and admins."""
+    _require_migrations()
+    auth.require_role(current_user(request), "approver", "admin")
+    assert reference_store is not None
+    return reference_store
+
+
+@app.get("/api/migrations/lists")
+async def migrations_lists(request: Request) -> dict:
+    _require_migrations()
+    user = current_user(request)
+    auth.require_signed_in(user)
+    assert reference_store is not None and database is not None
+    return {
+        **reference_store.as_payload(),
+        "can_edit": user.has_any("approver", "admin"),
+        "storage": database.describe,
+    }
+
+
+@app.put("/api/migrations/lists/{name}")
+async def migrations_set_list(request: Request, name: str, payload: dict[str, Any]) -> dict:
+    """Replace one simple list — releases, migration paths or change requestors."""
+    store_ = _require_reference(request)
+    values = payload.get("values")
+    if not isinstance(values, list):
+        raise HTTPException(status_code=422, detail="Send {\"values\": [...]}.")
+    store_.set_list(name, [str(v) for v in values])
+    return store_.as_payload()
+
+
+@app.put("/api/migrations/lists/microservices/{name}")
+async def migrations_save_service(request: Request, name: str, payload: dict[str, Any]) -> dict:
+    """Create or update one microservice, its repos and its track leads."""
+    store_ = _require_reference(request)
+    store_.save_microservice(
+        str(payload.get("name") or name),
+        [str(v) for v in (payload.get("repos") or [])],
+        [str(v) for v in (payload.get("track_leads") or [])],
+        rename_from="" if name == "new" else name,
+    )
+    return store_.as_payload()
+
+
+@app.put("/api/migrations/lists/employees/{number}")
+async def migrations_save_employee(request: Request, number: str, payload: dict[str, Any]) -> dict:
+    """Create or update one employee (`new` to add)."""
+    store_ = _require_reference(request)
+    store_.save_employee(
+        str(payload.get("number") or number),
+        str(payload.get("name") or ""),
+        str(payload.get("email") or ""),
+        rename_from="" if number == "new" else number,
+    )
+    return store_.as_payload()
+
+
+@app.delete("/api/migrations/lists/employees/{number}")
+async def migrations_delete_employee(request: Request, number: str) -> dict:
+    store_ = _require_reference(request)
+    store_.delete_employee(number)
+    return store_.as_payload()
+
+
+@app.delete("/api/migrations/lists/microservices/{name}")
+async def migrations_delete_service(request: Request, name: str) -> dict:
+    store_ = _require_reference(request)
+    used = store_.in_use(name)
+    if used:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{used} record{'s' if used != 1 else ''} name “{name}”. "
+                   "Existing records keep the value; remove it only if nothing should use it again.",
+        )
+    store_.delete_microservice(name)
+    return store_.as_payload()

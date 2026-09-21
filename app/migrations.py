@@ -21,15 +21,14 @@ no second source of truth to fall out of step with them.
 from __future__ import annotations
 
 import re
-import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from .auth import User
 from .config import MigrationConfig, Settings
+from .db import Database
 
 YES, NO = "Yes", "No"
 YESNO = (YES, NO)
@@ -95,7 +94,8 @@ FIELDS: tuple[Field, ...] = (
           help="Narrowed to the track leads of the selected microservice."),
     Field("created_by", "Created By", "auto", "request", help="Taken from the signed-in user."),
     Field("change_requestor", "Change Requestor", "enum", "request", ("developer",),
-          options="change_requestors", required=True),
+          options="change_requestors", required=True,
+          help="Defaults to you, where your address is on the employee list."),
     Field("reason", "Reason for Movement", "longtext", "request", ("developer",)),
     Field("change_description", "Change Description", "longtext", "request", ("developer",)),
     Field("code_image_change", "Code & Image Change?", "yesno", "request", ("developer",),
@@ -112,25 +112,49 @@ FIELDS: tuple[Field, ...] = (
           required_if=("ddl_dml", YES), help="Required when there is a DDL/DML change."),
     Field("date_created", "Date Created", "auto", "request"),
 
-    Field("approved_by", "Approved By", "enum", "approval", ("approver",), options="approvers",
-          help="Approvers only. Clearing it withdraws the approval and reopens the request."),
+    # --- QA approval ---
+    Field("ready_for_qa", "Ready for QA", "yesno", "approval", ("approver",), default=NO,
+          help="Approvers only. Setting this to Yes is the approval: it fills in "
+               "Approved By and Date Approved, and opens the QA migration. Setting it "
+               "back to No withdraws the approval and reopens the request."),
+    Field("approved_by", "Approved By", "auto", "approval",
+          help="The approver who set Ready for QA."),
     Field("date_approved", "Date Approved", "auto", "approval"),
-    Field("qa_date_planned", "QA Date Planned", "date", "approval", ("approver",)),
+    Field("qa_date_planned", "QA Migration Date Planned", "date", "approval", ("approver",)),
 
+    # --- QA migration ---
     Field("executed_in_qa", "Executed in QA", "yesno", "qa", ("devops",), default=NO,
-          help="DevOps only, once the request is approved."),
+          help="DevOps only, once the request is approved for QA."),
+    Field("qa_migration_date", "QA Migration Date", "auto", "qa"),
     Field("qa_migrated_by", "QA Migrated By", "auto", "qa"),
     Field("qa_migration_remarks", "QA Migration Remarks", "longtext", "qa", ("devops",)),
 
+    # --- prod approval ---
     Field("ready_for_prod", "Ready for Prod", "yesno", "prod_gate", ("approver",), default=NO,
-          help="Approvers only, once the QA migration is done."),
+          help="Approvers only, once the QA migration is done. Fills in the prod "
+               "approval below."),
+    Field("prod_approved_by", "Approved By", "auto", "prod_gate",
+          help="The approver who set Ready for Prod."),
+    Field("prod_date_approved", "Date Approved", "auto", "prod_gate"),
+    Field("prod_date_planned", "Prod Migration Date Planned", "date", "prod_gate", ("approver",)),
 
+    # --- prod migration ---
     Field("executed_in_prod", "Executed in PROD", "yesno", "prod", ("devops",), default=NO,
           help="DevOps only, once the request is marked ready for prod."),
     Field("prod_migration_date", "Prod Migration Date", "auto", "prod"),
     Field("prod_migrated_by", "Prod Migrated By", "auto", "prod"),
     Field("prod_migration_remarks", "Prod Migration Remarks", "longtext", "prod", ("devops",)),
 )
+
+# Shown as section headings on a record, and published so the UI does not keep a
+# second copy of them to drift out of step.
+STAGE_TITLES = {
+    "request": "Request",
+    "approval": "QA Approval",
+    "qa": "QA Migration",
+    "prod_gate": "Prod Approval",
+    "prod": "Production Migration",
+}
 
 # A mistyped stage would silently make a field unreachable — stage_open() would
 # fall through to its permissive default and the field would never lock.
@@ -187,6 +211,16 @@ def sort_rows(rows: list[dict[str, Any]], sort: str, direction: str) -> list[dic
     return sorted(rows, key=key, reverse=reverse)
 
 
+def approved_for_qa(row: dict[str, Any]) -> bool:
+    """Has an approver released this for QA?
+
+    Ready for QA is the switch an approver throws; Approved By is filled in as a
+    consequence. Records raised before Ready for QA existed carry only the
+    latter, so either counts.
+    """
+    return row.get("ready_for_qa") == YES or bool((row.get("approved_by") or "").strip())
+
+
 def status_of(row: dict[str, Any]) -> str:
     """Derived from the record's own fields — never stored, so never stale."""
     if row.get("executed_in_prod") == YES:
@@ -195,14 +229,19 @@ def status_of(row: dict[str, Any]) -> str:
         return "ready_for_prod"
     if row.get("executed_in_qa") == YES:
         return "in_qa"
-    if (row.get("approved_by") or "").strip():
+    if approved_for_qa(row):
         return "approved"
     return "submitted"
 
 
 # The fields stored as epoch seconds. Named explicitly rather than matched on a
 # "date_" prefix, which missed prod_migration_date and caught nothing useful.
-TIMESTAMP_FIELDS = frozenset({"date_created", "date_approved", "prod_migration_date"})
+TIMESTAMP_FIELDS = frozenset({
+    "date_created", "date_approved", "qa_migration_date",
+    "prod_date_approved", "prod_migration_date",
+})
+# Not a form field — set by archiving, and rendered like the others.
+STAMPED_COLUMNS = TIMESTAMP_FIELDS | {"archived_at"}
 
 
 def _iso(value: Any) -> str:
@@ -219,7 +258,7 @@ def _stamp(key: str, value: Any) -> str:
 
     They are stored as strings, so `_iso` alone would hand them straight back.
     """
-    if key in TIMESTAMP_FIELDS and value not in (None, ""):
+    if key in STAMPED_COLUMNS and value not in (None, ""):
         try:
             return _iso(float(value))
         except (TypeError, ValueError):
@@ -240,12 +279,12 @@ def stage_open(key: str, row: dict[str, Any]) -> tuple[bool, str]:
     approver has signed off on QA testing.
     """
     spec = BY_KEY[key]
-    approved = bool((row.get("approved_by") or "").strip())
+    approved = approved_for_qa(row)
 
     if spec.stage == "request":
         # Editing the request after approval would invalidate what was approved.
         if approved:
-            return False, "The request is approved; withdraw the approval to change it."
+            return False, "Approved for QA; set Ready for QA back to No to change it."
         return True, ""
 
     if spec.stage == "approval":
@@ -253,7 +292,7 @@ def stage_open(key: str, row: dict[str, Any]) -> tuple[bool, str]:
 
     if spec.stage == "qa":
         if not approved:
-            return False, "Not approved yet."
+            return False, "Not approved for QA yet."
         return True, ""
 
     if spec.stage == "prod_gate":
@@ -292,6 +331,11 @@ def can_write(
             return True, "", ""
         return False, "Set later in the workflow.", "stage"
 
+    # Archiving is final: an archived record is the permanent account of what
+    # happened, so nothing about it changes again.
+    if row.get("archived"):
+        return False, "This record is archived and cannot be changed.", "archived"
+
     # A retired record is read-only until someone brings it back, so that what
     # it said when it was retired is what it still says.
     if row.get("active") is False:
@@ -327,10 +371,26 @@ def option_lists(cfg: MigrationConfig, microservice: str = "") -> dict[str, list
         "microservices": cfg.service_names,
         "repo_name": list(service.repos) if service else [],
         "track_lead": list(service.track_leads) if service else [],
-        "change_requestors": list(cfg.change_requestors),
+        # Change Requestor comes from the employee list. The old free-standing
+        # list is still honoured where no employees are configured, so an
+        # existing deployment keeps working until staff are added.
+        "change_requestors": cfg.employee_labels or list(cfg.change_requestors),
         "approvers": list(cfg.approvers),
         "yesno": list(YESNO),
     }
+
+
+def clean_requestor(value: Any, cfg: MigrationConfig) -> str:
+    """Normalise a change requestor to its canonical "number - name" label.
+
+    A sheet may hold only the employee number, or a name, or the label with a
+    different dash. Resolving here means the register stores one spelling.
+    """
+    text = str(value or "").strip()
+    if not text or not cfg.employees:
+        return text
+    found = cfg.match_employee(text)
+    return found.label if found else text
 
 
 def _clean(spec: Field, value: Any) -> str:
@@ -402,36 +462,47 @@ _COLUMNS = ", ".join(f"{f.key} TEXT NOT NULL DEFAULT ''" for f in FIELDS if f.ke
 
 
 class MigrationStore:
-    """Migration requests, their audit trail, and the freeze windows."""
+    """Migration requests, their audit trail, and the freeze windows.
 
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
+    Backed by whichever database `app/db.py` was pointed at — SQLite or
+    PostgreSQL. All SQL here stays in the subset both accept.
+    """
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+        with db.connect() as conn:
             # sl_no is the sequence the form calls SL#, so it is the row id itself.
             conn.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS migrations (
-                    sl_no INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sl_no {db.identity},
                     {_COLUMNS},
                     active TEXT NOT NULL DEFAULT 'Yes',
-                    updated_at REAL NOT NULL DEFAULT 0
+                    archived_at TEXT NOT NULL DEFAULT '',
+                    archived_by TEXT NOT NULL DEFAULT '',
+                    updated_at {db.float_type} NOT NULL DEFAULT 0
                 )
                 """
             )
-            # Databases created before `active` existed are brought forward here
+            # A database written before a field existed is brought forward here,
             # rather than being left to fail on the first query that mentions it.
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(migrations)")}
-            if "active" not in columns:
-                conn.execute(
-                    "ALTER TABLE migrations ADD COLUMN active TEXT NOT NULL DEFAULT 'Yes'"
-                )
+            # Driven off FIELDS so adding one needs no matching migration.
+            existing = db.columns(conn, "migrations")
+            wanted = [(f.key, "''") for f in FIELDS if f.key != "sl_no"]
+            wanted.append(("active", "'Yes'"))
+            wanted += [("archived_at", "''"), ("archived_by", "''")]
+            for column, default in wanted:
+                if column not in existing:
+                    conn.execute(
+                        f"ALTER TABLE migrations ADD COLUMN {column} "
+                        f"TEXT NOT NULL DEFAULT {default}"
+                    )
             conn.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS migration_audit (
-                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                    sl_no     INTEGER NOT NULL,
-                    at        REAL NOT NULL,
+                    id        {db.identity},
+                    sl_no     BIGINT NOT NULL,
+                    at        {db.float_type} NOT NULL,
                     who       TEXT NOT NULL,
                     field     TEXT NOT NULL,
                     old_value TEXT NOT NULL DEFAULT '',
@@ -440,34 +511,28 @@ class MigrationStore:
                 """
             )
             conn.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS freezes (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    starts_at  REAL NOT NULL,
-                    ends_at    REAL NOT NULL,
+                    id         {db.identity},
+                    starts_at  {db.float_type} NOT NULL,
+                    ends_at    {db.float_type} NOT NULL,
                     reason     TEXT NOT NULL DEFAULT '',
                     created_by TEXT NOT NULL DEFAULT '',
-                    created_at REAL NOT NULL
+                    created_at {db.float_type} NOT NULL
                 )
                 """
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_sl ON migration_audit(sl_no)")
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=10)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        return conn
-
     # -- records ----------------------------------------------------------- #
 
     @staticmethod
-    def _shape(row: sqlite3.Row) -> dict[str, Any]:
-        data = {k: row[k] for k in row.keys()}
+    def _shape(row: dict[str, Any]) -> dict[str, Any]:
+        data = dict(row)
         # The raw epoch is kept for sorting and range filtering; comparing the
         # rendered strings would sort blanks oddly and cost a reparse per row.
         raw_created = data.get("date_created")
-        for key in ("date_created", "date_approved", "prod_migration_date"):
+        for key in TIMESTAMP_FIELDS:
             data[key] = _iso(float(data[key])) if data.get(key) else ""
         try:
             data["date_created_epoch"] = float(raw_created) if raw_created else None
@@ -476,17 +541,21 @@ class MigrationStore:
         data["status"] = status_of(data)
         data["status_label"] = STATUS_LABELS[data["status"]]
         data["active"] = data.get("active", YES) != NO
+        stamped = data.get("archived_at") or ""
+        data["archived"] = bool(stamped)
+        data["archived_at"] = _stamp("archived_at", stamped)
+        data["archived_by"] = data.get("archived_by") or ""
         data["amber"] = [k for k in AMBER_KEYS if data.get(k) == BY_KEY[k].amber_when]
         return data
 
     def get(self, sl_no: int) -> dict[str, Any] | None:
-        with self._connect() as conn:
-            row = conn.execute("SELECT * FROM migrations WHERE sl_no = ?", (sl_no,)).fetchone()
+        with self.db.connect() as conn:
+            row = self._raw(conn, sl_no)
             return self._shape(row) if row else None
 
-    def _raw(self, conn: sqlite3.Connection, sl_no: int) -> dict[str, Any] | None:
-        row = conn.execute("SELECT * FROM migrations WHERE sl_no = ?", (sl_no,)).fetchone()
-        return {k: row[k] for k in row.keys()} if row else None
+    @staticmethod
+    def _raw(conn: Any, sl_no: int) -> dict[str, Any] | None:
+        return conn.one("SELECT * FROM migrations WHERE sl_no = ?", (sl_no,))
 
     def list(
         self,
@@ -496,6 +565,7 @@ class MigrationStore:
         created_from: float | None = None,
         created_to: float | None = None,
         include_inactive: bool = False,
+        archived: bool = False,
         **filters: str,
     ) -> list[dict[str, Any]]:
         clauses, params = [], []
@@ -509,12 +579,17 @@ class MigrationStore:
             clauses.append("active != ?")
             params.append(NO)
 
+        # Archived records are a separate view, never mixed into the register —
+        # that is the whole point of filing them away.
+        clauses.append("archived_at <> ?" if archived else "archived_at = ?")
+        params.append("")
+
         sql = "SELECT * FROM migrations"
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
 
-        with self._connect() as conn:
-            rows = [self._shape(r) for r in conn.execute(sql, params).fetchall()]
+        with self.db.connect() as conn:
+            rows = [self._shape(r) for r in conn.all(sql, params)]
 
         # Status is derived rather than stored, so it cannot be a SQL clause.
         status = (filters.get("status") or "").strip()
@@ -541,41 +616,39 @@ class MigrationStore:
                 payload[spec.key] = spec.default
 
         keys = list(payload)
-        with self._connect() as conn:
-            cur = conn.execute(
+        with self.db.connect() as conn:
+            # RETURNING rather than lastrowid: psycopg has no equivalent, and
+            # both databases support it.
+            created = conn.one(
                 f"INSERT INTO migrations ({', '.join(keys)}, updated_at) "
-                f"VALUES ({', '.join('?' * len(keys))}, ?)",
+                f"VALUES ({', '.join('?' * len(keys))}, ?) RETURNING *",
                 [*[payload[k] for k in keys], now],
             )
-            sl_no = int(cur.lastrowid)
-            conn.executemany(
+            sl_no = int(created["sl_no"])
+            conn.execute(
                 "INSERT INTO migration_audit (sl_no, at, who, field, old_value, new_value) "
                 "VALUES (?,?,?,?,?,?)",
-                [(sl_no, now, user.email, "created", "", str(sl_no))],
+                (sl_no, now, user.email, "created", "", str(sl_no)),
             )
-            return self._shape(conn.execute(
-                "SELECT * FROM migrations WHERE sl_no = ?", (sl_no,)
-            ).fetchone())
+            return self._shape(created)
 
     def update(self, sl_no: int, changes: dict[str, str], user: User) -> dict[str, Any]:
         now = time.time()
-        with self._connect() as conn:
+        with self.db.connect() as conn:
             before = self._raw(conn, sl_no)
             if before is None:
                 raise MigrationError(f"No record with SL# {sl_no}.", status=404)
 
             changed = {k: v for k, v in changes.items() if str(before.get(k, "")) != str(v)}
             if not changed:
-                return self._shape(conn.execute(
-                    "SELECT * FROM migrations WHERE sl_no = ?", (sl_no,)
-                ).fetchone())
+                return self._shape(before)
 
             assignments = ", ".join(f"{k} = ?" for k in changed)
-            conn.execute(
-                f"UPDATE migrations SET {assignments}, updated_at = ? WHERE sl_no = ?",
+            after = conn.one(
+                f"UPDATE migrations SET {assignments}, updated_at = ? WHERE sl_no = ? RETURNING *",
                 [*changed.values(), now, sl_no],
             )
-            conn.executemany(
+            conn.many(
                 "INSERT INTO migration_audit (sl_no, at, who, field, old_value, new_value) "
                 "VALUES (?,?,?,?,?,?)",
                 [
@@ -583,32 +656,80 @@ class MigrationStore:
                     for k, v in changed.items()
                 ],
             )
-            return self._shape(conn.execute(
-                "SELECT * FROM migrations WHERE sl_no = ?", (sl_no,)
-            ).fetchone())
+            return self._shape(after)
 
     def set_active(self, sl_no: int, active: bool, user: User) -> dict[str, Any]:
         """Retire a record, or bring it back. Reversible, and it leaves a trail."""
         now = time.time()
-        with self._connect() as conn:
+        with self.db.connect() as conn:
             before = self._raw(conn, sl_no)
             if before is None:
                 raise MigrationError(f"No record with SL# {sl_no}.", status=404)
+            if before.get("archived_at") or "":
+                raise MigrationError(
+                    f"SL# {sl_no} is archived and cannot be changed.", status=409
+                )
             was = before.get("active", YES)
             want = YES if active else NO
-            if was != want:
-                conn.execute(
-                    "UPDATE migrations SET active = ?, updated_at = ? WHERE sl_no = ?",
-                    (want, now, sl_no),
+            if was == want:
+                return self._shape(before)
+            after = conn.one(
+                "UPDATE migrations SET active = ?, updated_at = ? WHERE sl_no = ? RETURNING *",
+                (want, now, sl_no),
+            )
+            conn.execute(
+                "INSERT INTO migration_audit (sl_no, at, who, field, old_value, new_value) "
+                "VALUES (?,?,?,?,?,?)",
+                (sl_no, now, user.email, "active", was, want),
+            )
+            return self._shape(after)
+
+    def archive(self, sl_nos: list[int], user: User) -> dict[str, Any]:
+        """File away completed records. There is no way back.
+
+        Only a record that reached production can be archived: archiving is for
+        finished work, not a way to hide something still in flight.
+        """
+        now = time.time()
+        archived: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+
+        with self.db.connect() as conn:
+            for sl_no in sl_nos:
+                row = self._raw(conn, sl_no)
+                if row is None:
+                    skipped.append({"sl_no": sl_no, "reason": "No such record."})
+                    continue
+                shaped = self._shape(row)
+                if shaped["archived"]:
+                    skipped.append({"sl_no": sl_no, "reason": "Already archived.",
+                                    "microservice": shaped["microservice"]})
+                    continue
+                if not shaped["active"]:
+                    skipped.append({"sl_no": sl_no, "reason": "Inactive.",
+                                    "microservice": shaped["microservice"]})
+                    continue
+                if shaped["status"] != "in_prod":
+                    skipped.append({
+                        "sl_no": sl_no,
+                        "reason": "Not migrated to production yet.",
+                        "microservice": shaped["microservice"],
+                    })
+                    continue
+
+                after = conn.one(
+                    "UPDATE migrations SET archived_at = ?, archived_by = ?, updated_at = ? "
+                    "WHERE sl_no = ? RETURNING *",
+                    (str(now), user.email, now, sl_no),
                 )
                 conn.execute(
                     "INSERT INTO migration_audit (sl_no, at, who, field, old_value, new_value) "
                     "VALUES (?,?,?,?,?,?)",
-                    (sl_no, now, user.email, "active", was, want),
+                    (sl_no, now, user.email, "archived", "", "archived"),
                 )
-            return self._shape(conn.execute(
-                "SELECT * FROM migrations WHERE sl_no = ?", (sl_no,)
-            ).fetchone())
+                archived.append(self._shape(after))
+
+        return {"archived": archived, "skipped": skipped, "requested": len(sl_nos)}
 
     def delete(self, sl_no: int) -> bool:
         """Remove a record and its history. Irreversible — deactivate is not.
@@ -616,20 +737,29 @@ class MigrationStore:
         The audit rows go with it: leaving them behind would keep a trail nobody
         can reach, for a record that no longer exists.
         """
-        with self._connect() as conn:
-            gone = conn.execute("DELETE FROM migrations WHERE sl_no = ?", (sl_no,)).rowcount > 0
+        with self.db.connect() as conn:
+            row = self._raw(conn, sl_no)
+            if row is not None and (row.get("archived_at") or ""):
+                raise MigrationError(
+                    f"SL# {sl_no} is archived and cannot be deleted.", status=409
+                )
+            gone = bool(conn.one("DELETE FROM migrations WHERE sl_no = ? RETURNING sl_no", (sl_no,)))
             if gone:
                 conn.execute("DELETE FROM migration_audit WHERE sl_no = ?", (sl_no,))
             return gone
 
     def audit(self, sl_no: int) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM migration_audit WHERE sl_no = ? ORDER BY id", (sl_no,)
-            ).fetchall()
+        with self.db.connect() as conn:
+            rows = conn.all("SELECT * FROM migration_audit WHERE sl_no = ? ORDER BY id", (sl_no,))
         out = []
         for row in rows:
             spec = BY_KEY.get(row["field"])
+            if row["field"] == "archived":
+                out.append({
+                    "at": _iso(row["at"]), "who": row["who"], "field": "archived",
+                    "label": "Record", "old_value": "", "new_value": "archived",
+                })
+                continue
             if row["field"] == "active":
                 out.append({
                     "at": _iso(row["at"]),
@@ -656,21 +786,20 @@ class MigrationStore:
         if ends_at <= starts_at:
             raise MigrationError("The freeze must end after it starts.")
         now = time.time()
-        with self._connect() as conn:
-            cur = conn.execute(
+        with self.db.connect() as conn:
+            row = conn.one(
                 "INSERT INTO freezes (starts_at, ends_at, reason, created_by, created_at) "
-                "VALUES (?,?,?,?,?)",
+                "VALUES (?,?,?,?,?) RETURNING *",
                 (starts_at, ends_at, reason.strip(), user.email, now),
             )
-            row = conn.execute("SELECT * FROM freezes WHERE id = ?", (cur.lastrowid,)).fetchone()
         return self._freeze(row)
 
     def delete_freeze(self, freeze_id: int) -> bool:
-        with self._connect() as conn:
-            return conn.execute("DELETE FROM freezes WHERE id = ?", (freeze_id,)).rowcount > 0
+        with self.db.connect() as conn:
+            return bool(conn.one("DELETE FROM freezes WHERE id = ? RETURNING id", (freeze_id,)))
 
     @staticmethod
-    def _freeze(row: sqlite3.Row) -> dict[str, Any]:
+    def _freeze(row: dict[str, Any]) -> dict[str, Any]:
         now = time.time()
         return {
             "id": row["id"],
@@ -685,8 +814,8 @@ class MigrationStore:
         }
 
     def freezes(self, include_past: bool = False) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM freezes ORDER BY starts_at DESC").fetchall()
+        with self.db.connect() as conn:
+            rows = conn.all("SELECT * FROM freezes ORDER BY starts_at DESC")
         out = [self._freeze(r) for r in rows]
         return out if include_past else [f for f in out if not f["past"]]
 
@@ -720,6 +849,10 @@ def create_record(
     for key in REQUEST_KEYS:
         if key in values:
             cleaned[key] = _clean(BY_KEY[key], values[key])
+    if "change_requestor" in cleaned:
+        cleaned["change_requestor"] = clean_requestor(
+            cleaned["change_requestor"], settings.migrations
+        )
     for spec in FIELDS:
         if spec.default and not cleaned.get(spec.key):
             cleaned[spec.key] = spec.default
@@ -758,10 +891,14 @@ def apply_changes(
             # 409 for "the workflow is not there yet", 403 for "not yours to set".
             raise MigrationError(
                 f"{spec.label}: {why}",
-                status=409 if kind in ("stage", "inactive") else 403,
+                status=409 if kind in ("stage", "inactive", "archived") else 403,
                 fields={key: why},
             )
         cleaned[key] = _clean(spec, value)
+    if "change_requestor" in cleaned:
+        cleaned["change_requestor"] = clean_requestor(
+            cleaned["change_requestor"], settings.migrations
+        )
 
     merged = {**{f.key: row.get(f.key, "") for f in FIELDS}, **cleaned}
     problems = validate(merged, settings.migrations)
@@ -777,8 +914,29 @@ def apply_changes(
             fields=relevant,
         )
 
+    _check_transitions(row, cleaned)
     cleaned.update(_auto_fields(row, cleaned, user))
     return store.update(sl_no, cleaned, user)
+
+
+# Undoing an approval reopens the request for editing. That is fine while nothing
+# has happened yet, and wrong once it has: it would let the commit hash of a
+# change already running in QA or production be rewritten after the fact.
+_NO_TAKEBACKS = (
+    ("ready_for_qa", "executed_in_qa", "It has already been migrated to QA."),
+    ("ready_for_prod", "executed_in_prod", "It has already been migrated to production."),
+)
+
+
+def _check_transitions(row: dict[str, Any], changes: dict[str, str]) -> None:
+    for switch, done, why in _NO_TAKEBACKS:
+        if changes.get(switch) == NO and row.get(done) == YES:
+            raise MigrationError(
+                f"{BY_KEY[switch].label} cannot be withdrawn. {why} "
+                f"Deactivate the record instead if it should not stand.",
+                status=409,
+                fields={switch: why},
+            )
 
 
 def _auto_fields(row: dict[str, Any], changes: dict[str, str], user: User) -> dict[str, str]:
@@ -786,28 +944,238 @@ def _auto_fields(row: dict[str, Any], changes: dict[str, str], user: User) -> di
     auto: dict[str, str] = {}
     now = str(time.time())
 
-    if "approved_by" in changes:
-        was = (row.get("approved_by") or "").strip()
-        now_set = changes["approved_by"].strip()
-        if now_set and not was:
-            auto["date_approved"] = now
-        elif not now_set and was:
-            # Withdrawing an approval must not leave its date behind.
-            auto["date_approved"] = ""
+    def flipped(key: str) -> str:
+        """"on", "off", or "" when this edit does not move the switch."""
+        if key not in changes or changes[key] == row.get(key):
+            return ""
+        return "on" if changes[key] == YES else "off"
 
-    if changes.get("executed_in_qa") == YES and row.get("executed_in_qa") != YES:
-        auto["qa_migrated_by"] = user.email
-    if changes.get("executed_in_qa") == NO and row.get("executed_in_qa") == YES:
-        auto["qa_migrated_by"] = ""
-
-    if changes.get("executed_in_prod") == YES and row.get("executed_in_prod") != YES:
-        auto["prod_migration_date"] = now
-        auto["prod_migrated_by"] = user.email
-    if changes.get("executed_in_prod") == NO and row.get("executed_in_prod") == YES:
-        auto["prod_migration_date"] = ""
-        auto["prod_migrated_by"] = ""
+    # Each switch stamps who threw it and when. Turning it back off clears that
+    # again: a withdrawn approval that still names an approver reads as approved.
+    for switch, who, when in (
+        ("ready_for_qa", "approved_by", "date_approved"),
+        ("executed_in_qa", "qa_migrated_by", "qa_migration_date"),
+        ("ready_for_prod", "prod_approved_by", "prod_date_approved"),
+        ("executed_in_prod", "prod_migrated_by", "prod_migration_date"),
+    ):
+        moved = flipped(switch)
+        if moved == "on":
+            auto[who], auto[when] = user.email, now
+        elif moved == "off":
+            auto[who], auto[when] = "", ""
 
     return auto
+
+
+@dataclass(frozen=True)
+class BulkAction:
+    """One switch that can be thrown across many records at once.
+
+    `extra` is the field that travels with it — the date being approved for, or
+    the remarks on a migration — applied to every record that moves.
+    """
+
+    key: str
+    switch: str
+    extra: str
+    roles: tuple[str, ...]
+    verb: str
+    done: str  # what to say about a record that has already had this done
+
+
+BULK_ACTIONS: dict[str, BulkAction] = {
+    "qa_approve": BulkAction(
+        "qa_approve", "ready_for_qa", "qa_date_planned",
+        ("approver", "admin"), "approve for QA", "Already approved."),
+    "prod_approve": BulkAction(
+        "prod_approve", "ready_for_prod", "prod_date_planned",
+        ("approver", "admin"), "approve for production", "Already approved."),
+    "qa_execute": BulkAction(
+        "qa_execute", "executed_in_qa", "qa_migration_remarks",
+        ("devops", "admin"), "record as migrated to QA", "Already recorded."),
+    "prod_execute": BulkAction(
+        "prod_execute", "executed_in_prod", "prod_migration_remarks",
+        ("devops", "admin"), "record as migrated to production", "Already recorded."),
+}
+
+# The stage names the /approve and /execute endpoints take, mapped to actions.
+BULK_BY_STAGE = {
+    "approve": {"qa": "qa_approve", "prod": "prod_approve"},
+    "execute": {"qa": "qa_execute", "prod": "prod_execute"},
+}
+MAX_BULK = 200
+
+
+def actionable(row: dict[str, Any], action: BulkAction) -> tuple[bool, str]:
+    """Would this action move this record? (yes, why not)."""
+    if row.get("archived"):
+        return False, "Archived."
+    if not row.get("active", True):
+        return False, "Inactive."
+    if row.get(action.switch) == YES:
+        return False, action.done
+    open_, why = stage_open(action.switch, row)
+    return (True, "") if open_ else (False, why)
+
+
+def bulk_apply(
+    settings: Settings,
+    store: MigrationStore,
+    user: User,
+    sl_nos: list[int],
+    action_key: str,
+    extra: str = "",
+) -> dict[str, Any]:
+    """Throw one workflow switch across several records.
+
+    Each record goes through `apply_changes`, so the role, stage, freeze,
+    inactive and audit rules are exactly those of doing it one at a time — this
+    is a loop over the ordinary path, not a second way in.
+
+    `extra` is the field that travels with the switch: the date being approved
+    for, or the remarks on a migration. Left blank, each record keeps whatever it
+    already had, because a batch should not wipe what was entered individually.
+
+    Records that cannot be moved are reported rather than silently skipped, and
+    they do not stop the ones that can.
+    """
+    action = BULK_ACTIONS.get(action_key)
+    if action is None:
+        raise MigrationError(f"“{action_key}” is not something that can be done in bulk.")
+    if not user.has_any(*action.roles):
+        raise MigrationError(
+            f"{BY_KEY[action.switch].label} needs the {' or '.join(action.roles)} role.",
+            status=403,
+        )
+
+    # Deduplicated, and in the order given so the report reads predictably.
+    wanted: list[int] = []
+    for sl_no in sl_nos:
+        if sl_no not in wanted:
+            wanted.append(int(sl_no))
+    if not wanted:
+        raise MigrationError("No records were selected.")
+    if len(wanted) > MAX_BULK:
+        raise MigrationError(f"{len(wanted)} records is more than the {MAX_BULK} this will do at once.")
+
+    # Checked once up front: during a freeze the answer is the same for every
+    # record, and N copies of it is not a useful report.
+    _guard_freeze(store)
+
+    # Likewise a malformed value: it would fail identically on every record.
+    extra = (extra or "").strip()
+    if extra:
+        problems = validate({action.extra: extra}, settings.migrations, partial=True)
+        if problems:
+            raise MigrationError(
+                f"{BY_KEY[action.extra].label}: {problems[action.extra]}",
+                fields={action.extra: problems[action.extra]},
+            )
+
+    moved: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for sl_no in wanted:
+        row = store.get(sl_no)
+        if row is None:
+            skipped.append({"sl_no": sl_no, "reason": "No such record."})
+            continue
+        ok, why = actionable(row, action)
+        if not ok:
+            skipped.append({"sl_no": sl_no, "reason": why, "microservice": row.get("microservice", "")})
+            continue
+        changes = {action.switch: YES}
+        if extra:
+            changes[action.extra] = extra
+        try:
+            moved.append(apply_changes(settings, store, user, sl_no, changes))
+        except MigrationError as exc:
+            skipped.append({"sl_no": sl_no, "reason": str(exc), "microservice": row.get("microservice", "")})
+
+    return {
+        "action": action.key,
+        "field": action.switch,
+        "label": BY_KEY[action.switch].label,
+        "extra_field": action.extra,
+        "extra_label": BY_KEY[action.extra].label,
+        "extra": extra,
+        "verb": action.verb,
+        "requested": len(wanted),
+        # `approved` is kept as an alias so callers written against the earlier
+        # approve-only shape keep working.
+        "moved": moved,
+        "approved": moved,
+        "skipped": skipped,
+    }
+
+
+def bulk_stage_action(kind: str, stage: str) -> str:
+    """Map an endpoint's (kind, stage) pair to an action key."""
+    try:
+        return BULK_BY_STAGE[kind][stage]
+    except KeyError:
+        raise MigrationError(
+            f"“{stage}” is not something that can be {kind}d in bulk."
+        ) from None
+
+
+def approve_many(
+    settings: Settings,
+    store: MigrationStore,
+    user: User,
+    sl_nos: list[int],
+    stage: str,
+    planned: str = "",
+) -> dict[str, Any]:
+    """Bulk approval, kept as the name the approve endpoint uses."""
+    result = bulk_apply(settings, store, user, sl_nos, bulk_stage_action("approve", stage), planned)
+    result["stage"] = stage
+    result["planned"] = result["extra"]
+    result["planned_label"] = result["extra_label"]
+    return result
+
+
+def execute_many(
+    settings: Settings,
+    store: MigrationStore,
+    user: User,
+    sl_nos: list[int],
+    stage: str,
+    remarks: str = "",
+) -> dict[str, Any]:
+    """Bulk recording of a migration that has been performed."""
+    result = bulk_apply(settings, store, user, sl_nos, bulk_stage_action("execute", stage), remarks)
+    result["stage"] = stage
+    result["remarks"] = result["extra"]
+    return result
+
+
+def permissions(user: User) -> dict[str, Any]:
+    """What this person may do, decided once, server-side.
+
+    The UI used to work this out from the role list, which meant re-implementing
+    the rules in JavaScript — and getting them wrong for `admin`, which satisfies
+    every check without literally holding the other roles.
+    """
+    can_raise = user.signed_in and (user.is_developer or user.is_approver)
+    if not user.signed_in:
+        why = "You are not signed in."
+    elif can_raise:
+        why = ""
+    elif not user.roles:
+        why = "No role is mapped to your address in config.yaml."
+    else:
+        why = f"Raising a request needs the developer role. You hold: {', '.join(sorted(user.roles))}."
+
+    return {
+        "can_raise": can_raise,
+        "why_not_raise": why,
+        "can_retire": user.has_any("approver", "admin"),
+        "can_freeze": user.has_any("approver", "admin"),
+        "can_approve": user.has_any("approver", "admin"),
+        "can_execute": user.has_any("devops", "admin"),
+        # Archiving is irreversible, so it sits with the other final acts.
+        "can_archive": user.has_any("approver", "admin"),
+    }
 
 
 def field_spec() -> list[dict[str, Any]]:

@@ -111,15 +111,15 @@ branch_exclude:
 #     - 10.0.0.0/8
 #   roles:                      # exact addresses or globs; matching ignores case
 #     developer:
-#       - "*@tcs.com"
+#       - "*@example.com"
 #     approver:
-#       - lead@tcs.com
+#       - lead@example.com
 #     devops:
-#       - devops@tcs.com
+#       - devops@example.com
 #     # A superset: satisfies every other role's checks. Approvers and admins
 #     # are the ones who can deactivate or delete records.
 #     admin:
-#       - lead@tcs.com
+#       - lead@example.com
 
 # ---------------------------------------------------------------------------
 # The dropdown lists on the migration request form.
@@ -151,4 +151,4 @@ branch_exclude:
 #   # Offered in the "Approved By" field. Only people holding the approver role
 #   # above can actually set it, whatever this list says.
 #   approvers:
-#     - lead@tcs.com
+#     - lead@example.com

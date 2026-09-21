@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -48,6 +49,24 @@ ROLES = ("developer", "approver", "devops", "admin")
 
 
 @dataclass(frozen=True)
+class Employee:
+    """Someone a migration request can be raised on behalf of.
+
+    `email` is what ties an employee to a signed-in user, so the form can put
+    the right person in Change Requestor without being asked.
+    """
+
+    number: str
+    name: str
+    email: str = ""
+
+    @property
+    def label(self) -> str:
+        # A plain hyphen, not an em dash: this value is typed into spreadsheets.
+        return f"{self.number} - {self.name}" if self.name else self.number
+
+
+@dataclass(frozen=True)
 class Microservice:
     """One microservice, with the repos and track leads that depend on it."""
 
@@ -85,6 +104,77 @@ class AuthConfig:
         return any(self.roles.values())
 
 
+SERVICE_COLUMNS: dict[str, list[str]] = {
+    "microservice": ["micro service name", "microservice name", "micro service",
+                     "microservice", "service name", "ms name", "service", "ms"],
+    "repo": ["repo name", "repository name", "repository", "repo", "git repo"],
+    "track_lead": ["track lead name", "track lead", "lead name", "lead", "owner"],
+}
+
+
+def load_microservices(path: Path) -> tuple[list[Microservice], str]:
+    """Read the microservice → repo → track lead map from a .csv or .xlsx.
+
+    Returns (services, problem). A problem is reported rather than raised: a
+    typo in this file must not stop the whole app from starting, it must show up
+    where the person who can fix it will see it.
+
+    One row per pairing, repeated for each repo or lead a service has. A cell may
+    also hold several values separated by commas or semicolons.
+    """
+    from .spreadsheet import SheetError, parse_columns  # local: avoids a cycle
+
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        return [], f"{path} could not be read: {exc.strerror or exc}."
+
+    try:
+        sheet = parse_columns(
+            path.name, content,
+            columns=SERVICE_COLUMNS,
+            required="microservice",
+            hint="It needs a “Micro Service Name” column, and usually “Repo Name” "
+                 "and “Track Lead Name” as well.",
+        )
+    except SheetError as exc:
+        return [], f"{path}: {exc}"
+
+    def cells(value: str) -> list[str]:
+        return [part.strip() for part in re.split(r"[;,]", value or "") if part.strip()]
+
+    order: list[str] = []
+    repos: dict[str, list[str]] = {}
+    leads: dict[str, list[str]] = {}
+    for row in sheet["rows"]:
+        name = (row.get("microservice") or "").strip()
+        if not name:
+            continue
+        key = name.casefold()
+        if key not in repos:
+            order.append(name)
+            repos[key], leads[key] = [], []
+        # Preserve first-seen order, drop repeats — the same pairing often
+        # appears on several rows of a hand-maintained sheet.
+        for repo in cells(row.get("repo", "")):
+            if repo not in repos[key]:
+                repos[key].append(repo)
+        for lead in cells(row.get("track_lead", "")):
+            if lead not in leads[key]:
+                leads[key].append(lead)
+
+    services = [
+        Microservice(name=name, repos=repos[name.casefold()], track_leads=leads[name.casefold()])
+        for name in order
+    ]
+    if not services:
+        # A backstop: parse_columns normally rejects an empty sheet first, with a
+        # better message. This exists so an empty list can never be returned as
+        # though it were fine, which would silently empty the dropdowns.
+        return [], f"{path} has a header but no microservice rows."
+    return services, ""
+
+
 @dataclass
 class MigrationConfig:
     """Reference lists for the migration request form."""
@@ -94,7 +184,66 @@ class MigrationConfig:
     migration_paths: list[str] = field(default_factory=list)
     microservices: list[Microservice] = field(default_factory=list)
     change_requestors: list[str] = field(default_factory=list)
+    employees: list[Employee] = field(default_factory=list)
     approvers: list[str] = field(default_factory=list)
+    # Optional external source for the microservice map.
+    microservices_file: Path | None = None
+    inline_microservices: list[Microservice] = field(default_factory=list)
+    services_error: str = ""
+    _stamp: object = None
+
+    def refresh(self) -> None:
+        """Re-read the microservice file if it has changed on disk.
+
+        Cheap enough to call per request: a stat, and a parse only when the file
+        has actually moved. It means a track lead changing does not need a
+        restart, unlike the rest of config.yaml.
+        """
+        if not self.microservices_file:
+            return
+        try:
+            info = self.microservices_file.stat()
+            stamp: object = (info.st_mtime_ns, info.st_size)
+        except OSError:
+            stamp = "missing"
+        if stamp == self._stamp:
+            return
+        self._stamp = stamp
+
+        services, problem = load_microservices(self.microservices_file)
+        self.services_error = problem
+        # On a bad file, fall back to whatever config.yaml listed inline rather
+        # than presenting an empty form with no explanation.
+        self.microservices = services or list(self.inline_microservices)
+
+    @property
+    def employee_labels(self) -> list[str]:
+        return [e.label for e in self.employees]
+
+    def employee_for(self, email: str) -> Employee | None:
+        """The employee a signed-in address belongs to, if any."""
+        who = (email or "").strip().casefold()
+        if not who:
+            return None
+        return next((e for e in self.employees if e.email.strip().casefold() == who), None)
+
+    def match_employee(self, value: str) -> Employee | None:
+        """Resolve a typed or pasted value to an employee.
+
+        Accepts the full label, the number alone, or the name alone, so a
+        spreadsheet holding only employee numbers still works.
+        """
+        text = (value or "").strip()
+        if not text:
+            return None
+        folded = text.casefold()
+        for employee in self.employees:
+            if folded in (employee.label.casefold(), employee.number.casefold(),
+                          employee.name.casefold()):
+                return employee
+        # "12345 — Name" with a different dash, or odd spacing.
+        head = text.split()[0].strip(" -—–")
+        return next((e for e in self.employees if e.number.casefold() == head.casefold()), None)
 
     def service(self, name: str) -> Microservice | None:
         want = (name or "").strip().casefold()
@@ -135,6 +284,9 @@ class Settings:
     auth: AuthConfig = field(default_factory=AuthConfig)
     migrations: MigrationConfig = field(default_factory=MigrationConfig)
     migration_store_path: Path = ROOT / ".cache" / "migrations.sqlite3"
+    # Where the migration register lives. "sqlite:///path" or a PostgreSQL URL.
+    # The git caches stay on SQLite regardless — see the README.
+    database_url: str = ""
 
     @property
     def has_github(self) -> bool:
@@ -209,23 +361,35 @@ def _parse_csr_repos(section: dict | None) -> list[CsrRepo]:
     return out
 
 
+def _clean_list(raw) -> list[str]:
+    """YAML values to a list of non-empty strings.
+
+    A blank list item (`-` with nothing after it) parses as None, and `str(None)`
+    is the perfectly non-empty string "None" — which then behaves as a real
+    value. Left unguarded that invents a role pattern, or a release called None.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, (str, bytes)):
+        raw = [raw]
+    out = []
+    for item in raw:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if text:
+            out.append(text)
+    return out
+
+
 def _parse_auth(section: dict | None) -> AuthConfig:
     section = section or {}
     raw_roles = section.get("roles") or {}
-    roles: dict[str, list[str]] = {}
-    for role in ROLES:
-        entries = raw_roles.get(role) or []
-        if isinstance(entries, str):
-            entries = [entries]
-        roles[role] = [str(e).strip() for e in entries if str(e).strip()]
-
-    proxies = section.get("trusted_proxies") or []
-    if isinstance(proxies, str):
-        proxies = [proxies]
+    roles = {role: _clean_list(raw_roles.get(role)) for role in ROLES}
 
     return AuthConfig(
         header=str(section.get("header") or "X-Forwarded-Email").strip(),
-        trusted_proxies=[str(p).strip() for p in proxies if str(p).strip()],
+        trusted_proxies=_clean_list(section.get("trusted_proxies")),
         dev_mode=bool(section.get("dev_mode", False)),
         dev_allow_remote=bool(section.get("dev_allow_remote", False)),
         dev_user=str(section.get("dev_user") or "").strip(),
@@ -237,10 +401,23 @@ def _parse_migrations(section: dict | None) -> MigrationConfig:
     section = section or {}
 
     def as_list(key: str) -> list[str]:
-        raw = section.get(key) or []
-        if isinstance(raw, str):
-            raw = [raw]
-        return [str(v).strip() for v in raw if str(v).strip()]
+        return _clean_list(section.get(key))
+
+    employees: list[Employee] = []
+    for entry in section.get("employees") or []:
+        if isinstance(entry, dict):
+            number = str(entry.get("number") or entry.get("id") or "").strip()
+            ename = str(entry.get("name") or "").strip()
+            email = str(entry.get("email") or "").strip()
+        else:
+            # "E1002 - John Roe" or "E1003 - Amy Poe, amy@example.com"
+            parts = [part.strip() for part in re.split(r"[,|]", str(entry)) if part.strip()]
+            number, _, ename = (x.strip() for x in parts[0].partition("-"))
+            email = next((x for x in parts[1:] if "@" in x), "")
+            if not ename and len(parts) > 1 and "@" not in parts[1]:
+                ename = parts[1]
+        if number or ename:
+            employees.append(Employee(number=number or ename, name=ename, email=email))
 
     services: list[Microservice] = []
     for entry in section.get("microservices") or []:
@@ -255,26 +432,48 @@ def _parse_migrations(section: dict | None) -> MigrationConfig:
             name, repos, leads = str(entry).strip(), [], []
         if not name:
             continue
-        if isinstance(repos, str):
-            repos = [repos]
-        if isinstance(leads, str):
-            leads = [leads]
         services.append(
-            Microservice(
-                name=name,
-                repos=[str(r).strip() for r in repos if str(r).strip()],
-                track_leads=[str(l).strip() for l in leads if str(l).strip()],
-            )
+            Microservice(name=name, repos=_clean_list(repos), track_leads=_clean_list(leads))
         )
 
-    return MigrationConfig(
-        enabled=bool(section.get("enabled", bool(services))),
+    raw_path = str(section.get("microservices_file") or "").strip()
+    path = None
+    if raw_path:
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = ROOT / path
+
+    cfg = MigrationConfig(
+        # A file counts as configuration too, so the tab can be switched on by
+        # pointing at one without also listing services inline.
+        enabled=bool(section.get("enabled", bool(services) or bool(path))),
         releases=as_list("releases"),
         migration_paths=as_list("migration_paths"),
         microservices=services,
         change_requestors=as_list("change_requestors"),
+        employees=employees,
         approvers=as_list("approvers"),
+        microservices_file=path,
+        inline_microservices=list(services),
     )
+    # Load once now so a broken path is visible at startup, not on first use.
+    cfg.refresh()
+    return cfg
+
+
+def _database_url(section: dict | None, cache_root: Path) -> str:
+    """Where the migration register lives.
+
+    DATABASE_URL wins, then `database.url` in config.yaml, then the SQLite file
+    the app has always used — so an existing deployment keeps working untouched.
+    """
+    from_env = os.getenv("DATABASE_URL", "").strip()
+    if from_env:
+        return from_env
+    configured = str((section or {}).get("url") or "").strip()
+    if configured:
+        return configured
+    return f"sqlite:///{cache_root / 'migrations.sqlite3'}"
 
 
 def load_settings() -> Settings:
@@ -311,4 +510,5 @@ def load_settings() -> Settings:
         auth=_parse_auth(raw.get("auth")),
         migrations=_parse_migrations(raw.get("migrations")),
         migration_store_path=cache_root / "migrations.sqlite3",
+        database_url=_database_url(raw.get("database"), cache_root),
     )

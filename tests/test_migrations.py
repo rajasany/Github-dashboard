@@ -10,6 +10,7 @@ Run with:  .venv/bin/python tests/test_migrations.py
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import tempfile
 import time
@@ -20,8 +21,54 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import migration_sheet, migrations  # noqa: E402
 from app.auth import User, dev_mode_available, resolve_user, roles_for  # noqa: E402
-from app.config import AuthConfig, Microservice, MigrationConfig, load_settings  # noqa: E402
+from app.config import (  # noqa: E402
+    ROLES, AuthConfig, Employee, Microservice, MigrationConfig, load_settings,
+)
+from app.db import Database  # noqa: E402
 from app.migrations import MigrationError, MigrationStore  # noqa: E402
+
+# Set TEST_DATABASE_URL to run this whole suite against PostgreSQL instead.
+TEST_DB_URL = os.getenv("TEST_DATABASE_URL", "").strip()
+APP_TABLES = ("migration_audit", "migrations", "freezes",
+              "ref_microservice_links", "ref_microservices", "ref_values", "ref_employees")
+
+
+_SHARED_PG: Database | None = None
+
+
+def database_for(root: Path, name: str) -> Database:
+    """A clean database for one test.
+
+    SQLite gets a fresh file. PostgreSQL has one namespace, so the app's tables
+    are dropped first — each test still starts from nothing — and one pool is
+    shared across the suite rather than opened and abandoned per test.
+    """
+    if not TEST_DB_URL:
+        return Database(f"sqlite:///{root / name}")
+
+    global _SHARED_PG
+    if _SHARED_PG is None:
+        # This suite drops and recreates the app's tables. Pointing it at the
+        # database the app is configured to use would wipe real records, so
+        # that is refused outright rather than warned about.
+        from app.config import load_settings
+
+        live = load_settings().database_url.strip()
+        if live and Database(live).kind != "sqlite" and live == TEST_DB_URL:
+            raise SystemExit(
+                "TEST_DATABASE_URL is the same database the app is configured to use.\n"
+                "This suite drops its tables. Point it at a throwaway database, e.g.\n"
+                "  createdb repo_dashboard_test"
+            )
+        _SHARED_PG = Database(TEST_DB_URL)
+    with _SHARED_PG.connect() as conn:
+        for table in APP_TABLES:
+            conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+    return _SHARED_PG
+
+
+def store_for(root: Path, name: str) -> MigrationStore:
+    return MigrationStore(database_for(root, name))
 
 FAILURES: list[str] = []
 
@@ -36,9 +83,11 @@ def check(name: str, got, want) -> None:
 
 def refused(name: str, fn, *, contains: str = "") -> None:
     """Assert a call is rejected, and optionally that it says why."""
+    from app.reference import ReferenceError
+
     try:
         fn()
-    except (MigrationError, PermissionError) as exc:
+    except (MigrationError, ReferenceError, PermissionError) as exc:
         if contains and contains.casefold() not in str(exc).casefold():
             check(name, f"rejected but said {str(exc)!r}", f"a message mentioning {contains!r}")
         else:
@@ -58,6 +107,11 @@ def build_settings():
             Microservice("cart", ["demo/cart", "demo/cart-ui"], ["R. Iyer", "S. Rao"]),
         ],
         change_requestors=["Business Ops", "Release Mgmt"],
+        employees=[
+            Employee("E1001", "Jane Doe", "dev@example.com"),
+            Employee("E1002", "John Roe", "lead@example.com"),
+            Employee("E1003", "Amy Poe"),
+        ],
         approvers=["lead@example.com", "head@example.com"],
     )
     settings.auth = AuthConfig(
@@ -83,7 +137,7 @@ GOOD_REQUEST = {
     "microservice": "payments",
     "repo_name": "demo/payments",
     "track_lead": "A. Kumar",
-    "change_requestor": "Business Ops",
+    "change_requestor": "E1001 - Jane Doe",
     "reason": "Defect fix",
     "change_description": "Rounding correction",
     "code_image_change": "Yes",
@@ -208,6 +262,35 @@ def test_dev_mode() -> None:
           "dev@example.com")
 
 
+def test_config_parsing() -> None:
+    """Blank and odd YAML entries must not become values."""
+    print("\n=== reading config.yaml ===")
+    from app.config import _parse_auth, _parse_migrations
+
+    # A list item written as a bare "-" parses as None, and str(None) is the
+    # non-empty string "None" — which would become a role pattern nobody spots.
+    auth = _parse_auth({"roles": {"approver": [None], "developer": ["", "  "], "devops": None}})
+    check("a blank list item is dropped, not turned into \"None\"", auth.roles["approver"], [])
+    check("so are empty strings", auth.roles["developer"], [])
+    check("and a null section", auth.roles["devops"], [])
+    check("every role is still present as a key", sorted(auth.roles), sorted(ROLES))
+    check("an all-blank roles map counts as unconfigured", auth.configured, False)
+    check("a real entry still lands",
+          _parse_auth({"roles": {"approver": ["a@b.com"]}}).roles["approver"], ["a@b.com"])
+    check("a bare string is accepted for a list",
+          _parse_auth({"roles": {"approver": "a@b.com"}}).roles["approver"], ["a@b.com"])
+    check("blank proxies are dropped too",
+          _parse_auth({"trusted_proxies": [None, "", "127.0.0.1"]}).trusted_proxies, ["127.0.0.1"])
+
+    cfg = _parse_migrations({
+        "releases": [None, "R1", "  ", "R2"],
+        "microservices": [{"name": "svc", "repos": [None, "a/b"], "track_leads": [None]}],
+    })
+    check("blank releases are dropped", cfg.releases, ["R1", "R2"])
+    check("blank repos are dropped", cfg.microservices[0].repos, ["a/b"])
+    check("a service with no lead gets an empty list", cfg.microservices[0].track_leads, [])
+
+
 def test_validation() -> None:
     print("\n=== validation ===")
     settings = build_settings()
@@ -258,7 +341,7 @@ def test_validation() -> None:
 def test_workflow(root: Path) -> None:
     print("\n=== roles and the workflow ===")
     settings = build_settings()
-    store = MigrationStore(root / "migrations.sqlite3")
+    store = store_for(root, "migrations.sqlite3")
 
     record = migrations.create_record(settings, store, DEV, dict(GOOD_REQUEST))
     sl = record["sl_no"]
@@ -270,11 +353,15 @@ def test_workflow(root: Path) -> None:
     check("SL# is the sequence", record["sl_no"], sl)
 
     refused("a developer cannot approve",
-            lambda: migrations.apply_changes(settings, store, DEV, sl, {"approved_by": "lead@example.com"}),
+            lambda: migrations.apply_changes(settings, store, DEV, sl, {"ready_for_qa": "Yes"}),
             contains="approver role")
     refused("devops cannot approve",
-            lambda: migrations.apply_changes(settings, store, DEVOPS, sl, {"approved_by": "lead@example.com"}),
+            lambda: migrations.apply_changes(settings, store, DEVOPS, sl, {"ready_for_qa": "Yes"}),
             contains="approver role")
+    refused("nor can anyone type in who approved it",
+            lambda: migrations.apply_changes(settings, store, APPROVER, sl,
+                                             {"approved_by": "someone@example.com"}),
+            contains="automatically")
     refused("nobody can write an auto field",
             lambda: migrations.apply_changes(settings, store, APPROVER, sl, {"date_approved": "2026-01-01"}),
             contains="automatically")
@@ -283,7 +370,7 @@ def test_workflow(root: Path) -> None:
             contains="devops role")
     refused("devops cannot record QA before approval",
             lambda: migrations.apply_changes(settings, store, DEVOPS, sl, {"executed_in_qa": "Yes"}),
-            contains="not approved")
+            contains="not approved for qa")
     refused("another developer cannot edit someone else's request",
             lambda: migrations.apply_changes(settings, store, DEV2, sl, {"reason": "mine now"}),
             contains="raised the request")
@@ -292,16 +379,17 @@ def test_workflow(root: Path) -> None:
     check("the author can edit their own request", edited["reason"], "Defect fix, revised")
 
     approved = migrations.apply_changes(
-        settings, store, APPROVER, sl, {"approved_by": "lead@example.com", "qa_date_planned": "2026-10-01"}
+        settings, store, APPROVER, sl, {"ready_for_qa": "Yes", "qa_date_planned": "2026-10-01"}
     )
-    check("an approver can approve", approved["approved_by"], "lead@example.com")
-    check("the approval date is filled in automatically", bool(approved["date_approved"]), True)
-    check("the planned QA date is kept", approved["qa_date_planned"], "2026-10-01")
+    check("an approver marks it ready for QA", approved["ready_for_qa"], "Yes")
+    check("which fills in who approved it", approved["approved_by"], "lead@example.com")
+    check("and when", bool(approved["date_approved"]), True)
+    check("the planned QA migration date is kept", approved["qa_date_planned"], "2026-10-01")
     check("status moves to approved", approved["status"], "approved")
 
     refused("the request is locked once approved",
             lambda: migrations.apply_changes(settings, store, DEV, sl, {"reason": "changed my mind"}),
-            contains="withdraw the approval")
+            contains="Ready for QA back to No")
     refused("devops cannot jump straight to prod",
             lambda: migrations.apply_changes(settings, store, DEVOPS, sl, {"executed_in_prod": "Yes"}),
             contains="ready for prod")
@@ -314,14 +402,21 @@ def test_workflow(root: Path) -> None:
     )
     check("devops can record the QA migration", qa["executed_in_qa"], "Yes")
     check("QA migrated by is filled from the login", qa["qa_migrated_by"], "ops@example.com")
+    check("and the QA migration date is stamped", bool(qa["qa_migration_date"]), True)
     check("status moves to in QA", qa["status"], "in_qa")
 
     refused("devops cannot declare it ready for prod",
             lambda: migrations.apply_changes(settings, store, DEVOPS, sl, {"ready_for_prod": "Yes"}),
             contains="approver role")
 
-    ready = migrations.apply_changes(settings, store, APPROVER, sl, {"ready_for_prod": "Yes"})
+    ready = migrations.apply_changes(
+        settings, store, APPROVER, sl,
+        {"ready_for_prod": "Yes", "prod_date_planned": "2026-11-03"},
+    )
     check("the approver marks it ready after testing", ready["status"], "ready_for_prod")
+    check("the prod approval records who", ready["prod_approved_by"], "lead@example.com")
+    check("and when", bool(ready["prod_date_approved"]), True)
+    check("and keeps the planned prod date", ready["prod_date_planned"], "2026-11-03")
 
     prod = migrations.apply_changes(
         settings, store, DEVOPS, sl, {"executed_in_prod": "Yes", "prod_migration_remarks": "Done 02:10"}
@@ -331,9 +426,25 @@ def test_workflow(root: Path) -> None:
     check("and who did it is recorded", prod["prod_migrated_by"], "ops@example.com")
     check("status reaches in prod", prod["status"], "in_prod")
 
-    # Withdrawing an approval must not leave its evidence behind.
-    withdrawn = migrations.apply_changes(settings, store, APPROVER, sl, {"approved_by": ""})
-    check("withdrawing an approval clears its date", withdrawn["date_approved"], "")
+    # Undoing an approval after the migration has happened would reopen the
+    # request for editing — of a change already running in production.
+    refused("the QA approval cannot be withdrawn once QA has run",
+            lambda: migrations.apply_changes(settings, store, APPROVER, sl, {"ready_for_qa": "No"}),
+            contains="already been migrated to QA")
+    refused("nor the prod approval once prod has run",
+            lambda: migrations.apply_changes(settings, store, APPROVER, sl, {"ready_for_prod": "No"}),
+            contains="already been migrated to production")
+
+    # On a record where nothing has happened yet, withdrawing is fine.
+    undo = migrations.create_record(settings, store, DEV, dict(GOOD_REQUEST))
+    migrations.apply_changes(settings, store, APPROVER, undo["sl_no"], {"ready_for_qa": "Yes"})
+    withdrawn = migrations.apply_changes(settings, store, APPROVER, undo["sl_no"], {"ready_for_qa": "No"})
+    check("withdrawing the QA approval clears who approved it", withdrawn["approved_by"], "")
+    check("and its date", withdrawn["date_approved"], "")
+    check("and reopens the request", withdrawn["status"], "submitted")
+    check("so it can be edited again",
+          migrations.apply_changes(settings, store, DEV, undo["sl_no"],
+                                   {"reason": "revised"})["reason"], "revised")
 
     # Conditional requirements apply to edits too, not just creation.
     fresh = migrations.create_record(
@@ -361,12 +472,17 @@ def test_workflow(root: Path) -> None:
     check("a developer sees only their request fields",
           migrations.editable_fields(DEV, store.get(fresh["sl_no"])),
           list(migrations.REQUEST_KEYS))
+    check("an approver sees the QA approval fields",
+          migrations.editable_fields(APPROVER, store.get(fresh["sl_no"])),
+          list(migrations.REQUEST_KEYS) + ["ready_for_qa", "qa_date_planned"])
     check("devops sees nothing on an unapproved record",
           migrations.editable_fields(DEVOPS, store.get(fresh["sl_no"])), [])
 
     entries = store.audit(sl)
     check("the audit trail records the approval",
           any(e["field"] == "approved_by" and e["new_value"] == "lead@example.com" for e in entries), True)
+    check("and the switch that caused it",
+          any(e["field"] == "ready_for_qa" and e["new_value"] == "Yes" for e in entries), True)
     check("it records who did it",
           any(e["field"] == "executed_in_prod" and e["who"] == "ops@example.com" for e in entries), True)
     check("it keeps the previous value",
@@ -381,7 +497,7 @@ def test_workflow(root: Path) -> None:
 def test_freeze(root: Path) -> None:
     print("\n=== freeze windows ===")
     settings = build_settings()
-    store = MigrationStore(root / "freeze.sqlite3")
+    store = store_for(root, "freeze.sqlite3")
     record = migrations.create_record(settings, store, DEV, dict(GOOD_REQUEST))
     sl = record["sl_no"]
 
@@ -446,13 +562,13 @@ def test_sheet() -> None:
     page.append(["Rel#", "Migration Path", "Micro Service Name", "Repo Name",
                  "Track Lead Name", "Change Requestor", "Code & Image Change?", "Commit Hash"])
     page.append(["R2026.09", "SIT to QA", "payments", "demo/payments", "A. Kumar",
-                 "Business Ops", "Yes", "a1b2c3d"])
+                 "E1001", "Yes", "a1b2c3d"])
     page.append(["R2026.09", "SIT to QA", "cart", "demo/cart", "R. Iyer",
-                 "Business Ops", "yes", ""])           # missing the required hash
+                 "E1001", "yes", ""])           # missing the required hash
     page.append(["R1999.01", "SIT to QA", "payments", "demo/payments", "A. Kumar",
-                 "Business Ops", "No", ""])            # release not in the list
+                 "E1001", "No", ""])            # release not in the list
     page.append(["R2026.09", "SIT to QA", "payments", "demo/cart", "A. Kumar",
-                 "Business Ops", "No", ""])            # repo of another microservice
+                 "E1001", "No", ""])            # repo of another microservice
     page.append([None, None, None])                    # blank row, skipped
 
     import io
@@ -479,12 +595,121 @@ def test_sheet() -> None:
             contains="more than")
 
 
+def test_permissions() -> None:
+    """What the UI is told it may do — decided here, not in JavaScript."""
+    print("\n=== permissions ===")
+    from app.migrations import permissions
+
+    anon = permissions(User(""))
+    check("anonymous cannot raise", anon["can_raise"], False)
+    check("and is told why", anon["why_not_raise"], "You are not signed in.")
+
+    stranger = permissions(User("x@y.com", frozenset()))
+    check("an unmapped address cannot raise", stranger["can_raise"], False)
+    check("and is pointed at config.yaml", "config.yaml" in stranger["why_not_raise"], True)
+
+    check("a developer can raise", permissions(DEV)["can_raise"], True)
+    check("but cannot retire", permissions(DEV)["can_retire"], False)
+    check("an approver can do both",
+          (permissions(APPROVER)["can_raise"], permissions(APPROVER)["can_retire"]), (True, True))
+
+    devops = permissions(DEVOPS)
+    check("devops alone cannot raise", devops["can_raise"], False)
+    check("and the message names what they hold", "devops" in devops["why_not_raise"], True)
+
+    # The bug this replaced: the UI looked for "developer" in the role list, so
+    # an admin — who holds none of the three — saw the button greyed out.
+    admin = permissions(User("boss@y.com", frozenset({"admin"})))
+    check("an admin can raise without holding developer", admin["can_raise"], True)
+    check("and can retire", admin["can_retire"], True)
+    check("and freeze", admin["can_freeze"], True)
+    check("with nothing to explain", admin["why_not_raise"], "")
+
+
+def test_employees(root: Path) -> None:
+    """Change Requestor comes from the employee list, and defaults to you."""
+    print("\n=== employees as change requestors ===")
+    from app.reference import ReferenceStore
+
+    settings = build_settings()
+    cfg = settings.migrations
+
+    check("the requestor list is the employees",
+          migrations.option_lists(cfg)["change_requestors"],
+          ["E1001 - Jane Doe", "E1002 - John Roe", "E1003 - Amy Poe"])
+    check("a signed-in address maps to its employee",
+          cfg.employee_for("dev@example.com").label, "E1001 - Jane Doe")
+    check("case does not matter", cfg.employee_for("DEV@Example.com").number, "E1001")
+    check("an unmapped address maps to nobody", cfg.employee_for("ops@example.com"), None)
+    check("nor does a blank one", cfg.employee_for(""), None)
+
+    # A sheet may hold the number alone, or a different dash.
+    check("a number resolves to the label",
+          migrations.clean_requestor("E1002", cfg), "E1002 - John Roe")
+    check("so does a name", migrations.clean_requestor("amy poe", cfg), "E1003 - Amy Poe")
+    check("an em dash is tolerated",
+          migrations.clean_requestor("E1001 — Jane Doe", cfg), "E1001 - Jane Doe")
+    check("the canonical label passes through",
+          migrations.clean_requestor("E1001 - Jane Doe", cfg), "E1001 - Jane Doe")
+    check("something unknown is left alone, to be rejected",
+          migrations.clean_requestor("Somebody", cfg), "Somebody")
+    check("and is rejected",
+          "change_requestor" in migrations.validate({"change_requestor": "Somebody"}, cfg, partial=True),
+          True)
+
+    # A record stores the resolved label whatever was typed.
+    store = store_for(root, "employees.sqlite3")
+    row = migrations.create_record(settings, store, DEV,
+                                   {**GOOD_REQUEST, "change_requestor": "E1003"})
+    check("a record stores the canonical label", row["change_requestor"], "E1003 - Amy Poe")
+
+    # With no employees configured the old plain list still works.
+    plain = build_settings()
+    plain.migrations.employees = []
+    check("without employees the old list is used",
+          migrations.option_lists(plain.migrations)["change_requestors"],
+          ["Business Ops", "Release Mgmt"])
+    check("and a value from it is left as typed",
+          migrations.clean_requestor("Business Ops", plain.migrations), "Business Ops")
+
+    # The reference store keeps them.
+    ref = ReferenceStore(database_for(root, "empref.sqlite3"))
+    ref.seed(cfg)
+    check("employees are seeded", [e.number for e in ref.snapshot(fresh=True).employees],
+          ["E1001", "E1002", "E1003"])
+    live = ref.save_employee("E1004", "Kay Singh", "kay@example.com")
+    check("one can be added", live.employees[-1].label, "E1004 - Kay Singh")
+    live = ref.save_employee("E1004", "Kay Singh-Patel", "kay@example.com")
+    check("and edited in place", live.employees[-1].name, "Kay Singh-Patel")
+    check("without duplicating", len([e for e in live.employees if e.number == "E1004"]), 1)
+    live = ref.save_employee("E9004", "Kay Singh-Patel", "kay@example.com", rename_from="E1004")
+    check("renumbering keeps one entry", [e.number for e in live.employees][-1], "E9004")
+    refused("renumbering onto an existing number is refused",
+            lambda: ref.save_employee("E1001", "x", "", rename_from="E9004"),
+            contains="already an employee")
+    live = ref.delete_employee("E9004")
+    check("and one can be removed", "E9004" in [e.number for e in live.employees], False)
+    refused("an employee needs a number",
+            lambda: ref.save_employee("  ", "No Number", ""), contains="needs a number")
+    refused("deleting an unknown one is refused",
+            lambda: ref.delete_employee("E0000"), contains="No employee")
+
+
 def test_spec() -> None:
     print("\n=== the field contract ===")
     spec = migrations.field_spec()
     check("every field is published", len(spec), len(migrations.FIELDS))
-    # 27 from the specification, plus prod_migrated_by for symmetry with QA Migrated By.
-    check("all 28 fields are present", len(migrations.FIELDS), 28)
+    check("every field is accounted for", len(migrations.FIELDS), 33)
+    check("the stage headings cover every stage",
+          sorted(migrations.STAGE_TITLES), sorted({f.stage for f in migrations.FIELDS}))
+    check("QA approval is named as such", migrations.STAGE_TITLES["approval"], "QA Approval")
+    check("and prod approval too", migrations.STAGE_TITLES["prod_gate"], "Prod Approval")
+    check("approved by is filled in, not chosen", migrations.BY_KEY["approved_by"].kind, "auto")
+    check("so is the prod one", migrations.BY_KEY["prod_approved_by"].kind, "auto")
+    check("the planned QA date says what it plans",
+          migrations.BY_KEY["qa_date_planned"].label, "QA Migration Date Planned")
+    check("and the prod one is enterable",
+          migrations.BY_KEY["prod_date_planned"].roles, ("approver",))
     check("four fields carry the amber flag", len(migrations.AMBER_KEYS), 4)
     check("the amber fields are the risk ones", sorted(migrations.AMBER_KEYS),
           ["code_image_change", "ddl_dml", "env_change", "env_secret"])
@@ -496,6 +721,11 @@ def test_spec() -> None:
     check("created by is auto", migrations.BY_KEY["created_by"].kind, "auto")
     check("date approved is auto", migrations.BY_KEY["date_approved"].kind, "auto")
     check("QA migrated by is auto", migrations.BY_KEY["qa_migrated_by"].kind, "auto")
+    check("QA migration date is auto", migrations.BY_KEY["qa_migration_date"].kind, "auto")
+    check("it comes before QA migrated by",
+          [f.key for f in migrations.FIELDS].index("qa_migration_date")
+          < [f.key for f in migrations.FIELDS].index("qa_migrated_by"), True)
+    check("prod date approved is auto", migrations.BY_KEY["prod_date_approved"].kind, "auto")
     check("prod migration date is auto", migrations.BY_KEY["prod_migration_date"].kind, "auto")
 
 
@@ -509,7 +739,7 @@ async def test_http(root: Path) -> None:
     template = build_settings()
     M.settings.migrations = template.migrations
     M.settings.auth = template.auth
-    M.settings.migration_store_path = root / "http.sqlite3"
+    M.settings.database_url = database_for(root, "http.sqlite3").url
 
     def client(email: str | None, peer: str = "127.0.0.1") -> httpx.AsyncClient:
         headers = {"X-Forwarded-Email": email} if email else {}
@@ -543,13 +773,12 @@ async def test_http(root: Path) -> None:
             check("the response says what they may edit next",
                   sorted(r.json()["editable"]), sorted(migrations.REQUEST_KEYS))
 
-            r = await c.patch(f"/api/migrations/records/{sl}",
-                              json={"approved_by": "lead@example.com"})
+            r = await c.patch(f"/api/migrations/records/{sl}", json={"ready_for_qa": "Yes"})
             check("but cannot approve it", r.status_code, 403)
             check("and is told which role that needs",
                   "approver" in r.json()["detail"], True)
             check("naming the field, so the form can mark it",
-                  list(r.json()["fields"]), ["approved_by"])
+                  list(r.json()["fields"]), ["ready_for_qa"])
 
             # A 28-field form has to say which fields are wrong, not just that
             # something is — the client marks the controls from this.
@@ -580,14 +809,21 @@ async def test_http(root: Path) -> None:
 
         async with client("lead@example.com") as c:
             r = await c.patch(f"/api/migrations/records/{sl}",
-                              json={"approved_by": "lead@example.com", "qa_date_planned": "2026-10-02"})
+                              json={"ready_for_qa": "Yes", "qa_date_planned": "2026-10-02"})
             check("an approver can approve", r.status_code, 200)
+            check("who approved it is filled in", r.json()["approved_by"], "lead@example.com")
             check("the approval is dated automatically", bool(r.json()["date_approved"]), True)
 
         async with client("ops@example.com") as c:
             r = await c.patch(f"/api/migrations/records/{sl}", json={"executed_in_qa": "Yes"})
             check("devops can then record QA", r.status_code, 200)
             check("and is recorded as having done it", r.json()["qa_migrated_by"], "ops@example.com")
+            check("with the migration dated", bool(r.json()["qa_migration_date"]), True)
+
+            # The headings the form renders come from the server.
+            stages = {s["key"]: s["label"] for s in (await c.get("/api/migrations/meta")).json()["stages"]}
+            check("the approval stage is named QA Approval", stages["approval"], "QA Approval")
+            check("and the prod gate is named Prod Approval", stages["prod_gate"], "Prod Approval")
 
         # --- the spreadsheet round trip ---
         async with client("dev@example.com") as c:
@@ -604,8 +840,10 @@ async def test_http(root: Path) -> None:
             page = book.active
             page.append(["Rel#", "Migration Path", "Micro Service Name", "Repo Name",
                          "Track Lead Name", "Change Requestor"])
-            page.append(["R2026.09", "SIT to QA", "cart", "demo/cart", "R. Iyer", "Business Ops"])
-            page.append(["R2026.09", "SIT to QA", "cart", "demo/payments", "R. Iyer", "Business Ops"])
+            # The requestor column carries just the employee number, as a real
+            # sheet usually would; the server resolves it to the full label.
+            page.append(["R2026.09", "SIT to QA", "cart", "demo/cart", "R. Iyer", "E1001"])
+            page.append(["R2026.09", "SIT to QA", "cart", "demo/payments", "R. Iyer", "E1001"])
             buffer = io.BytesIO()
             book.save(buffer)
             upload = {"file": ("plan.xlsx", buffer.getvalue(),
@@ -619,7 +857,10 @@ async def test_http(root: Path) -> None:
             check("nothing was created", body["created"], [])
 
             r = await c.post("/api/migrations/upload", files=upload, data={"commit": "true"})
-            check("committing imports only the valid rows", len(r.json()["created"]), 1)
+            created = r.json()["created"]
+            check("committing imports only the valid rows", len(created), 1)
+            check("and the employee number became the full label",
+                  created[0]["change_requestor"], "E1001 - Jane Doe")
 
             # Sorting and the date range, as the tab sends them.
             r = await c.get("/api/migrations/records?sort=date_created&dir=asc")
@@ -649,9 +890,9 @@ async def test_http(root: Path) -> None:
 
             r = await c.get("/api/migrations/export.csv")
             check("the register exports as CSV", r.status_code, 200)
-            # Every field, plus the derived Status and Active columns.
+            # Every field, plus Status, Active, Archived and Archived By.
             check("with a header naming every field",
-                  r.text.splitlines()[0].count(",") + 1, len(migrations.FIELDS) + 2)
+                  r.text.splitlines()[0].count(",") + 1, len(migrations.FIELDS) + 4)
 
             # The export must agree with the screen, or the two disagree silently.
             query = "sort=date_created&dir=asc&created_from=2000-01-01"
@@ -680,6 +921,30 @@ async def test_http(root: Path) -> None:
         async with client("ops@example.com") as c:
             r = await c.patch(f"/api/migrations/records/{sl}", json={"qa_migration_remarks": "x"})
             check("and so is an edit, whatever the role", r.status_code, 423)
+            r = await c.post("/api/migrations/records/execute",
+                             json={"sl_nos": [sl], "stage": "qa"})
+            # The role is checked before the freeze: telling someone it is frozen
+            # when they could never do it anyway would be misleading.
+            check("bulk execution is refused for its own role's reason", r.status_code, 423)
+
+        async with client("lead@example.com") as c:
+            # Retiring a record is a change to it, so the freeze must cover it —
+            # deleting already was refused, this was the gap.
+            r = await c.post(f"/api/migrations/records/{sl}/active", json={"active": False})
+            check("deactivating is refused while frozen", r.status_code, 423)
+            r = await c.post("/api/migrations/records/approve",
+                             json={"sl_nos": [sl], "stage": "qa"})
+            check("so is bulk approval", r.status_code, 423)
+
+            # The register still reads, and reports that nothing may be changed.
+            listing = (await c.get("/api/migrations/records")).json()
+            check("the register is still readable", listing["count"] > 0, True)
+            check("but no field is offered as editable",
+                  all(not r_["editable"] for r_ in listing["rows"]), True)
+            meta = (await c.get("/api/migrations/meta")).json()
+            check("and meta says it is frozen", meta["frozen"], True)
+            check("while the lists remain readable",
+                  (await c.get("/api/migrations/lists")).status_code, 200)
 
         async with client("dev@example.com") as c:
             r = await c.delete(f"/api/migrations/freezes/{freeze_id}")
@@ -699,6 +964,103 @@ async def test_http(root: Path) -> None:
             check("an unmapped address can still read", r.status_code, 200)
             r = await c.post("/api/migrations/records", json=dict(GOOD_REQUEST))
             check("but cannot write", r.status_code, 403)
+
+        # --- bulk approval, over the wire ---
+        async with client("dev@example.com") as c:
+            batch = [(await c.post("/api/migrations/records", json=dict(GOOD_REQUEST))).json()["sl_no"]
+                     for _ in range(3)]
+            r = await c.post("/api/migrations/records/approve",
+                             json={"sl_nos": batch, "stage": "qa"})
+            check("a developer cannot bulk approve", r.status_code, 403)
+
+        async with client("lead@example.com") as c:
+            r = await c.post("/api/migrations/records/approve",
+                             json={"sl_nos": batch, "stage": "qa"})
+            check("an approver can", r.status_code, 200)
+            check("and all three move", len(r.json()["approved"]), 3)
+            check("with nothing skipped", r.json()["skipped"], [])
+
+            # "approve" must not be read as a record number by the {sl_no} route.
+            check("the route is not mistaken for a record id",
+                  (await c.get("/api/migrations/records/approve/audit")).status_code, 422)
+
+            r = await c.post("/api/migrations/records/approve",
+                             json={"sl_nos": batch, "stage": "prod"})
+            check("prod approval waits for the QA migration", len(r.json()["approved"]), 0)
+            check("and says so for each", len(r.json()["skipped"]), 3)
+
+            r = await c.post("/api/migrations/records/approve",
+                             json={"sl_nos": ["x"], "stage": "qa"})
+            check("a non-numeric selection is refused", r.status_code, 422)
+            r = await c.post("/api/migrations/records/approve", json={"sl_nos": [], "stage": "qa"})
+            check("an empty selection is refused", r.status_code, 422)
+
+            meta = (await c.get("/api/migrations/meta")).json()
+            check("an approver is offered the bulk controls",
+                  meta["permissions"]["can_approve"], True)
+
+        async with client("ops@example.com") as c:
+            for sl in batch:
+                await c.patch(f"/api/migrations/records/{sl}", json={"executed_in_qa": "Yes"})
+        async with client("lead@example.com") as c:
+            r = await c.post("/api/migrations/records/approve",
+                             json={"sl_nos": batch, "stage": "prod"})
+            check("once QA has run they can all go to prod", len(r.json()["approved"]), 3)
+            check("attributed to the approver",
+                  {x["prod_approved_by"] for x in r.json()["approved"]}, {"lead@example.com"})
+
+        async with client("dev@example.com") as c:
+            meta = (await c.get("/api/migrations/meta")).json()
+            check("a developer is not offered them", meta["permissions"]["can_approve"], False)
+
+        # --- archiving, over the wire ---
+        async with client("dev@example.com") as c:
+            keep_sl = (await c.post("/api/migrations/records", json=dict(GOOD_REQUEST))).json()["sl_no"]
+            r = await c.post("/api/migrations/records/archive", json={"sl_nos": [keep_sl]})
+            check("a developer cannot archive", r.status_code, 403)
+        async with client("ops@example.com") as c:
+            r = await c.post("/api/migrations/records/archive", json={"sl_nos": [keep_sl]})
+            check("nor devops", r.status_code, 403)
+
+        async with client("lead@example.com") as c:
+            r = await c.post("/api/migrations/records/archive", json={"sl_nos": [keep_sl]})
+            check("an approver can, but only finished work", r.json()["archived"], [])
+            check("and is told why", r.json()["skipped"][0]["reason"],
+                  "Not migrated to production yet.")
+            check("archiving is advertised in permissions",
+                  (await c.get("/api/migrations/meta")).json()["permissions"]["can_archive"], True)
+
+            await c.patch(f"/api/migrations/records/{keep_sl}", json={"ready_for_qa": "Yes"})
+        async with client("ops@example.com") as c:
+            await c.patch(f"/api/migrations/records/{keep_sl}", json={"executed_in_qa": "Yes"})
+        async with client("lead@example.com") as c:
+            await c.patch(f"/api/migrations/records/{keep_sl}", json={"ready_for_prod": "Yes"})
+        async with client("ops@example.com") as c:
+            await c.patch(f"/api/migrations/records/{keep_sl}", json={"executed_in_prod": "Yes"})
+
+        async with client("lead@example.com") as c:
+            before = (await c.get("/api/migrations/records")).json()["count"]
+            r = await c.post("/api/migrations/records/archive", json={"sl_nos": [keep_sl]})
+            check("once in production it archives", len(r.json()["archived"]), 1)
+            check("the register loses it",
+                  (await c.get("/api/migrations/records")).json()["count"], before - 1)
+            archive = (await c.get("/api/migrations/records?archived=true")).json()
+            check("and the archive gains it",
+                  keep_sl in [x["sl_no"] for x in archive["rows"]], True)
+            check("with nothing editable on it",
+                  all(not x["editable"] for x in archive["rows"]), True)
+
+            r = await c.patch(f"/api/migrations/records/{keep_sl}", json={"ready_for_qa": "No"})
+            check("an archived record refuses edits over HTTP", r.status_code, 409)
+            r = await c.delete(f"/api/migrations/records/{keep_sl}")
+            check("and refuses deletion", r.status_code, 409)
+            r = await c.post(f"/api/migrations/records/{keep_sl}/active", json={"active": False})
+            check("and refuses deactivation", r.status_code, 409)
+
+            csv_archived = (await c.get("/api/migrations/export.csv?archived=true")).text
+            check("the archive exports too", len(csv_archived.splitlines()), 2)
+            r = await c.post("/api/migrations/records/archive", json={"sl_nos": []})
+            check("an empty selection is refused", r.status_code, 422)
 
         # --- retiring and deleting, over the wire ---
         async with client("dev@example.com") as c:
@@ -735,7 +1097,8 @@ async def test_http(root: Path) -> None:
             check("and can be brought back", r.json()["active"], True)
 
             csv_text = (await c.get("/api/migrations/export.csv")).text
-            check("the CSV gains an Active column", csv_text.splitlines()[0].endswith(",Active"), True)
+            check("the CSV gains an Active column", ",Active," in csv_text.splitlines()[0], True)
+            check("and an Archived one", csv_text.splitlines()[0].endswith(",Archived By"), True)
 
             r = await c.delete(f"/api/migrations/records/{drop}")
             check("an approver can delete", r.status_code, 200)
@@ -778,7 +1141,7 @@ async def test_http_dev(root: Path) -> None:
     M.settings.auth.trusted_proxies = []
     M.settings.auth.dev_mode = True
     M.settings.auth.dev_user = "dev@example.com"
-    M.settings.migration_store_path = root / "dev.sqlite3"
+    M.settings.database_url = database_for(root, "dev.sqlite3").url
 
     def client(peer: str = "127.0.0.1", cookies=None) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -806,7 +1169,7 @@ async def test_http_dev(root: Path) -> None:
             sl = r.json()["sl_no"]
             check("recorded against them", r.json()["created_by"], "dev@example.com")
 
-            r = await c.patch(f"/api/migrations/records/{sl}", json={"approved_by": "lead@example.com"})
+            r = await c.patch(f"/api/migrations/records/{sl}", json={"ready_for_qa": "Yes"})
             check("and cannot approve, being only a developer", r.status_code, 403)
 
         # Switching identity is a cookie away — no restart, no config edit.
@@ -814,8 +1177,9 @@ async def test_http_dev(root: Path) -> None:
             meta = (await c.get("/api/migrations/meta")).json()
             check("the cookie switches who you are", meta["user"]["email"], "lead@example.com")
             check("with the approver role", "approver" in meta["user"]["roles"], True)
-            r = await c.patch(f"/api/migrations/records/{sl}", json={"approved_by": "lead@example.com"})
+            r = await c.patch(f"/api/migrations/records/{sl}", json={"ready_for_qa": "Yes"})
             check("who can then approve", r.status_code, 200)
+            check("and is recorded as the approver", r.json()["approved_by"], "lead@example.com")
 
             # A download is a plain navigation, so it must ride on the cookie too.
             r = await c.get("/api/migrations/export.csv")
@@ -851,9 +1215,8 @@ def test_sorting_and_dates(root: Path) -> None:
     """The created date, the orderings it enables, and the range filter."""
     print("\n=== sorting and the created date ===")
     settings = build_settings()
-    store = MigrationStore(root / "sorting.sqlite3")
+    store = store_for(root, "sorting.sqlite3")
 
-    import sqlite3
     from datetime import datetime as dt, timezone as tz
 
     def at(iso: str) -> float:
@@ -871,11 +1234,12 @@ def test_sorting_and_dates(root: Path) -> None:
         made.append((row["sl_no"], when))
 
     # create_record stamps "now"; rewrite the stamps so the order is knowable.
-    conn = sqlite3.connect(store.path)
-    for sl, when in made:
-        conn.execute("UPDATE migrations SET date_created = ? WHERE sl_no = ?", (str(at(when)), sl))
-    conn.commit()
-    conn.close()
+    def restamp(pairs):
+        with store.db.connect() as conn:
+            for sl, value in pairs:
+                conn.execute("UPDATE migrations SET date_created = ? WHERE sl_no = ?", (value, sl))
+
+    restamp([(sl, str(at(when))) for sl, when in made])
 
     check("the epoch is published for sorting",
           isinstance(store.get(1)["date_created_epoch"], float), True)
@@ -892,23 +1256,17 @@ def test_sorting_and_dates(root: Path) -> None:
 
     # Status ordering should follow the workflow, not the alphabet: "Approved"
     # would otherwise sort before "Awaiting approval".
-    migrations.apply_changes(settings, store, APPROVER, 1, {"approved_by": "lead@example.com"})
+    migrations.apply_changes(settings, store, APPROVER, 1, {"ready_for_qa": "Yes"})
     check("status sorts along the workflow",
           [r["status"] for r in store.list(sort="status", direction="asc")],
           ["submitted", "submitted", "approved"])
 
     # A row with no date must not float to the top of a newest-first sort.
-    conn = sqlite3.connect(store.path)
-    conn.execute("UPDATE migrations SET date_created = '' WHERE sl_no = 2")
-    conn.commit()
-    conn.close()
+    restamp([(2, "")])
     check("an undated row sorts as oldest", order(sort="date_created", direction="desc")[-1], 2)
     check("and is not dropped", len(order(sort="date_created")), 3)
 
-    conn = sqlite3.connect(store.path)
-    conn.execute("UPDATE migrations SET date_created = ? WHERE sl_no = 2", (str(at("2026-09-05T10:00:00")),))
-    conn.commit()
-    conn.close()
+    restamp([(2, str(at("2026-09-05T10:00:00")))])
 
     check("a from-date excludes earlier rows",
           order(created_from=at("2026-09-03T00:00:00")), [3, 2])
@@ -929,7 +1287,7 @@ def test_retire_and_delete(root: Path) -> None:
     print("\n=== inactive records and deletion ===")
     settings = build_settings()
     settings.auth.roles["admin"] = ["boss@example.com"]
-    store = MigrationStore(root / "retire.sqlite3")
+    store = store_for(root, "retire.sqlite3")
 
     ADMIN = User("boss@example.com", frozenset({"admin"}))
 
@@ -955,7 +1313,7 @@ def test_retire_and_delete(root: Path) -> None:
 
     refused("an inactive record cannot be edited",
             lambda: migrations.apply_changes(settings, store, APPROVER, first["sl_no"],
-                                             {"approved_by": "lead@example.com"}),
+                                             {"ready_for_qa": "Yes"}),
             contains="inactive")
     check("and offers nothing to edit",
           migrations.editable_fields(APPROVER, store.get(first["sl_no"])), [])
@@ -999,7 +1357,7 @@ def test_retire_and_delete(root: Path) -> None:
     conn.commit()
     conn.close()
 
-    reopened = MigrationStore(legacy)
+    reopened = MigrationStore(Database(f"sqlite:///{legacy}"))
     check("an older database gains the column on open",
           "active" in {r[1] for r in sqlite3.connect(legacy).execute("PRAGMA table_info(migrations)")},
           True)
@@ -1007,7 +1365,627 @@ def test_retire_and_delete(root: Path) -> None:
     check("so they are still listed", len(reopened.list()), 1)
 
 
+def test_microservice_file(root: Path) -> None:
+    """Reading the microservice → repo → track lead map from a file."""
+    print("\n=== the microservice file ===")
+    from app.config import MigrationConfig, load_microservices
+
+    path = root / "services.csv"
+    path.write_text(
+        "Micro Service Name,Repo Name,Track Lead Name\n"
+        "payments,demo/payments,A. Kumar\n"
+        "payments,demo/payments-ui,A. Kumar\n"
+        "cart,demo/cart,R. Iyer\n"
+        "cart,demo/cart,S. Rao\n"
+    )
+    services, problem = load_microservices(path)
+    check("a clean file reads without complaint", problem, "")
+    check("one entry per microservice", [s.name for s in services], ["payments", "cart"])
+    check("repos accumulate across rows", services[0].repos, ["demo/payments", "demo/payments-ui"])
+    check("so do track leads", services[1].track_leads, ["R. Iyer", "S. Rao"])
+    check("a repeated repo is not listed twice", services[1].repos, ["demo/cart"])
+
+    # Real files are not tidy.
+    messy = root / "messy.csv"
+    messy.write_text(
+        "Microservice map — October\n"
+        "\n"
+        "MS,Repository,Lead\n"
+        "  payments  ,demo/payments ; demo/payments-api,  A. Kumar \n"
+        ",,\n"
+        "Cart,demo/cart,R. Iyer\n"
+    )
+    services, problem = load_microservices(messy)
+    check("a title row above the header is tolerated", problem, "")
+    check("and shorter column names are recognised", [s.name for s in services], ["payments", "Cart"])
+    check("whitespace is trimmed", services[0].track_leads, ["A. Kumar"])
+    check("several repos in one cell are split", services[0].repos, ["demo/payments", "demo/payments-api"])
+    check("a blank row is skipped", len(services), 2)
+
+    # Case differences should not create a second service.
+    dupes = root / "dupes.csv"
+    dupes.write_text("MS,Repo,Lead\npayments,demo/a,A\nPayments,demo/b,B\n")
+    services, _ = load_microservices(dupes)
+    check("case does not split a service in two", len(services), 1)
+    check("its rows are merged", services[0].repos, ["demo/a", "demo/b"])
+    check("keeping the first spelling seen", services[0].name, "payments")
+
+    # Failures are reported, never raised.
+    services, problem = load_microservices(root / "absent.csv")
+    check("a missing file is reported", bool(problem), True)
+    check("and names the path", "absent.csv" in problem, True)
+    check("returning no services rather than throwing", services, [])
+
+    headerless = root / "headerless.csv"
+    headerless.write_text("just,some,values\n1,2,3\n")
+    services, problem = load_microservices(headerless)
+    check("a file with no usable header is reported", bool(problem), True)
+    check("and says what column it wanted", "Micro Service Name" in problem, True)
+
+    empty = root / "empty.csv"
+    empty.write_text("Micro Service Name,Repo Name,Track Lead Name\n")
+    services, problem = load_microservices(empty)
+    check("a header with no rows is reported", "no row had a microservice" in problem, True)
+    check("and no services come back problem-free", (services, bool(problem)), ([], True))
+
+    # xlsx works too, since it is the same reader as the upload tab.
+    from openpyxl import Workbook
+
+    book = Workbook()
+    book.active.append(["Micro Service Name", "Repo Name", "Track Lead Name"])
+    book.active.append(["billing", "demo/billing", "T. Nair"])
+    xlsx = root / "services.xlsx"
+    book.save(xlsx)
+    services, problem = load_microservices(xlsx)
+    check("a workbook is accepted as well", [s.name for s in services], ["billing"])
+
+    # --- hot reload -----------------------------------------------------------
+    cfg = MigrationConfig(
+        enabled=True,
+        microservices_file=path,
+        inline_microservices=[Microservice("fallback", ["demo/fb"], ["Nobody"])],
+    )
+    cfg.refresh()
+    check("the file wins over the inline list", [s.name for s in cfg.microservices],
+          ["payments", "cart"])
+
+    path.write_text("MS,Repo,Lead\nledger,demo/ledger,P. Das\n")
+    cfg.refresh()
+    check("editing the file is picked up without a restart",
+          [s.name for s in cfg.microservices], ["ledger"])
+    check("and no error is left behind", cfg.services_error, "")
+
+    path.unlink()
+    cfg.refresh()
+    check("if it disappears the problem is reported", bool(cfg.services_error), True)
+    check("and the inline list is used rather than nothing",
+          [s.name for s in cfg.microservices], ["fallback"])
+
+    # With no file configured, refresh must leave the inline list alone.
+    plain = MigrationConfig(enabled=True, microservices=[Microservice("only", [], [])])
+    plain.refresh()
+    check("no file means nothing changes", [s.name for s in plain.microservices], ["only"])
+    check("and no error is invented", plain.services_error, "")
+
+
+def test_bulk_approval(root: Path) -> None:
+    """Approving many records at once, through the same rules as approving one."""
+    print("\n=== bulk approval ===")
+    settings = build_settings()
+    store = store_for(root, "bulk.sqlite3")
+
+    made = [migrations.create_record(settings, store, DEV, dict(GOOD_REQUEST))["sl_no"]
+            for _ in range(5)]
+    a, b, c, d, e = made
+
+    refused("a developer cannot bulk approve",
+            lambda: migrations.approve_many(settings, store, DEV, [a, b], "qa"),
+            contains="approver or admin role")
+    refused("nor devops",
+            lambda: migrations.approve_many(settings, store, DEVOPS, [a, b], "qa"),
+            contains="approver or admin role")
+    refused("an unknown stage is rejected",
+            lambda: migrations.approve_many(settings, store, APPROVER, [a], "staging"),
+            contains="not something that can be approved")
+    refused("an empty selection is rejected",
+            lambda: migrations.approve_many(settings, store, APPROVER, [], "qa"),
+            contains="No records were selected")
+    refused("more than the cap is rejected",
+            lambda: migrations.approve_many(settings, store, APPROVER,
+                                            list(range(migrations.MAX_BULK + 2)), "qa"),
+            contains="more than")
+
+    # The planned migration date is part of the approval, not a follow-up edit.
+    refused("a malformed planned date fails the batch, not each record",
+            lambda: migrations.approve_many(settings, store, APPROVER, [a, b], "qa", "02/10/2026"),
+            contains="YYYY-MM-DD")
+
+    out = migrations.approve_many(settings, store, APPROVER, [a, b, c], "qa", "2026-10-02")
+    check("the planned date is echoed back", out["planned"], "2026-10-02")
+    check("and named", out["planned_label"], "QA Migration Date Planned")
+    check("it is set on every approved record",
+          {r["qa_date_planned"] for r in out["approved"]}, {"2026-10-02"})
+    check("three are approved at once", len(out["approved"]), 3)
+    check("none is skipped", out["skipped"], [])
+    check("the count of what was asked is kept", out["requested"], 3)
+    check("each is now approved", {r["status"] for r in out["approved"]}, {"approved"})
+    check("and attributed to the approver",
+          {r["approved_by"] for r in out["approved"]}, {"lead@example.com"})
+    check("with a date on each", all(r["date_approved"] for r in out["approved"]), True)
+    check("the others are untouched", store.get(d)["status"], "submitted")
+
+    # The same call again should do nothing, and say so rather than silently.
+    again = migrations.approve_many(settings, store, APPROVER, [a, b], "qa")
+    check("re-approving does nothing", again["approved"], [])
+    check("and reports why", {s["reason"] for s in again["skipped"]}, {"Already approved."})
+
+    # Prod approval needs the QA migration to have happened.
+    out = migrations.approve_many(settings, store, APPROVER, [a, b], "prod")
+    check("prod approval is refused before QA has run", out["approved"], [])
+    check("naming the gate", {s["reason"] for s in out["skipped"]}, {"Not migrated to QA yet."})
+
+    migrations.apply_changes(settings, store, DEVOPS, a, {"executed_in_qa": "Yes"})
+    migrations.apply_changes(settings, store, DEVOPS, b, {"executed_in_qa": "Yes"})
+
+    # `a` has a planned date of its own, `b` has none. A blank bulk date must
+    # leave both as they are rather than clearing or inventing one.
+    migrations.apply_changes(settings, store, APPROVER, a, {"prod_date_planned": "2026-11-01"})
+
+    out = migrations.approve_many(settings, store, APPROVER, [a, b, c], "prod")
+    check("the ones that are ready go through",
+          sorted(r["sl_no"] for r in out["approved"]), sorted([a, b]))
+    check("a partial run does not stop at the first refusal", len(out["skipped"]), 1)
+    check("and the one that is not is named",
+          out["skipped"][0]["reason"], "Not migrated to QA yet.")
+    check("prod approval is attributed too",
+          {r["prod_approved_by"] for r in out["approved"]}, {"lead@example.com"})
+    check("a blank date leaves an existing one alone",
+          next(r["prod_date_planned"] for r in out["approved"] if r["sl_no"] == a), "2026-11-01")
+    check("and does not invent one for the others",
+          next(r["prod_date_planned"] for r in out["approved"] if r["sl_no"] == b), "")
+
+    # Mixed input: a missing record and an inactive one.
+    store.set_active(d, False, APPROVER)
+    out = migrations.approve_many(settings, store, APPROVER, [d, 9999, e], "qa")
+    check("an inactive record is skipped", 
+          next(s["reason"] for s in out["skipped"] if s["sl_no"] == d), "Inactive.")
+    check("a missing one is skipped", 
+          next(s["reason"] for s in out["skipped"] if s["sl_no"] == 9999), "No such record.")
+    check("while the good one still goes through", [r["sl_no"] for r in out["approved"]], [e])
+
+    # Duplicates in the selection must not double-apply.
+    f = migrations.create_record(settings, store, DEV, dict(GOOD_REQUEST))["sl_no"]
+    out = migrations.approve_many(settings, store, APPROVER, [f, f, f], "qa")
+    check("a repeated selection is collapsed", out["requested"], 1)
+    check("and approved once", len(out["approved"]), 1)
+    check("leaving one audit entry for the switch",
+          len([x for x in store.audit(f) if x["field"] == "ready_for_qa"]), 1)
+
+    # A freeze stops the lot, not one at a time.
+    now = time.time()
+    freeze = store.add_freeze(now - 60, now + 600, "window", APPROVER)
+    refused("a freeze stops the whole batch",
+            lambda: migrations.approve_many(settings, store, APPROVER, [e], "prod"),
+            contains="frozen")
+    store.delete_freeze(freeze["id"])
+
+    # Admin holds none of the three roles, but satisfies every check.
+    admin = User("boss@example.com", frozenset({"admin"}))
+    h = migrations.create_record(settings, store, DEV, dict(GOOD_REQUEST))["sl_no"]
+    out = migrations.approve_many(settings, store, admin, [h], "qa")
+    check("an admin can bulk approve as well", [r["sl_no"] for r in out["approved"]], [h])
+    check("and is recorded as the approver", out["approved"][0]["approved_by"], "boss@example.com")
+
+
+def test_bulk_execution(root: Path) -> None:
+    """DevOps recording several migrations at once — the same machinery."""
+    print("\n=== bulk execution ===")
+    settings = build_settings()
+    settings.auth.roles["admin"] = ["boss@elsewhere.com"]
+    store = store_for(root, "exec.sqlite3")
+    ADMIN = User("boss@elsewhere.com", frozenset({"admin"}))
+
+    made = [migrations.create_record(settings, store, DEV, dict(GOOD_REQUEST))["sl_no"]
+            for _ in range(4)]
+    a, b, c, d = made
+
+    # A stage that has not been reached is a skip with a reason, not an error:
+    # that is what makes a mixed batch usable.
+    early = migrations.execute_many(settings, store, DEVOPS, [a], "qa")
+    check("devops cannot record QA before approval", early["moved"], [])
+    check("and is told why", early["skipped"][0]["reason"], "Not approved for QA yet.")
+    refused("an approver cannot record a migration",
+            lambda: migrations.execute_many(settings, store, APPROVER, [a], "qa"),
+            contains="devops or admin role")
+    refused("nor a developer",
+            lambda: migrations.execute_many(settings, store, DEV, [a], "qa"),
+            contains="devops or admin role")
+
+    migrations.approve_many(settings, store, APPROVER, [a, b, c], "qa", "2026-10-02")
+
+    out = migrations.execute_many(settings, store, DEVOPS, [a, b, c, d], "qa", "Window 02:00-03:00")
+    check("the approved ones are recorded", sorted(r["sl_no"] for r in out["moved"]), sorted([a, b, c]))
+    check("the unapproved one is left", [s["sl_no"] for s in out["skipped"]], [d])
+    check("with the reason", out["skipped"][0]["reason"], "Not approved for QA yet.")
+    check("each is attributed to the operator",
+          {r["qa_migrated_by"] for r in out["moved"]}, {"ops@example.com"})
+    check("each is dated", all(r["qa_migration_date"] for r in out["moved"]), True)
+    check("the shared remarks land on all of them",
+          {r["qa_migration_remarks"] for r in out["moved"]}, {"Window 02:00-03:00"})
+    check("and are echoed back", out["remarks"], "Window 02:00-03:00")
+    check("the verb describes what happened", out["verb"], "record as migrated to QA")
+
+    again = migrations.execute_many(settings, store, DEVOPS, [a], "qa")
+    check("recording it twice does nothing", again["moved"], [])
+    check("and says it is already done", again["skipped"][0]["reason"], "Already recorded.")
+
+    # Prod execution waits for the prod approval, not just the QA migration.
+    refused_out = migrations.execute_many(settings, store, DEVOPS, [a, b], "prod")
+    check("prod execution waits for the prod approval", refused_out["moved"], [])
+    check("naming the gate",
+          {s["reason"] for s in refused_out["skipped"]}, {"Not marked ready for prod yet."})
+
+    migrations.approve_many(settings, store, APPROVER, [a, b], "prod", "2026-11-14")
+    out = migrations.execute_many(settings, store, DEVOPS, [a, b], "prod", "Prod window")
+    check("then both go through", len(out["moved"]), 2)
+    check("dated and attributed",
+          all(r["prod_migration_date"] and r["prod_migrated_by"] == "ops@example.com"
+              for r in out["moved"]), True)
+    check("with the shared remarks",
+          {r["prod_migration_remarks"] for r in out["moved"]}, {"Prod window"})
+    check("and they reach the end of the workflow",
+          {r["status"] for r in out["moved"]}, {"in_prod"})
+
+    # Blank remarks must not wipe what was written per record.
+    e = migrations.create_record(settings, store, DEV, dict(GOOD_REQUEST))["sl_no"]
+    migrations.approve_many(settings, store, APPROVER, [e], "qa")
+    migrations.execute_many(settings, store, DEVOPS, [e], "qa", "first note")
+    migrations.apply_changes(settings, store, DEVOPS, e, {"executed_in_qa": "No"})
+    out = migrations.execute_many(settings, store, DEVOPS, [e], "qa")
+    check("blank remarks leave an existing note alone",
+          out["moved"][0]["qa_migration_remarks"], "first note")
+
+    # An admin can do the devops actions too.
+    f = migrations.create_record(settings, store, DEV, dict(GOOD_REQUEST))["sl_no"]
+    migrations.approve_many(settings, store, ADMIN, [f], "qa")
+    out = migrations.execute_many(settings, store, ADMIN, [f], "qa")
+    check("an admin can record migrations", [r["sl_no"] for r in out["moved"]], [f])
+    check("attributed to them", out["moved"][0]["qa_migrated_by"], "boss@elsewhere.com")
+
+    now = time.time()
+    freeze = store.add_freeze(now - 60, now + 600, "window", APPROVER)
+    refused("a freeze stops bulk execution too",
+            lambda: migrations.execute_many(settings, store, DEVOPS, [d], "qa"),
+            contains="frozen")
+    store.delete_freeze(freeze["id"])
+
+    check("the roles each action needs are published",
+          (migrations.permissions(DEVOPS)["can_execute"],
+           migrations.permissions(DEVOPS)["can_approve"]), (True, False))
+    check("and the approver's are the other way round",
+          (migrations.permissions(APPROVER)["can_execute"],
+           migrations.permissions(APPROVER)["can_approve"]), (False, True))
+    check("an admin gets both",
+          (migrations.permissions(ADMIN)["can_execute"],
+           migrations.permissions(ADMIN)["can_approve"]), (True, True))
+
+
+def test_database_reachability(root: Path) -> None:
+    """A database that cannot be reached must say so clearly, and quickly."""
+    print("\n=== reaching the database ===")
+    from app.db import Database, DatabaseError
+
+    ok = Database(f"sqlite:///{root / 'fine.sqlite3'}")
+    ok.verify()
+    check("a good SQLite path verifies", True, True)
+
+    try:
+        Database("sqlite:////proc/nope/cannot-create.sqlite3").verify()
+        check("an impossible SQLite path is reported", "allowed", "rejected")
+    except (DatabaseError, OSError):
+        check("an impossible SQLite path is reported", "rejected", "rejected")
+
+    if TEST_DB_URL:
+        Database(TEST_DB_URL).verify()
+        check("a good PostgreSQL URL verifies", True, True)
+
+        import time as _t
+
+        bad = Database(TEST_DB_URL.rsplit("/", 1)[0] + "/definitely_not_here")
+        start = _t.monotonic()
+        try:
+            bad.verify()
+            check("a missing database is reported", "allowed", "rejected")
+        except DatabaseError as exc:
+            message = str(exc)
+            check("a missing database is reported", "rejected", "rejected")
+            check("naming the database", "definitely_not_here" in message, True)
+            check("quoting what the server said", "does not exist" in message, True)
+            check("and suggesting what to check", "pg_hba.conf" in message, True)
+        check("without waiting on a long timeout", _t.monotonic() - start < 5, True)
+
+
+def test_db_migration(root: Path) -> None:
+    """Copying the register between databases, keeping SL# and the sequence."""
+    print("\n=== moving the database ===")
+    import subprocess
+
+    from app.reference import ReferenceStore
+
+    source = Database(f"sqlite:///{root / 'from.sqlite3'}")
+    store, ref = MigrationStore(source), ReferenceStore(source)
+    settings = build_settings()
+    ref.seed(settings.migrations)
+    settings.migrations = ref.snapshot(fresh=True)
+    settings.migrations.enabled = True
+
+    for _ in range(3):
+        migrations.create_record(settings, store, DEV, dict(GOOD_REQUEST))
+    migrations.apply_changes(settings, store, APPROVER, 2, {"ready_for_qa": "Yes"})
+    store.add_freeze(time.time() - 10, time.time() - 5, "past", APPROVER)
+
+    target_url = TEST_DB_URL or f"sqlite:///{root / 'to.sqlite3'}"
+    if TEST_DB_URL:
+        # The shared PostgreSQL is the source's counterpart here; clear it first.
+        with Database(TEST_DB_URL).connect() as conn:
+            for table in APP_TABLES:
+                conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+
+    def run(*extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(Path(__file__).parent.parent / "tools" / "migrate_db.py"),
+             "--from", source.url, "--to", target_url, *extra],
+            capture_output=True, text=True,
+        )
+
+    dry = run("--dry-run")
+    check("a dry run succeeds", dry.returncode, 0)
+    check("and writes nothing", "nothing written" in dry.stdout, True)
+
+    done = run()
+    check("the copy succeeds", done.returncode, 0)
+    check("reporting a verified destination", "destination verified" in done.stdout, True)
+
+    target = Database(target_url)
+    moved = MigrationStore(target)
+    check("every record came across", len(moved.list()), 3)
+    check("SL# is preserved, not renumbered",
+          sorted(r["sl_no"] for r in moved.list()), [1, 2, 3])
+    check("workflow state came with them",
+          moved.get(2)["status"], "approved")
+    check("so did who approved it", moved.get(2)["approved_by"], "lead@example.com")
+    check("the audit trail came too", len(moved.audit(2)) >= 3, True)
+    check("and the freeze window", len(moved.freezes(include_past=True)), 1)
+    check("with the reference lists",
+          [e.number for e in ReferenceStore(target).snapshot(fresh=True).employees],
+          ["E1001", "E1002", "E1003"])
+
+    # The trap this tool exists for: inserting explicit ids leaves a PostgreSQL
+    # identity sequence at 1, so the next record would collide.
+    settings.migrations = ReferenceStore(target).snapshot(fresh=True)
+    settings.migrations.enabled = True
+    fresh = migrations.create_record(settings, moved, DEV, dict(GOOD_REQUEST))
+    check("the next new record continues the numbering", fresh["sl_no"], 4)
+
+    again = run()
+    check("a populated destination is refused", again.returncode, 1)
+    check("saying what is in the way", "destination is not empty" in again.stderr, True)
+    check("and that merging is not the answer", "cannot be merged" in again.stderr, True)
+
+    # --replace is for a second attempt after a half-finished one.
+    replaced = run("--replace")
+    check("replacing an existing destination works", replaced.returncode, 0)
+    check("it says what it discarded", "discarding" in replaced.stdout, True)
+    check("and the result is the source, not the source twice",
+          len(MigrationStore(Database(target_url)).list()), 3)
+
+    same = subprocess.run(
+        [sys.executable, str(Path(__file__).parent.parent / "tools" / "migrate_db.py"),
+         "--from", source.url, "--to", source.url],
+        capture_output=True, text=True,
+    )
+    check("copying a database onto itself is refused", same.returncode, 2)
+
+    if not TEST_DB_URL:
+        target.close()
+    source.close()
+
+
+def test_reference_store(root: Path) -> None:
+    """The dropdown lists, now kept in the database rather than in files."""
+    print("\n=== reference lists in the database ===")
+    from app.reference import ReferenceError, ReferenceStore
+
+    db = database_for(root, "ref.sqlite3")
+    store = ReferenceStore(db)
+    seed = build_settings().migrations
+
+    check("a new database has no lists", store.is_empty(), True)
+    counts = store.seed(seed)
+    check("seeding takes the releases from config", counts["releases"], 2)
+    check("and the microservices", counts["microservices"], 2)
+    check("after which it is not empty", store.is_empty(), False)
+
+    live = store.snapshot(fresh=True)
+    check("the lists read back", live.releases, ["R2026.09", "R2026.10"])
+    check("in the order given", live.migration_paths, ["SIT to QA", "QA to PROD"])
+    check("with the microservices", [m.name for m in live.microservices], ["payments", "cart"])
+    check("and their repos", live.service("cart").repos, ["demo/cart", "demo/cart-ui"])
+    check("and their track leads", live.service("cart").track_leads, ["R. Iyer", "S. Rao"])
+
+    # Seeding is once-only: it must never resurrect a deliberate deletion.
+    store.set_list("releases", ["R2027.01"])
+    check("a list can be replaced", store.snapshot(fresh=True).releases, ["R2027.01"])
+    check("seeding again does nothing", store.seed(seed), {})
+    check("so the edit stands", store.snapshot(fresh=True).releases, ["R2027.01"])
+
+    check("blanks are dropped and order kept",
+          store.set_list("releases", ["  R1  ", "", "R2"]).releases, ["R1", "R2"])
+    check("duplicates collapse case-insensitively",
+          store.set_list("releases", ["R1", "r1", "R2"]).releases, ["R1", "R2"])
+    refused_list = lambda: store.set_list("nonsense", ["x"])
+    try:
+        refused_list()
+        check("an unknown list is refused", "allowed", "rejected")
+    except ReferenceError:
+        check("an unknown list is refused", "rejected", "rejected")
+    check("an all-blank list clears it, deliberately",
+          store.set_list("releases", ["   ", ""]).releases, [])
+    store.set_list("releases", ["R2026.09", "R2026.10"])
+
+    try:
+        store.save_microservice("   ", [], [])
+        check("a nameless microservice is refused", "allowed", "rejected")
+    except ReferenceError:
+        check("a nameless microservice is refused", "rejected", "rejected")
+    try:
+        store.set_list("releases", ["x" * 201])
+        check("an absurdly long value is refused", "allowed", "rejected")
+    except ReferenceError:
+        check("an absurdly long value is refused", "rejected", "rejected")
+
+    # Microservices.
+    live = store.save_microservice("billing", ["demo/billing", "demo/billing "], ["T. Nair"])
+    check("a microservice can be added", [m.name for m in live.microservices][-1], "billing")
+    check("with repeated repos collapsed", live.service("billing").repos, ["demo/billing"])
+
+    live = store.save_microservice("billing", ["demo/billing", "demo/billing-ui"], ["T. Nair", "P. Das"])
+    check("and edited in place", live.service("billing").repos, ["demo/billing", "demo/billing-ui"])
+    check("without duplicating the entry", len([m for m in live.microservices if m.name == "billing"]), 1)
+    check("leads replaced wholesale", live.service("billing").track_leads, ["T. Nair", "P. Das"])
+
+    live = store.save_microservice("invoicing", ["demo/billing"], ["T. Nair"], rename_from="billing")
+    check("renaming keeps one entry", [m.name for m in live.microservices].count("invoicing"), 1)
+    check("and drops the old name", "billing" in [m.name for m in live.microservices], False)
+    check("carrying its links", live.service("invoicing").repos, ["demo/billing"])
+
+    try:
+        store.save_microservice("payments", [], [], rename_from="invoicing")
+        check("renaming onto an existing name is refused", "allowed", "rejected")
+    except ReferenceError:
+        check("renaming onto an existing name is refused", "rejected", "rejected")
+
+    live = store.delete_microservice("invoicing")
+    check("a microservice can be deleted", "invoicing" in [m.name for m in live.microservices], False)
+    try:
+        store.delete_microservice("invoicing")
+        check("deleting it twice is refused", "allowed", "rejected")
+    except ReferenceError:
+        check("deleting it twice is refused", "rejected", "rejected")
+
+    # Records referencing a microservice are counted before it is removed.
+    settings = build_settings()
+    settings.migrations = store.snapshot(fresh=True)
+    settings.migrations.enabled = True
+    records = MigrationStore(db)
+    migrations.create_record(settings, records, DEV, {
+        **GOOD_REQUEST, "release": settings.migrations.releases[0],
+    })
+    check("records using a microservice are counted", store.in_use("payments"), 1)
+    check("and an unused one counts zero", store.in_use("cart"), 0)
+
+    # The snapshot is cached, but a write must be visible at once.
+    store.set_list("change_requestors", ["Ops"])
+    check("a write is visible immediately", store.snapshot().change_requestors, ["Ops"])
+
+
+def test_archive(root: Path) -> None:
+    """Filing away finished records, and the immutability that follows."""
+    print("\n=== archiving ===")
+    settings = build_settings()
+    settings.auth.roles["admin"] = ["boss@elsewhere.com"]
+    store = store_for(root, "archive.sqlite3")
+    ADMIN = User("boss@elsewhere.com", frozenset({"admin"}))
+
+    def to_prod(sl: int) -> None:
+        migrations.apply_changes(settings, store, APPROVER, sl, {"ready_for_qa": "Yes"})
+        migrations.apply_changes(settings, store, DEVOPS, sl, {"executed_in_qa": "Yes"})
+        migrations.apply_changes(settings, store, APPROVER, sl, {"ready_for_prod": "Yes"})
+        migrations.apply_changes(settings, store, DEVOPS, sl, {"executed_in_prod": "Yes"})
+
+    made = [migrations.create_record(settings, store, DEV, dict(GOOD_REQUEST))["sl_no"]
+            for _ in range(4)]
+    done, part, fresh, retired = made
+    to_prod(done)
+    to_prod(part)
+    migrations.apply_changes(settings, store, APPROVER, retired, {"ready_for_qa": "Yes"})
+    store.set_active(retired, False, APPROVER)
+
+    # Only production-migrated records qualify.
+    out = store.archive([fresh], APPROVER)
+    check("a record still in flight cannot be archived", out["archived"], [])
+    check("and is told why", out["skipped"][0]["reason"], "Not migrated to production yet.")
+    out = store.archive([retired], APPROVER)
+    check("nor an inactive one", out["skipped"][0]["reason"], "Inactive.")
+    out = store.archive([9999], APPROVER)
+    check("a missing record is reported", out["skipped"][0]["reason"], "No such record.")
+
+    out = store.archive([done, fresh], APPROVER)
+    check("a mixed selection archives what it can", [r["sl_no"] for r in out["archived"]], [done])
+    check("and reports the rest", len(out["skipped"]), 1)
+    check("the archived record says so", out["archived"][0]["archived"], True)
+    check("naming who filed it", out["archived"][0]["archived_by"], "lead@example.com")
+    check("and when", out["archived"][0]["archived_at"].endswith("Z"), True)
+
+    check("archiving twice is reported", store.archive([done], APPROVER)["skipped"][0]["reason"],
+          "Already archived.")
+
+    # It leaves the register, and can be found only in the archive.
+    check("it is gone from the register", done in [r["sl_no"] for r in store.list()], False)
+    check("even asking for inactive ones",
+          done in [r["sl_no"] for r in store.list(include_inactive=True)], False)
+    check("the archive holds it", [r["sl_no"] for r in store.list(archived=True)], [done])
+    check("and holds only archived records",
+          all(r["archived"] for r in store.list(archived=True)), True)
+    check("the register still has the others", sorted(r["sl_no"] for r in store.list()),
+          sorted([part, fresh]))
+
+    # Nothing about it may change again.
+    archived_row = store.get(done)
+    check("no field is editable", migrations.editable_fields(APPROVER, archived_row), [])
+    check("not even for an admin", migrations.editable_fields(ADMIN, archived_row), [])
+    # Asked by someone who *would* hold the field, so it is archived-ness that
+    # refuses it and not the role — the role is checked first, as with freezes.
+    refused("an archived record cannot be edited",
+            lambda: migrations.apply_changes(settings, store, DEVOPS, done,
+                                             {"prod_migration_remarks": "late note"}),
+            contains="archived")
+    refused("nor deactivated",
+            lambda: store.set_active(done, False, APPROVER),
+            contains="archived")
+    refused("nor deleted",
+            lambda: store.delete(done),
+            contains="archived")
+    # A bulk action reports it rather than raising, as it does for anything
+    # else it cannot move.
+    bulk = migrations.approve_many(settings, store, APPROVER, [done], "qa")
+    check("a bulk action will not move it", bulk["approved"], [])
+    check("and says it is archived", "archived" in bulk["skipped"][0]["reason"].casefold(), True)
+
+    check("the filing is in its history",
+          any(e["field"] == "archived" and e["new_value"] == "archived"
+              for e in store.audit(done)), True)
+    check("attributed to whoever did it",
+          next(e["who"] for e in store.audit(done) if e["field"] == "archived"),
+          "lead@example.com")
+
+    # An admin may archive too; a developer and devops may not — checked at the API.
+    out = store.archive([part], ADMIN)
+    check("an admin can archive", [r["sl_no"] for r in out["archived"]], [part])
+    check("the archive now holds both",
+          sorted(r["sl_no"] for r in store.list(archived=True)), sorted([done, part]))
+    check("and the register neither", sorted(r["sl_no"] for r in store.list()), [fresh])
+
+    check("archiving is offered to approvers and admins",
+          (migrations.permissions(APPROVER)["can_archive"],
+           migrations.permissions(ADMIN)["can_archive"]), (True, True))
+    check("and not to developers or devops",
+          (migrations.permissions(DEV)["can_archive"],
+           migrations.permissions(DEVOPS)["can_archive"]), (False, False))
+
+
 def main() -> int:
+    test_config_parsing()
     test_identity()
     test_dev_mode()
     test_validation()
@@ -1019,12 +1997,31 @@ def main() -> int:
         test_sorting_and_dates(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
         test_retire_and_delete(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_microservice_file(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_bulk_approval(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_bulk_execution(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_database_reachability(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_db_migration(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_reference_store(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_archive(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_employees(Path(tmp))
     test_sheet()
+    test_permissions()
     test_spec()
     with tempfile.TemporaryDirectory() as tmp:
         asyncio.run(test_http(Path(tmp)))
     with tempfile.TemporaryDirectory() as tmp:
         asyncio.run(test_http_dev(Path(tmp)))
+    if _SHARED_PG is not None:
+        _SHARED_PG.close()
     print(f"\n{'ALL PASS' if not FAILURES else f'{len(FAILURES)} FAILURES: ' + ', '.join(FAILURES)}")
     return 1 if FAILURES else 0
 

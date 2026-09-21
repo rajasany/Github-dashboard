@@ -11,3 +11,5 @@ python-pptx>=1.0      # PowerPoint
 # Spreadsheet upload (/api/bulk/*)
 openpyxl>=3.1
 python-multipart>=0.0.9   # FastAPI multipart file uploads
+# PostgreSQL backend for the migration register (optional — SQLite needs nothing).
+psycopg[binary,pool]>=3.2

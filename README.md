@@ -178,9 +178,18 @@ a `+` on the file count and may under-report folders.
 | `GET /api/branches?key=github:owner/repo` | Every branch of one repository, for the compare pickers. |
 | `GET /api/compare?key=…&base=main&head=feature/x` | Three-dot comparison: commits, changed files, ahead/behind, merge base. |
 | `POST /api/report` | `{format: "pdf"\|"pptx", criteria: {…}, commits: [...]}` → the document as a file download. |
-| `GET /api/migrations/meta` | Who you are, your roles, the dropdown lists, the field rules, the active freeze. |
-| `GET /api/migrations/records?release=…&microservice=…&status=…&mine=true&created_from=…&created_to=…&sort=date_created&dir=asc` | The register, each row carrying the fields *you* may edit. |
+| `GET /api/migrations/lists` | The reference lists, whether you may edit them, and which database they are in. |
+| `PUT /api/migrations/lists/{name}` | `{values: [...]}` → replace one list. Approvers and admins. |
+| `PUT /api/migrations/lists/microservices/{name}` | Create or update one microservice (`new` to add). |
+| `PUT /api/migrations/lists/employees/{number}` | Create or update one employee (`new` to add). |
+| `DELETE /api/migrations/lists/employees/{number}` | Remove one from the change-requestor list. |
+| `DELETE /api/migrations/lists/microservices/{name}` | Remove one, unless records still name it. |
+| `GET /api/migrations/meta` | Who you are, your roles, the dropdown lists (re-reading `microservices_file` if it changed), the field rules, the active freeze. |
+| `GET /api/migrations/records?release=…&status=…&mine=true&created_from=…&sort=date_created&dir=asc&archived=true` | The register, each row carrying the fields *you* may edit. `archived=true` returns the archive instead. |
 | `POST /api/migrations/records` | Raise a request. Developer role; request-stage fields only. |
+| `POST /api/migrations/records/approve` | `{sl_nos: [...], stage: "qa"\|"prod", planned: "YYYY-MM-DD"}` → approve several at once, setting the planned migration date on each. Approvers and admins. |
+| `POST /api/migrations/records/archive` | `{sl_nos: [...]}` → archive production-migrated records, permanently. Approvers and admins. |
+| `POST /api/migrations/records/execute` | `{sl_nos: [...], stage: "qa"\|"prod", remarks: "..."}` → record several as migrated. DevOps and admins. Both return `moved` and `skipped` with reasons. |
 | `PATCH /api/migrations/records/{sl}` | Change fields. 403 if the role is wrong, 409 if the workflow is not there yet, 423 if frozen. |
 | `GET /api/migrations/records/{sl}/audit` | Every change to one record: when, who, from, to. |
 | `GET /api/migrations/template` | The .xlsx template, with the permitted values as real dropdowns. |
@@ -209,6 +218,9 @@ a `+` on the file count and may under-report folders.
 | [app/bulk.py](app/bulk.py) | Resolves each sheet row to a repo/folder and summarises it. |
 | [app/identity.py](app/identity.py) | Who a tag is attributed to: config, then the signed-in provider account. |
 | [app/auth.py](app/auth.py) | Identity from the proxy header, the trusted-proxy guard, role matching. |
+| [app/db.py](app/db.py) | The SQLite / PostgreSQL layer: dialect differences and nothing else. |
+| [tools/migrate_db.py](tools/migrate_db.py) | Copy the register between databases, in either direction. |
+| [app/reference.py](app/reference.py) | The dropdown lists in the database, and the one-time seed from config. |
 | [app/migrations.py](app/migrations.py) | The 28 fields, the workflow gates, the store, the audit trail, freezes. |
 | [app/migration_sheet.py](app/migration_sheet.py) | The request template and the upload reader. |
 | [app/feed.py](app/feed.py) | Merges providers, dedupes by `(repo, sha)`, derives folders. |
@@ -490,23 +502,39 @@ open only when the preceding step is done.
 | Stage | Who | What they set | Opens when |
 | --- | --- | --- | --- |
 | Request | developer | Rel#, path, microservice, repo, track lead, requestor, reason, description, the four risk flags, commit hash, DB script path | always — and locks once approved |
-| Approval | approver | Approved By, QA Date Planned | always |
-| QA migration | devops | Executed in QA, QA Migration Remarks | once approved |
-| Ready for production | approver | Ready for Prod | once the QA migration is recorded |
-| Production migration | devops | Executed in PROD, Prod Migration Remarks | once marked ready for prod |
+| QA Approval | approver | Ready for QA, QA Migration Date Planned | always |
+| QA Migration | devops | Executed in QA, QA Migration Remarks | once approved for QA |
+| Prod Approval | approver | Ready for Prod, Prod Migration Date Planned | once the QA migration is recorded |
+| Production Migration | devops | Executed in PROD, Prod Migration Remarks | once marked ready for prod |
+
+Each stage turns on a single switch, and the app fills in who threw it and when:
+
+| Switch | Fills in |
+| --- | --- |
+| **Ready for QA** | Approved By, Date Approved |
+| **Executed in QA** | QA Migration Date, QA Migrated By |
+| **Ready for Prod** | Approved By, Date Approved *(the prod pair)* |
+| **Executed in PROD** | Prod Migration Date, Prod Migrated By |
+
+Nobody types those in — an approval or a migration is attributed to whoever actually
+performed it, not to whoever was picked from a list.
 
 Editing a request after it has been approved would invalidate what was approved, so the
-request fields lock at that point. An approver can clear **Approved By** to withdraw the
-approval, which reopens them and clears the approval date.
+request fields lock at that point. Setting **Ready for QA** back to No withdraws the
+approval, clears Approved By and Date Approved, and reopens the request — but only while
+the QA migration has not run. Once it has, the approval cannot be withdrawn: that would
+reopen for editing a change already running in QA or production. Deactivate the record
+instead.
 
 The status shown against each row is derived from the record's own fields rather than
 stored, so it cannot drift out of step with them.
 
 ### The fields
 
-Eight are filled in by the app and cannot be typed by anyone: **SL#** (the sequence),
-**Created By**, **Date Created**, **Date Approved**, **QA Migrated By**, **Prod Migration
-Date**, **Prod Migrated By** and the derived status. The rest are role-gated as above.
+Ten are filled in by the app and cannot be typed by anyone: **SL#** (the sequence),
+**Created By**, **Date Created**, the **Approved By** / **Date Approved** pair for each of
+the two approvals, **QA Migration Date**, **QA Migrated By**, **Prod Migration Date** and
+**Prod Migrated By** — plus the derived status. The rest are role-gated as above.
 
 *Prod Migrated By is not in the original field list — it is there for symmetry with QA
 Migrated By, so a production migration records who performed it and not only when.*
@@ -514,6 +542,220 @@ Migrated By, so a production migration records who performed it and not only whe
 **Repo Name** and **Track Lead Name** are narrowed to the microservice selected, and the
 server rejects a pairing that does not match, so a sheet naming another microservice's
 repo is caught rather than stored.
+
+**Where a microservice has only one repo or one track lead, the form fills it in** rather
+than leaving a dropdown of one to click through, and says *"Only one — filled in for you"*
+underneath so it is not a silent guess. The value stays yours to change. Where there is a
+genuine choice nothing is picked. Changing the microservice re-evaluates both fields and
+clears anything the new service does not offer — in the form *and* on an existing
+record, which previously kept showing the old service's repos until the server refused
+the pairing.
+
+### Where the data lives
+
+The migration register — the records, their audit trail, the freeze windows and the
+reference lists — sits in **SQLite or PostgreSQL**, whichever the URL points at:
+
+```yaml
+database:
+  url: postgresql://user:password@localhost:5432/repo_dashboard
+```
+
+`DATABASE_URL` in `.env` overrides it. Omit both and it uses a SQLite file under
+`.cache/`, which is what the app has always done — an existing deployment upgrades
+without touching anything. Use PostgreSQL when more than one person relies on the
+register, or when it needs to be backed up alongside everything else.
+
+#### Pointing at a PostgreSQL server on another machine
+
+Nothing in the code changes — only the URL. On the **database server**:
+
+```bash
+createdb repo_dashboard
+psql -c "CREATE ROLE dashboard LOGIN PASSWORD 'a-real-password';"
+psql -d repo_dashboard -c "GRANT ALL ON SCHEMA public TO dashboard;"
+```
+
+The role needs `CREATE` on the schema, not just read and write: the app creates its own
+tables on first start and adds columns as fields are added, so there is no separate
+migration step.
+
+Then let it accept connections from the app host — in `postgresql.conf`:
+
+```
+listen_addresses = '*'          # or the specific interface
+```
+
+and in `pg_hba.conf`, a line per app host, using a real authentication method:
+
+```
+host  repo_dashboard  dashboard  10.0.0.0/24  scram-sha-256
+```
+
+`SHOW hba_file;` and `SHOW config_file;` in psql will tell you where those live. Reload
+with `pg_ctl reload` or `SELECT pg_reload_conf();`.
+
+On the **app host**, put the URL in `.env` rather than `config.yaml` — it now contains a
+password, and `.env` is already gitignored:
+
+```
+DATABASE_URL=postgresql://dashboard:a-real-password@db.internal:5432/repo_dashboard?sslmode=require
+```
+
+Anything after `?` is passed to libpq untouched, so `sslmode`, `connect_timeout`,
+`application_name` and the rest work as documented by PostgreSQL. Use `sslmode=require`
+or stronger over any network you do not control.
+
+**If the app cannot reach it**, the Migrations tab reports 503 with the reason — the
+database, what the server said, and what to check — and the server prints the same at
+startup. The rest of the dashboard reads git and carries on working. A wrong database
+name or password fails immediately; an unreachable host takes the connect timeout.
+
+#### Moving the database
+
+Two different things get called a migration here. Neither needs you to write SQL.
+
+**Schema changes happen by themselves.** The tables are created on first start, and when
+a field is added to the register a matching column is added to any existing database on
+the next start — driven off the field list, so there is no migration file to write or
+run and no step to forget. Downgrading is not handled: an older build will ignore columns
+it does not know about rather than dropping them.
+
+**Moving the data** from one database to another — SQLite to PostgreSQL when you outgrow
+a single machine, or between PostgreSQL servers — is one command:
+
+```bash
+.venv/bin/python tools/migrate_db.py \
+    --from "sqlite:///.cache/migrations.sqlite3" \
+    --to   "postgresql://dashboard:secret@db.internal:5432/repo_dashboard"
+```
+
+It copies the records, their audit trail, the freeze windows and every reference list,
+then counts both sides and refuses to claim success unless they agree.
+
+| | |
+| --- | --- |
+| `--dry-run` | Report what would be copied and write nothing. Worth doing first. |
+| `--replace` | Empty the destination before copying. For a second attempt after a half-finished one. |
+
+The destination must otherwise be empty. Two registers cannot be merged: both number
+their own SL# 1, and renumbering a record would break every reference to it that people
+have already written down elsewhere.
+
+Preserving SL# is also why this is a tool rather than three shell commands. Inserting
+explicit ids leaves a **PostgreSQL identity sequence still sitting at 1**, so the next
+record raised after the move collides with an existing one. `migrate_db.py` resets every
+sequence at the end; a hand-rolled `pg_dump`/`psql` or a CSV round trip will not, and the
+failure shows up later as a puzzling primary-key error rather than at the time.
+
+Afterwards, point `DATABASE_URL` at the new database and restart. The old one is left
+untouched, so there is something to go back to.
+
+Between two PostgreSQL servers `pg_dump` is also perfectly good, and keeps the sequences:
+
+```bash
+pg_dump -h 127.0.0.1 repo_dashboard | psql -h db.internal -U dashboard repo_dashboard
+```
+
+Or start empty and let the reference lists seed from `config.yaml` again.
+
+Only the register moves. The **git commit cache** and **staged tags** stay on SQLite by
+design: one is rebuildable derived data, the other stages tags against a local mirror
+clone. Neither is shared state, so neither gains anything from a server database.
+
+There is no ORM. `app/db.py` is a thin layer over both drivers that smooths the four
+places they genuinely differ — placeholder style, identity columns, `REAL` versus
+`DOUBLE PRECISION`, and schema introspection — and everything else is plain SQL in the
+subset both accept. The whole migration test suite runs against either:
+
+```bash
+.venv/bin/python tests/test_migrations.py                        # SQLite
+createdb repo_dashboard_test
+TEST_DATABASE_URL=postgresql://localhost/repo_dashboard_test \
+  .venv/bin/python tests/test_migrations.py                      # PostgreSQL
+```
+
+It drops and recreates its tables, so it must point at a throwaway database — if
+`TEST_DATABASE_URL` matches the one the app is configured to use, it refuses to run.
+
+### Employees and the change requestor
+
+**Change Requestor** is picked from an employee list of number and name, shown as
+`E1001 - Jane Doe`. Each employee can carry an email, and that is what ties them to a
+signed-in user: **the new-request form starts on whoever is filling it in**, saying *"That
+is you — change it if you are raising this for someone else."* It is a starting point, not
+a constraint — every other employee is still in the dropdown.
+
+Someone whose address is not on the list simply gets no default.
+
+A value is resolved before it is stored, so a spreadsheet holding only `E1001`, or a name,
+or the label with an em dash, all end up as the one canonical `E1001 - Jane Doe`. Anything
+that matches no employee is rejected rather than quietly stored.
+
+Employees are managed under **Lists…** alongside everything else. Until any exist the
+older free-standing `change_requestors` list is still used, so an existing deployment
+keeps working until staff are added.
+
+```yaml
+migrations:
+  employees:
+    - { number: E1001, name: Jane Doe, email: jane@example.com }
+    - E1002 - John Roe                       # shorthand, no email
+    - E1003 - Amy Poe, amy@example.com       # shorthand with one
+```
+
+That is only the seed, as with every other list — after first run they live in the
+database.
+
+### The reference lists
+
+Rel#, migration paths, employees and the microservice → repo → track lead map
+live **in the database**, and are edited from **Lists…** in the Migrations tab by
+approvers and admins. Everyone else can read them.
+
+They are seeded once, on a database with no lists in it, from `config.yaml` and
+`microservices_file` — so the YAML is still a fine way to describe a *new* deployment,
+and an existing one carries its lists across without anyone retyping them. After that
+seed the database is the only source of truth: editing the YAML does nothing, and
+seeding never runs again, so it cannot resurrect something an administrator deleted.
+
+Editing a list takes effect on the next request — no restart. A microservice that
+records already name cannot be deleted; the API says how many use it.
+
+### The microservice map
+
+That mapping can live in a file rather than in `config.yaml`, which suits it: it is the
+list most likely to change, and the person who maintains it is not necessarily the person
+who edits YAML.
+
+```yaml
+migrations:
+  microservices_file: data/microservices.csv
+```
+
+**This file is a seed, not a live source.** It is read once to populate an empty
+database; after that the map is edited under **Lists…**. Relative paths are from the
+project root; `.csv` and `.xlsx` both work. Three columns,
+one row per pairing — repeat the service to give it several repos or leads, or separate
+them with commas in one cell:
+
+```csv
+Micro Service Name,Repo Name,Track Lead Name
+payments,acme/payments,A. Kumar
+payments,acme/payments-ui,A. Kumar
+cart,acme/cart,R. Iyer
+cart,acme/cart,S. Rao
+```
+
+Column names are matched the same tolerant way as the upload tab — `MS`, `Service`,
+`Repository`, `Lead` and several other spellings are recognised, and a title row above
+the header is fine. Names differing only in case are one service, keeping the first
+spelling seen; repeated repos are not listed twice. See
+[data/microservices.example.csv](data/microservices.example.csv).
+
+If both a file and an inline `microservices:` list are configured, the file wins, and the
+inline list is used only if the file cannot be read. Either way it only decides what gets
+seeded.
 
 **Amber flags.** Four yes/no fields mark a request as carrying risk, and show amber
 wherever they appear — in the form and as chips in the register:
@@ -549,6 +791,82 @@ day that is printed beside it, whatever timezone you are in. Calling the API dir
 may pass plain `YYYY-MM-DD` dates instead, which are read as UTC; a bare end date covers
 the whole of that day rather than its first instant.
 
+### Working in bulk
+
+Nobody moves a release wave one record at a time. Tick the rows in the register — or the
+box in the header to take everything on screen — and a bar appears above the table with
+the actions **your role** allows:
+
+```
+approver   3 selected   [ Approve 1 for QA ]  [ Approve 2 for prod ]           [ Clear ]
+devops     3 selected   [ Mark 1 migrated to QA ]  [ Mark 1 migrated to prod ] [ Clear ]
+admin      3 selected   all four                                               [ Clear ]
+```
+
+| Action | Sets | Role |
+| --- | --- | --- |
+| Approve for QA | Ready for QA | approver, admin |
+| Approve for prod | Ready for Prod | approver, admin |
+| Mark migrated to QA | Executed in QA | devops, admin |
+| Mark migrated to prod | Executed in PROD | devops, admin |
+| Archive | files finished records away, permanently | approver, admin |
+
+Someone with none of those roles gets no checkbox column at all, so the register does not
+sprout controls that would only be refused.
+
+Each button counts only the selected records actually at *that* stage, so it says what it
+will do before you press it. Confirming lists exactly which records move, with the rest
+under "will be left alone".
+
+**The confirmation asks for the field that goes with the action** and applies it to every
+record in the batch — the planned date for an approval, the migration remarks for an
+execution. Approving a wave and then filling in twenty dates individually would defeat
+the point. The listing shows each record's current value beside it and says how many
+already have one, so replacing them is a visible choice. Leave it blank and each record
+keeps its own.
+
+Migration dates and the operator are never asked for: **Executed in QA** and **Executed
+in PROD** stamp the time and your name automatically, as they do for a single record.
+
+Every bulk action is a loop over the ordinary single-record path, not a second way in.
+The role, stage, freeze, inactive and withdrawal rules are identical, and each record gets
+its own audit entry. A record that cannot be moved is reported with a reason and does not
+stop the others — a batch where one record has not reached QA yet still moves the rest and
+says which one it left. Those stay selected so you can deal with them.
+
+A freeze disables the buttons, and is checked once for the batch rather than producing the
+same refusal N times. A malformed date is likewise rejected once. The cap is 200 records
+per call.
+
+### Archiving
+
+Once a change has reached production its record is finished, and the register does not
+need to keep showing it. Select the rows — or the header box to take everything on screen
+— and **Archive** files them away.
+
+Only records with a status of **Migrated to prod** can be archived. Anything else in the
+selection is left alone and reported, so filing a release wave is one action rather than a
+hunt for the finished ones. An archived record:
+
+- **leaves the register entirely** — it is not in the default view and not under *Show
+  inactive* either;
+- **is read only from the Archive button**, which switches the register into a read-only
+  archive view and back;
+- **can never be changed again** — no edit, no approval, no deactivation, no deletion, by
+  any role including admin. The API reports its editable-field list as empty, so the form
+  renders it read-only without knowing the rule, and every write endpoint refuses with 409.
+
+The filing is recorded in the record's history with who did it and when, and the row
+carries an **Archived** chip with the date.
+
+**Archiving cannot be undone.** That is what makes an archived record a dependable account
+of what happened, and it is why the confirmation says so plainly, lists exactly which
+records will go, and why only approvers and admins can do it. If you would rather it were
+reversible, that is a small change — say so.
+
+To archive everything finished rather than a page of it, filter **Status** to *Migrated to
+prod* first, then use the header checkbox.
+
 ### Retiring and deleting records
 
 Approvers and admins get two ways to take a record out of the register:
@@ -579,6 +897,17 @@ approvers either**; every write is refused with 423 and the reason is shown as a
 Managing freezes is exempt, so an approver can always lift one. The window is stored as
 an instant, and the browser converts your local wall-clock entry, so a freeze means the
 same moment for everyone regardless of timezone.
+
+**The tab shows it rather than letting you find out by being refused.** The register greys
+out, the row checkboxes and every bulk button go dead, New request and Upload are
+disabled, and opening a record shows a banner with no Save, Deactivate or Delete and no
+editable control on it. That last part is not the client deciding: while a freeze is
+active the API reports every record's editable-field list as empty, so the form renders it
+read-only without knowing the rule. Reading carries on as normal — the register, the
+record detail, the history, the CSV export and the reference lists are all still there.
+
+Everything that changes a record is covered, including **deactivating** one — that was a
+gap until the freeze was extended to it, while deleting had always been refused.
 
 Note that this stops DevOps recording a migration *that has already happened* during the
 window. That is what "no one can edit/enter records during that time" asks for; if you
@@ -678,9 +1007,9 @@ one — otherwise every step simply succeeds and nothing is being tested:
 
 ```yaml
   roles:
-    developer: [dev@tcs.com]
-    approver:  [lead@tcs.com]
-    devops:    [ops@tcs.com]
+    developer: [dev@abc.com]
+    approver:  [lead@abc.com]
+    devops:    [ops@abc.com]
 ```
 
 They need not be real mailboxes; in dev mode they are only labels to switch between.
@@ -696,6 +1025,11 @@ They need not be real mailboxes; in dev mode they are only labels to switch betw
 While it is on, the server prints a warning on every start and the tab carries a standing
 amber banner naming the risk. If `dev_mode` is set but a guard refused it, the tab says
 which one — rather than silently behaving as though the setting were absent.
+
+The tab asks the API what the current user may do — raise, retire, freeze — rather than
+working it out from the role list. That matters for `admin`, which satisfies every check
+without literally holding the other roles: derived client-side it would look unprivileged.
+When a control is disabled the reason is shown on the page, not only as a tooltip.
 
 Everything above is enforced server-side, in `apply_changes`. The UI asks the API which
 fields the current user may edit and renders only those, but that is a courtesy to stop
@@ -908,9 +1242,9 @@ other rule hard-codes a colour.
 .venv/bin/python tests/test_cherrypick.py # cherry-pick detection            (24 checks)
 .venv/bin/python tests/test_compare.py  # branch comparison, real git repo   (33 checks)
 .venv/bin/python tests/test_bulk.py     # sheet parsing, conventions, concurrency (55 checks)
-.venv/bin/python tests/test_migrations.py # roles, workflow, freeze, retire    (270 checks)
+.venv/bin/python tests/test_migrations.py # roles, workflow, archive, staff    (553 checks)
 node tests/ui_cascade.test.js          # selection, rendering, escaping      (186 checks)
-node tests/ui_migrations.test.js       # rendering, dates, sorting, escaping  (72 checks)
+node tests/ui_migrations.test.js       # rendering, archive, staff, escaping (182 checks)
 ```
 
 The second suite runs the real `app/static/app.js` in a stubbed DOM and asserts the cases
@@ -946,3 +1280,6 @@ than injected into the markup.
 - Deleting a migration request also deletes its audit trail. Deactivating is the
   reversible option and keeps the history; prefer it unless the record should genuinely
   never have existed.
+- Archiving is permanent and has no undo. It is limited to records already migrated to
+  production, and confirmed before it happens, but there is no way back short of editing
+  the database.

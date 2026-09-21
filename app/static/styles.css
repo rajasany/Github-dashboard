@@ -1477,3 +1477,62 @@ tr.is-past td { color: var(--muted); }
 .mig-table tr.is-inactive .mono,
 .mig-table tr.is-inactive .mig-date { opacity: 0.75; }
 .mig-table tr.is-inactive:hover td { background: var(--surface-2); }
+
+/* A config snippet inside a notice: small, selectable, and not a wall of colour. */
+.mig-snippet {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.05);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre;
+  overflow-x: auto;
+}
+
+/* Bulk selection. The bar only exists while something is selected, so it can
+   sit above the table without permanently costing a row of height. */
+.mig-bulkbar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 10px; padding: 8px 12px;
+  border: 1px solid var(--accent); border-radius: 8px;
+  background: var(--accent-soft); color: var(--accent-ink);
+}
+.mig-bulkcount { font-size: 12.5px; font-weight: 650; margin-right: 2px; }
+.mig-table th.mig-pickcol,
+.mig-table td.mig-pickcol { width: 30px; padding-right: 0; text-align: center; }
+.mig-pick, #mig-pick-all { cursor: pointer; margin: 0; }
+.mig-table tr.is-inactive .mig-pick { opacity: 0.5; }
+
+/* The planned-date field in a bulk approval: one field, so it should not
+   stretch across the whole dialog the way the record grid does. */
+.mig-bulk-when { grid-template-columns: minmax(200px, 320px); margin-bottom: 14px; }
+
+/* A frozen register. Muted rather than hidden: the records still need reading,
+   they just cannot be changed. Opacity alone would fail contrast, so the text
+   colour is muted explicitly and the rule sits above the row tints. */
+.table-scroll.is-frozen .mig-table td { color: var(--muted); background: #fbfbfc; }
+.table-scroll.is-frozen .mig-table tbody tr:hover td { background: var(--surface-2); }
+.table-scroll.is-frozen .mig-table .mono,
+.table-scroll.is-frozen .mig-table .mig-date { color: var(--muted); }
+.table-scroll.is-frozen .mig-amber { filter: saturate(0.45); }
+.table-scroll.is-frozen .mig-status { background: var(--surface-2); color: var(--muted); }
+.table-scroll.is-frozen .mig-pick { cursor: not-allowed; opacity: 0.45; }
+
+/* The archive: a separate, read-only view of finished work. */
+.mig-note.archive {
+  background: var(--surface-2); color: var(--text);
+  border-color: var(--border);
+}
+.mig-status.archived {
+  background: #ece7f6; color: #4a3a75;
+}
+#mig-archive-view.is-active {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+#mig-archive-view.is-active:hover { filter: brightness(1.06); }
+
+/* A field the form filled in because there was only one choice. Stated, not
+   silent — the value is still the person's to change. */
+.mig-hint.mig-autofilled { color: var(--accent-ink); font-weight: 600; }

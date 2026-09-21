@@ -18,7 +18,9 @@ import io
 from typing import Any
 
 from .config import MigrationConfig
-from .migrations import BY_KEY, REQUEST_KEYS, YESNO, MigrationError, validate, _clean
+from .migrations import (
+    BY_KEY, REQUEST_KEYS, YESNO, MigrationError, clean_requestor, validate, _clean,
+)
 from .spreadsheet import SheetError, parse_columns
 
 # Longer, more specific aliases first — the reader also falls back to a
@@ -76,6 +78,9 @@ def check_rows(rows: list[dict[str, Any]], cfg: MigrationConfig) -> list[dict[st
         for key in REQUEST_KEYS:
             if key in raw:
                 values[key] = _clean(BY_KEY[key], raw[key])
+        if values.get("change_requestor"):
+            # A sheet usually carries just the employee number.
+            values["change_requestor"] = clean_requestor(values["change_requestor"], cfg)
         for key in REQUEST_KEYS:
             spec = BY_KEY[key]
             if spec.default and not values.get(key):
@@ -134,7 +139,10 @@ def build_template(cfg: MigrationConfig) -> bytes:
     named["release"] = put("Rel#", cfg.releases)
     named["migration_path"] = put("Migration Path", cfg.migration_paths)
     named["microservice"] = put("Micro Service", cfg.service_names)
-    named["change_requestor"] = put("Change Requestor", cfg.change_requestors)
+    # Employee labels where staff are configured, the old plain list otherwise.
+    named["change_requestor"] = put(
+        "Change Requestor", cfg.employee_labels or cfg.change_requestors
+    )
     yesno_ref = put("Yes / No", list(YESNO))
 
     # Repo and track lead cascade off the microservice, which Excel validation
@@ -187,7 +195,7 @@ def build_template(cfg: MigrationConfig) -> bytes:
         "microservice": service.name if service else "",
         "repo_name": service.repos[0] if service and service.repos else "",
         "track_lead": service.track_leads[0] if service and service.track_leads else "",
-        "change_requestor": cfg.change_requestors[0] if cfg.change_requestors else "",
+        "change_requestor": (cfg.employee_labels or cfg.change_requestors or [""])[0],
         "reason": "Defect fix agreed in the 09:30 triage call",
         "change_description": "Corrects the rounding on the settlement total",
         "code_image_change": "Yes",
