@@ -70,3 +70,85 @@ branch_include: []
 # Optional: always hide branches matching these glob patterns.
 branch_exclude:
   - dependabot/*
+
+# ---------------------------------------------------------------------------
+# Who is using the app, and what they may do (the Migrations tab).
+#
+# There are two ways to run this, and they are MUTUALLY EXCLUSIVE.
+# Pick one. Setting `trusted_proxies` switches `dev_mode` off, because a proxy
+# on the same host also looks like loopback and would otherwise let dev mode be
+# reached through it.
+# ---------------------------------------------------------------------------
+
+# --- OPTION A: testing, no SSO ---------------------------------------------
+# The caller declares who they are and the tab shows a role switcher, so one
+# person can walk a request through the whole workflow. This is a COMPLETE
+# authentication bypass: it is refused from anywhere but loopback unless
+# dev_allow_remote is set, the server warns on every start, and the tab carries
+# a standing amber banner. Do not deploy with it on.
+#
+# auth:
+#   dev_mode: true
+#   dev_allow_remote: false     # true to allow it from other machines too
+#   dev_user: you@example.com   # who you are before picking someone else
+#   roles:
+#     developer: ["*@example.com"]
+#     approver:  [you@example.com]
+#     devops:    [you@example.com]
+#     admin:     [you@example.com]   # superset; can also retire and delete records
+
+# --- OPTION B: deployed, behind an SSO proxy -------------------------------
+# Identity comes from a header the proxy sets. This is only safe if the app
+# CANNOT be reached except through that proxy — a header is just bytes the
+# client sends, so anyone able to connect directly can claim to be anybody.
+# `trusted_proxies` is the guard; leave it out and the app still runs but warns
+# on every page that it is unprotected.
+#
+# auth:
+#   header: X-Forwarded-Email   # X-Forwarded-User and X-Auth-Request-Email also read
+#   trusted_proxies:            # honour that header only from these addresses
+#     - 127.0.0.1
+#     - 10.0.0.0/8
+#   roles:                      # exact addresses or globs; matching ignores case
+#     developer:
+#       - "*@tcs.com"
+#     approver:
+#       - lead@tcs.com
+#     devops:
+#       - devops@tcs.com
+#     # A superset: satisfies every other role's checks. Approvers and admins
+#     # are the ones who can deactivate or delete records.
+#     admin:
+#       - lead@tcs.com
+
+# ---------------------------------------------------------------------------
+# The dropdown lists on the migration request form.
+# Remove the comments and fill these in to switch the Migrations tab on.
+# ---------------------------------------------------------------------------
+# migrations:
+#   enabled: true
+#   releases:
+#     - R2026.09
+#     - R2026.10
+#   migration_paths:
+#     - SIT to QA
+#     - QA to PROD
+#   # Repo Name and Track Lead Name are narrowed to the microservice chosen.
+#   microservices:
+#     - name: payments
+#       repos:
+#         - rajasany/Insurance
+#       track_leads:
+#         - A. Kumar
+#     - name: guardrails
+#       repos:
+#         - rajasany/Guardrails
+#       track_leads:
+#         - R. Iyer
+#   change_requestors:
+#     - Business Ops
+#     - Release Management
+#   # Offered in the "Approved By" field. Only people holding the approver role
+#   # above can actually set it, whatever this list says.
+#   approvers:
+#     - lead@tcs.com

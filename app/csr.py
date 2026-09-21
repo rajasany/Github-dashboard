@@ -149,6 +149,12 @@ class GitMirror:
         self.tokens = TokenProvider(settings)
         # Network git operations are serialised more tightly than local reads.
         self._net = asyncio.Semaphore(max(1, min(4, settings.max_concurrency)))
+        # One lock per repository. Two concurrent syncs of the *same* mirror
+        # collide — the second finds a half-written clone directory — which
+        # happens as soon as one request touches a repository more than once,
+        # as a spreadsheet listing several folders of one repo does.
+        self._sync_locks: dict[str, asyncio.Lock] = {}
+        self._synced_at: dict[str, float] = {}
 
     def path_for(self, key: str) -> Path:
         digest = hashlib.sha256(key.encode()).hexdigest()[:16]
@@ -190,9 +196,29 @@ class GitMirror:
             raise CsrError(_scrub(message.splitlines()[-1] if message else "git failed"))
         return (out or b"").decode()
 
-    async def sync(self, key: str, clone_url: str) -> Path:
-        """Clone on first use, otherwise fetch. Returns the local mirror path."""
+    async def sync(self, key: str, clone_url: str, *, max_age: float = 0) -> Path:
+        """Clone on first use, otherwise fetch. Returns the local mirror path.
+
+        `max_age` lets a caller accept a mirror fetched that recently instead of
+        fetching again — for a request that visits one repository many times, such
+        as a spreadsheet naming several of its folders. It defaults to 0, so every
+        other caller still gets a real fetch and sees the true remote state.
+        """
+        lock = self._sync_locks.get(key)
+        if lock is None:
+            lock = self._sync_locks[key] = asyncio.Lock()
+
+        async with lock:
+            return await self._sync_locked(key, clone_url, max_age)
+
+    async def _sync_locked(self, key: str, clone_url: str, max_age: float) -> Path:
         path = self.path_for(key)
+
+        last = self._synced_at.get(key)
+        if max_age > 0 and last is not None and (time.monotonic() - last) < max_age:
+            if (path / "HEAD").exists():
+                return path
+
         token = await self.tokens.get()
 
         async with self._net:
@@ -207,6 +233,7 @@ class GitMirror:
                 await self._git(
                     ["clone", "--mirror", "--quiet", clone_url, str(path)], token=token
                 )
+        self._synced_at[key] = time.monotonic()
         return path
 
     async def default_branch(self, path: Path) -> str | None:

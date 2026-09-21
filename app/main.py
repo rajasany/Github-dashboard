@@ -9,12 +9,15 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from . import compare, lookup, ordering, report, summary, tagging
+from . import (
+    auth, bulk, compare, lookup, migration_sheet, migrations, naming, ordering, report,
+    spreadsheet, summary, tagging,
+)
 from .config import load_settings
 from .csr import GitMirror
 from .feed import build_feed, enrich_commit_folders
@@ -28,6 +31,7 @@ gh_client: GitHubClient | None = None
 mirror: GitMirror | None = None
 store: FileStore | None = None
 tag_store: tagging.TagStore | None = None
+migration_store: migrations.MigrationStore | None = None
 
 # Single-flight state for the local `gcloud auth login` flow. This app is a
 # localhost, single-user tool — the subprocess opens a browser and writes to
@@ -58,11 +62,20 @@ async def _run_gcloud_login() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global gh_client, mirror, store, tag_store
+    global gh_client, mirror, store, tag_store, migration_store
     gh_client = GitHubClient(settings)
     mirror = GitMirror(settings)
     store = FileStore(settings.store_path)
     tag_store = tagging.TagStore(settings.tag_store_path)
+    migration_store = migrations.MigrationStore(settings.migration_store_path)
+    if settings.auth.dev_mode:
+        scope = "ANY address" if settings.auth.dev_allow_remote else "loopback only"
+        disabled = " — IGNORED, because auth.trusted_proxies is set" if settings.auth.trusted_proxies else ""
+        print(
+            f"\n  *** auth.dev_mode is ON ({scope}){disabled}. Identity is self-declared:\n"
+            f"      anyone who can reach this app can choose any role. Testing only. ***\n",
+            flush=True,
+        )
     yield
     await gh_client.aclose()
 
@@ -107,6 +120,9 @@ async def index() -> HTMLResponse:
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
     html = html.replace("/static/app.js", f"/static/app.js?v={_asset_version('app.js')}")
     html = html.replace("/static/styles.css", f"/static/styles.css?v={_asset_version('styles.css')}")
+    html = html.replace(
+        "/static/migrations.js", f"/static/migrations.js?v={_asset_version('migrations.js')}"
+    )
     return HTMLResponse(html)
 
 
@@ -381,6 +397,63 @@ async def order_commits(body: OrderRequest) -> dict:
         raise HTTPException(status_code=exc.status or 502, detail=exc.message) from exc
 
 
+@app.get("/api/bulk/template")
+async def bulk_template() -> Response:
+    """A starter workbook, so the expected columns are shown rather than guessed."""
+    return Response(
+        content=spreadsheet.build_template(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="release-plan-template.xlsx"'},
+    )
+
+
+@app.get("/api/bulk/placeholders")
+async def bulk_placeholders() -> dict:
+    return {"placeholders": [{"token": tok, "help": txt} for tok, txt in naming.PLACEHOLDERS]}
+
+
+@app.post("/api/bulk/process")
+async def bulk_process(
+    file: UploadFile = File(..., description="A .xlsx or .csv of repo/folder rows"),
+    convention: str = Form(...),
+    days: int = Form(default=None),
+    since: str = Form(default=None),
+    branch: str = Form(default=None),
+) -> dict:
+    """Summarise each row of an uploaded sheet and propose a tag for it."""
+    assert gh_client is not None and mirror is not None and store is not None
+
+    if not settings.configured:
+        raise HTTPException(status_code=400, detail="No repositories configured.")
+
+    content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="That file is larger than 5 MB.")
+
+    try:
+        sheet = spreadsheet.parse_sheet(file.filename or "", content)
+    except spreadsheet.SheetError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    since_dt, _ = _resolve_window(days, since, None)
+    try:
+        result = await bulk.process_rows(
+            settings, gh_client, mirror, store,
+            rows=sheet["rows"], convention=convention,
+            since_dt=since_dt, default_branch=(branch or None),
+        )
+    except bulk.BulkError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    result["sheet"] = {
+        "filename": file.filename,
+        "columns": sheet["columns"],
+        "header_row": sheet["header_row"],
+        "ignored": sheet["ignored"],
+    }
+    return result
+
+
 @app.get("/api/branches")
 async def get_branches(key: str = Query(description="Repo key, e.g. github:owner/repo")) -> dict:
     """All branches of one repository, for the comparison pickers."""
@@ -526,3 +599,394 @@ async def health() -> dict:
         "github_repos": len(settings.repos),
         "csr_repos": len(settings.csr_repos),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Migration requests
+# --------------------------------------------------------------------------- #
+
+
+def current_user(request: Request) -> auth.User:
+    """Identify the caller from the proxy header, or dev mode (see app/auth.py)."""
+    peer = request.client.host if request.client else None
+    return auth.resolve_user(request.headers, peer, settings, request.cookies)
+
+
+def _require_migrations() -> migrations.MigrationStore:
+    if not settings.migrations.enabled:
+        raise HTTPException(
+            status_code=404,
+            detail="Migration requests are not enabled. Add a `migrations:` section to config.yaml.",
+        )
+    assert migration_store is not None
+    return migration_store
+
+
+@app.exception_handler(auth.AuthError)
+async def _auth_error(request: Request, exc: auth.AuthError) -> Response:
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse({"detail": str(exc)}, status_code=exc.status)
+
+
+@app.exception_handler(migrations.MigrationError)
+async def _migration_error(request: Request, exc: migrations.MigrationError) -> Response:
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(
+        {"detail": str(exc), "fields": exc.fields}, status_code=exc.status
+    )
+
+
+@app.get("/api/migrations/meta")
+async def migrations_meta(request: Request) -> dict:
+    """Everything the tab needs to render: who you are, the lists, the field rules."""
+    store_ = _require_migrations()
+    user = current_user(request)
+    cfg = settings.migrations
+    freeze = store_.active_freeze()
+
+    peer = request.client.host if request.client else None
+    dev_on, dev_why = auth.dev_mode_available(peer, settings)
+    # Only exact addresses can be offered; a glob like *@example.com names nobody.
+    identities: set[str] = set()
+    for patterns in settings.auth.roles.values():
+        identities.update(p for p in patterns if "*" not in p and "?" not in p)
+    if settings.auth.dev_user:
+        identities.add(settings.auth.dev_user)
+
+    return {
+        "user": user.as_dict(),
+        "auth_configured": settings.auth.configured,
+        "dev": {
+            "enabled": dev_on,
+            "configured": settings.auth.dev_mode,
+            "why_not": "" if dev_on else dev_why,
+            "cookie": auth.DEV_COOKIE,
+            "identities": [
+                {"email": who, "roles": sorted(auth.roles_for(who, settings))}
+                for who in sorted(identities)
+            ],
+        },
+        "fields": migrations.field_spec(),
+        "options": migrations.option_lists(cfg),
+        "services": [
+            {"name": m.name, "repos": m.repos, "track_leads": m.track_leads}
+            for m in cfg.microservices
+        ],
+        "statuses": [{"key": k, "label": v} for k, v in migrations.STATUS_LABELS.items()],
+        "request_fields": list(migrations.REQUEST_KEYS),
+        "freeze": freeze,
+        "frozen": freeze is not None,
+    }
+
+
+def _created_range(
+    created_from: str, created_to: str, from_epoch: float | None, to_epoch: float | None
+) -> tuple[float | None, float | None]:
+    """Resolve the created-date range to instants.
+
+    The browser sends epochs computed from the viewer's own midnight, so the day
+    a record falls on matches the day shown next to it. Plain dates are accepted
+    too, for callers outside the UI, and are read as UTC.
+    """
+
+    def day(value: str, end: bool) -> float | None:
+        value = (value or "").strip()
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail=f"“{value}” is not a date (use YYYY-MM-DD)."
+            ) from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        if end and parsed.timetz() == time(0, 0, tzinfo=parsed.tzinfo):
+            # A bare end date means the whole of that day, not its first instant.
+            parsed = parsed + timedelta(days=1) - timedelta(microseconds=1)
+        return parsed.timestamp()
+
+    return (
+        from_epoch if from_epoch is not None else day(created_from, False),
+        to_epoch if to_epoch is not None else day(created_to, True),
+    )
+
+
+@app.get("/api/migrations/records")
+async def migrations_list(
+    request: Request,
+    release: str = Query(default=""),
+    microservice: str = Query(default=""),
+    migration_path: str = Query(default=""),
+    status: str = Query(default=""),
+    mine: bool = Query(default=False),
+    created_from: str = Query(default=""),
+    created_to: str = Query(default=""),
+    created_from_epoch: float | None = Query(default=None),
+    created_to_epoch: float | None = Query(default=None),
+    sort: str = Query(default="sl_no"),
+    dir: str = Query(default="desc"),
+    include_inactive: bool = Query(default=False),
+) -> dict:
+    store_ = _require_migrations()
+    user = current_user(request)
+    auth.require_signed_in(user)
+
+    since, until = _created_range(created_from, created_to, created_from_epoch, created_to_epoch)
+    rows = store_.list(
+        release=release,
+        microservice=microservice,
+        migration_path=migration_path,
+        status=status,
+        created_by=user.email if mine else "",
+        created_from=since,
+        created_to=until,
+        sort=sort,
+        direction=dir,
+        include_inactive=include_inactive,
+    )
+    # The client renders from this, but never decides it — every write is
+    # re-checked server-side in apply_changes.
+    for row in rows:
+        row["editable"] = migrations.editable_fields(user, row)
+    return {
+        "rows": rows,
+        "count": len(rows),
+        "user": user.as_dict(),
+        "sort": {"field": sort if sort in migrations.SORTABLE else "sl_no", "dir": dir},
+        "sortable": list(migrations.SORTABLE),
+        "can_retire": user.has_any("approver", "admin"),
+    }
+
+
+@app.post("/api/migrations/records", status_code=201)
+async def migrations_create(request: Request, payload: dict[str, Any]) -> dict:
+    store_ = _require_migrations()
+    user = current_user(request)
+    auth.require_signed_in(user)
+    row = migrations.create_record(settings, store_, user, payload or {})
+    row["editable"] = migrations.editable_fields(user, row)
+    return row
+
+
+@app.patch("/api/migrations/records/{sl_no}")
+async def migrations_update(request: Request, sl_no: int, payload: dict[str, Any]) -> dict:
+    store_ = _require_migrations()
+    user = current_user(request)
+    auth.require_signed_in(user)
+    row = migrations.apply_changes(settings, store_, user, sl_no, payload or {})
+    row["editable"] = migrations.editable_fields(user, row)
+    return row
+
+
+@app.post("/api/migrations/records/{sl_no}/active")
+async def migrations_set_active(request: Request, sl_no: int, payload: dict[str, Any]) -> dict:
+    """Retire a record, or bring it back. Approvers and admins.
+
+    Reversible, and the change is recorded — unlike DELETE below, which is not.
+    """
+    store_ = _require_migrations()
+    user = current_user(request)
+    auth.require_role(user, "approver", "admin")
+
+    active = bool(payload.get("active", True))
+    row = store_.set_active(sl_no, active, user)
+    row["editable"] = migrations.editable_fields(user, row)
+    return row
+
+
+@app.delete("/api/migrations/records/{sl_no}")
+async def migrations_delete(request: Request, sl_no: int) -> dict:
+    """Remove a record and its history permanently. Approvers and admins.
+
+    A freeze blocks this too: it stops record entry, and erasing one is the most
+    final kind of entry there is.
+    """
+    store_ = _require_migrations()
+    user = current_user(request)
+    auth.require_role(user, "approver", "admin")
+
+    if store_.active_freeze():
+        raise HTTPException(
+            status_code=423,
+            detail="Record entry is frozen. An approver can lift the freeze.",
+        )
+    if store_.get(sl_no) is None:
+        raise HTTPException(status_code=404, detail=f"No record with SL# {sl_no}.")
+    store_.delete(sl_no)
+    return {"deleted": sl_no}
+
+
+@app.get("/api/migrations/records/{sl_no}/audit")
+async def migrations_audit(request: Request, sl_no: int) -> dict:
+    store_ = _require_migrations()
+    auth.require_signed_in(current_user(request))
+    if store_.get(sl_no) is None:
+        raise HTTPException(status_code=404, detail=f"No record with SL# {sl_no}.")
+    return {"sl_no": sl_no, "entries": store_.audit(sl_no)}
+
+
+@app.get("/api/migrations/template")
+async def migrations_template(request: Request) -> Response:
+    _require_migrations()
+    auth.require_signed_in(current_user(request))
+    return Response(
+        content=migration_sheet.build_template(settings.migrations),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="migration-requests-template.xlsx"'},
+    )
+
+
+@app.post("/api/migrations/upload")
+async def migrations_upload(
+    request: Request,
+    file: UploadFile = File(..., description="A .xlsx or .csv of migration requests"),
+    commit: bool = Form(default=False),
+) -> dict:
+    """Validate an uploaded sheet, and import it only when `commit` is set.
+
+    The default is a dry run so the UI can show exactly what would be created
+    before anything is.
+    """
+    store_ = _require_migrations()
+    user = current_user(request)
+    auth.require_signed_in(user)
+    if not user.is_developer and not user.is_approver:
+        raise HTTPException(status_code=403, detail="Raising requests needs the developer role.")
+
+    content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="That file is larger than 5 MB.")
+
+    try:
+        sheet = migration_sheet.parse(file.filename or "", content)
+    except spreadsheet.SheetError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    results = migration_sheet.check_rows(sheet["rows"], settings.migrations)
+    valid = [r for r in results if r["ok"]]
+
+    created: list[dict[str, Any]] = []
+    if commit:
+        if not valid:
+            raise HTTPException(status_code=422, detail="No row in that sheet is valid.")
+        # Checked once here rather than per row, so a freeze starting mid-import
+        # cannot let half a sheet through.
+        if store_.active_freeze():
+            raise HTTPException(
+                status_code=423,
+                detail="Record entry is frozen. An approver can lift the freeze.",
+            )
+        for result in valid:
+            created.append(store_.insert(result["values"], user))
+
+    return {
+        "committed": commit,
+        "sheet": {
+            "filename": file.filename,
+            "columns": sheet["columns"],
+            "header_row": sheet["header_row"],
+            "ignored": sheet["ignored"],
+        },
+        "total": len(results),
+        "valid": len(valid),
+        "invalid": len(results) - len(valid),
+        "results": results,
+        "created": created,
+    }
+
+
+@app.get("/api/migrations/freezes")
+async def migrations_freezes(request: Request, include_past: bool = Query(default=False)) -> dict:
+    store_ = _require_migrations()
+    user = current_user(request)
+    auth.require_signed_in(user)
+    return {
+        "freezes": store_.freezes(include_past=include_past),
+        "active": store_.active_freeze(),
+        "can_manage": user.is_approver,
+    }
+
+
+@app.post("/api/migrations/freezes", status_code=201)
+async def migrations_add_freeze(request: Request, payload: dict[str, Any]) -> dict:
+    store_ = _require_migrations()
+    user = current_user(request)
+    auth.require_role(user, "approver")
+
+    def instant(epoch_key: str, iso_key: str) -> float:
+        if payload.get(epoch_key) not in (None, ""):
+            return float(payload[epoch_key])
+        raw = str(payload.get(iso_key) or "").strip()
+        if not raw:
+            raise HTTPException(status_code=422, detail=f"{iso_key} is required.")
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"{iso_key} is not a date and time.") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+
+    return store_.add_freeze(
+        instant("starts_epoch", "starts_at"),
+        instant("ends_epoch", "ends_at"),
+        str(payload.get("reason") or ""),
+        user,
+    )
+
+
+@app.delete("/api/migrations/freezes/{freeze_id}")
+async def migrations_delete_freeze(request: Request, freeze_id: int) -> dict:
+    store_ = _require_migrations()
+    auth.require_role(current_user(request), "approver")
+    if not store_.delete_freeze(freeze_id):
+        raise HTTPException(status_code=404, detail="No such freeze.")
+    return {"deleted": freeze_id}
+
+
+@app.get("/api/migrations/export.csv")
+async def migrations_export(
+    request: Request,
+    release: str = Query(default=""),
+    microservice: str = Query(default=""),
+    migration_path: str = Query(default=""),
+    status: str = Query(default=""),
+    created_from: str = Query(default=""),
+    created_to: str = Query(default=""),
+    created_from_epoch: float | None = Query(default=None),
+    created_to_epoch: float | None = Query(default=None),
+    sort: str = Query(default="sl_no"),
+    dir: str = Query(default="desc"),
+    include_inactive: bool = Query(default=False),
+) -> Response:
+    """The full register as CSV — every field, including the role-gated ones."""
+    import csv as _csv
+    import io as _io
+
+    store_ = _require_migrations()
+    auth.require_signed_in(current_user(request))
+    since, until = _created_range(created_from, created_to, created_from_epoch, created_to_epoch)
+    rows = store_.list(
+        release=release, microservice=microservice,
+        migration_path=migration_path, status=status,
+        created_from=since, created_to=until, sort=sort, direction=dir,
+        include_inactive=include_inactive,
+    )
+
+    buffer = _io.StringIO()
+    writer = _csv.writer(buffer)
+    writer.writerow([f.label for f in migrations.FIELDS] + ["Status", "Active"])
+    for row in rows:
+        writer.writerow(
+            [row.get(f.key, "") for f in migrations.FIELDS]
+            + [row["status_label"], "Yes" if row["active"] else "No"]
+        )
+
+    return Response(
+        content=buffer.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="migration-requests.csv"'},
+    )

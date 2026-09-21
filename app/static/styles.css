@@ -1233,3 +1233,247 @@ select:focus-visible, .input:focus-visible, .btn:focus-visible {
 .lookup-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .order-actions { margin-left: auto; flex-shrink: 0; }
 .order-head { row-gap: 6px; }
+
+/* ---------- release plan from a spreadsheet ---------- */
+
+.plan-bar .field.block.grow { flex: 2 1 320px; }
+.plan-bar input[type="file"] { padding: 5px 7px; font-size: 12.5px; }
+.plan-bar #plan-convention { font-family: var(--mono); font-size: 12.5px; }
+
+.plan-help {
+  margin: -6px 0 0;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  font-size: 12.5px;
+}
+.plan-help summary { cursor: pointer; color: var(--muted); }
+.plan-help summary:hover { color: var(--accent-ink); }
+.plan-tokens {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+  gap: 4px 18px;
+  margin-top: 10px;
+}
+.plan-token { display: flex; gap: 8px; align-items: baseline; }
+.plan-token code {
+  flex: 0 0 108px;
+  font: 11.5px var(--mono);
+  color: var(--accent-ink);
+}
+.plan-token span { color: var(--muted); }
+
+.plan-sub { margin-top: 2px; font-size: 11.5px; line-height: 1.45; }
+.plan-sub.warn { color: #8a4b12; }
+.chip.tag.proposed { background: var(--accent-soft); color: var(--accent-ink); border-color: transparent; }
+
+/* ---------- migration requests ---------- */
+
+:root {
+  /* Amber marks the four risk flags. Ink/background measured against each
+     other and against white: 6.64:1 and 7.48:1, both clear of AA at 11px. */
+  --amber-soft: #fdf0d8;
+  --amber-ink: #7a4a00;
+  --amber-line: #e8c98c;
+}
+
+.mig-bar { flex-wrap: wrap; }
+.mig-bar .field.block { min-width: 150px; flex: 1 1 150px; }
+.field.inline { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.mig-mine { align-self: flex-end; padding-bottom: 8px; font-size: 12.5px; }
+
+#mig-notices { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+
+.mig-whoami {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12.5px; color: var(--muted);
+}
+.mig-who { font-weight: 600; color: var(--text); }
+.mig-roles {
+  padding: 2px 8px; border-radius: 999px;
+  background: var(--surface-2); color: var(--muted);
+  font-size: 11px; font-weight: 650; letter-spacing: 0.03em; text-transform: uppercase;
+}
+
+.mig-note {
+  padding: 9px 12px; border-radius: 8px; font-size: 12.5px; line-height: 1.5;
+  border: 1px solid transparent;
+}
+.mig-note.warn { background: #fdf4e3; color: #8a5300; border-color: #eed9ae; }
+.mig-note.freeze { background: #fdecec; color: #8a1c1c; border-color: #f0c9c9; }
+.mig-note code {
+  font-family: var(--mono); font-size: 11.5px;
+  background: rgba(0, 0, 0, 0.05); padding: 1px 4px; border-radius: 4px;
+}
+
+/* --- the register table --- */
+
+.mig-table td { vertical-align: middle; }
+.mig-risk { min-width: 130px; }
+.mig-amber {
+  display: inline-block; margin: 1px 3px 1px 0; padding: 2px 7px;
+  border-radius: 999px; border: 1px solid var(--amber-line);
+  background: var(--amber-soft); color: var(--amber-ink);
+  font-size: 10.5px; font-weight: 650; letter-spacing: 0.02em; white-space: nowrap;
+}
+.mig-status {
+  display: inline-block; padding: 2px 9px; border-radius: 999px;
+  font-size: 11px; font-weight: 650; white-space: nowrap;
+  background: var(--surface-2); color: var(--muted);
+}
+.mig-status.ok { background: var(--accent-soft); color: var(--accent-ink); }
+.mig-status.done { background: #e5f3ea; color: #0f5c34; }
+.mig-status.wait { background: var(--surface-2); color: var(--muted); }
+
+.linkish {
+  border: 0; background: none; padding: 0; cursor: pointer;
+  font: inherit; color: var(--accent-ink); font-weight: 650;
+}
+.linkish:hover { text-decoration: underline; }
+
+/* --- the dialogs --- */
+
+.mig-dialog { width: min(1080px, calc(100vw - 32px)); max-height: calc(100vh - 64px); }
+.mig-dialog-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 14px 18px; border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; background: var(--surface); z-index: 1;
+}
+.mig-dialog-head h2 { font-size: 16px; }
+.mig-x {
+  border: 0; background: none; font-size: 22px; line-height: 1;
+  cursor: pointer; color: var(--muted); padding: 0 4px;
+}
+.mig-x:hover { color: var(--text); }
+/* The head and foot are sticky, so the scroll belongs to the body alone. */
+.mig-dialog-body { padding: 14px 18px; overflow-y: auto; max-height: calc(100vh - 190px); }
+.mig-dialog-foot {
+  display: flex; flex-direction: column; align-items: stretch; gap: 10px;
+  padding: 12px 18px; border-top: 1px solid var(--border);
+  position: sticky; bottom: 0; background: var(--surface);
+}
+.mig-foot-actions { display: flex; justify-content: flex-end; gap: 8px; }
+/* Empty slot must take no room, or every dialog gains a phantom gap. */
+.mig-error-slot:empty { display: none; }
+
+.mig-field.is-bad .input,
+.mig-field.is-bad select,
+.mig-field.is-bad textarea { border-color: #b3261e; background: #fff7f7; }
+.mig-field.is-bad label { color: #8a1c1c; }
+.mig-field-error { margin: 2px 0 0; font-size: 11.5px; color: #8a1c1c; line-height: 1.4; }
+
+.mig-grid {
+  display: grid; gap: 12px 16px;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+}
+.mig-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.mig-field.wide { grid-column: 1 / -1; }
+.mig-field label {
+  font-size: 11px; font-weight: 650; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--muted);
+  display: flex; align-items: center; gap: 4px;
+}
+.mig-field .input, .mig-field select { width: 100%; }
+.mig-field textarea.input { font: inherit; resize: vertical; }
+.mig-req { color: #a32020; font-weight: 700; }
+.mig-flagmark { color: var(--amber-ink); font-size: 9px; }
+.mig-hint { margin: 0; font-size: 11.5px; color: var(--muted); line-height: 1.45; }
+
+.mig-readonly {
+  padding: 7px 10px; border-radius: 8px; min-height: 34px;
+  background: var(--surface-2); color: var(--text);
+  font-size: 13px; word-break: break-word;
+}
+.mig-readonly.is-amber, .mig-input.is-amber {
+  background: var(--amber-soft); color: var(--amber-ink);
+  border-color: var(--amber-line); font-weight: 600;
+}
+
+.mig-stage { margin-bottom: 18px; }
+.mig-stage h3 {
+  margin: 0 0 10px; font-size: 12px; font-weight: 700;
+  letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted);
+  display: flex; align-items: center; gap: 8px;
+  padding-bottom: 6px; border-bottom: 1px solid var(--border);
+}
+.mig-stage.is-open h3 { color: var(--accent-ink); border-bottom-color: var(--accent); }
+.mig-yours {
+  padding: 1px 7px; border-radius: 999px; text-transform: none; letter-spacing: 0;
+  background: var(--accent-soft); color: var(--accent-ink); font-size: 10.5px;
+}
+
+.mig-audit { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 10px; }
+.mig-audit summary { cursor: pointer; font-size: 12.5px; font-weight: 650; color: var(--accent-ink); }
+.mig-audit-table { margin-top: 10px; font-size: 12px; }
+
+.mig-problems { margin: 0; padding-left: 16px; font-size: 12px; color: #8a1c1c; }
+tr.is-bad td { background: #fdecec; }
+tr.is-active td { background: var(--amber-soft); }
+tr.is-past td { color: var(--muted); }
+
+.mig-freeze-form { margin: 12px 0 16px; }
+
+@media (max-width: 720px) {
+  .mig-grid { grid-template-columns: 1fr; }
+  .mig-dialog-body { max-height: calc(100vh - 210px); }
+}
+
+/* Dev mode: deliberately conspicuous. Someone must not be able to mistake a
+   self-declared identity for a real sign-in at a glance. */
+.mig-devbar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 12px; border-radius: 8px;
+  background: var(--amber-soft); border: 1px solid var(--amber-line);
+  font-size: 12.5px; color: var(--amber-ink);
+}
+.mig-devbar label { font-weight: 650; }
+.mig-devbar select { min-width: 240px; }
+.mig-devtag {
+  padding: 2px 8px; border-radius: 999px;
+  background: var(--amber-ink); color: #fff;
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+}
+
+/* Sortable column headers. The button carries the padding so the whole header
+   cell is the hit target, not just the few pixels of text. */
+.mig-table th.mig-sortable { padding: 0; }
+.mig-sort {
+  display: flex; align-items: center; gap: 5px;
+  width: 100%; padding: 8px 12px;
+  border: 0; background: none; cursor: pointer;
+  font: inherit; color: inherit; letter-spacing: inherit; text-align: left;
+  white-space: nowrap;
+}
+.mig-sort:hover { color: var(--text); background: rgba(0, 0, 0, 0.04); }
+.mig-sort:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.mig-table th.is-sorted { color: var(--accent-ink); }
+.mig-arrow { font-size: 8px; line-height: 1; }
+/* Reserve the arrow's width on every sortable header so the columns do not
+   shift sideways as the sort moves between them. */
+.mig-sortable .mig-arrow { min-width: 8px; }
+
+.mig-table .mig-date { white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+/* Destructive actions. Outlined at rest rather than a solid red slab — it sits
+   next to Close and should read as available, not as the obvious next step. */
+.btn.danger { color: #8a1c1c; border-color: #e7b9b9; }
+.btn.danger:hover { background: #fdecec; border-color: #d99a9a; }
+/* The confirm step is the one place it is filled, because by then it is the
+   action being asked about. */
+.mig-foot-actions .btn.danger#mig-del-yes {
+  background: #b3261e; border-color: #b3261e; color: #fff;
+}
+.mig-foot-actions .btn.danger#mig-del-yes:hover { filter: brightness(1.08); }
+
+.mig-foot-left { display: flex; gap: 8px; margin-right: auto; }
+.mig-confirm {
+  flex: 1 1 auto; align-self: center; text-align: left;
+  font-size: 12.5px; color: #8a1c1c; line-height: 1.45;
+}
+
+.mig-status.retired { background: var(--surface-2); color: var(--muted); }
+.mig-table tr.is-inactive td { background: #fafbfc; color: var(--muted); }
+.mig-table tr.is-inactive .mono,
+.mig-table tr.is-inactive .mig-date { opacity: 0.75; }
+.mig-table tr.is-inactive:hover td { background: var(--surface-2); }

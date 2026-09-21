@@ -41,6 +41,70 @@ class CsrRepo:
         return f"{self.web_url}/+/{sha}"
 
 
+# "admin" is a superset: every permission check any other role satisfies, it
+# satisfies too (see User.has_any). It exists so that clearing up the register —
+# deactivating and deleting records — can be separated from approving them.
+ROLES = ("developer", "approver", "devops", "admin")
+
+
+@dataclass(frozen=True)
+class Microservice:
+    """One microservice, with the repos and track leads that depend on it."""
+
+    name: str
+    repos: list[str] = field(default_factory=list)
+    track_leads: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AuthConfig:
+    """How a request's user is identified, and which roles they hold.
+
+    Identity comes from a header set by an SSO proxy in front of this app. That
+    is only trustworthy if the app cannot be reached except through that proxy —
+    anyone able to connect directly can set the header themselves. `trusted_proxies`
+    is the guard: when set, the header is honoured only from those addresses.
+    """
+
+    header: str = "X-Forwarded-Email"
+    trusted_proxies: list[str] = field(default_factory=list)
+    # Testing without an SSO proxy: the caller says who they are. Off unless
+    # switched on explicitly, and honoured only from the loopback interface
+    # unless dev_allow_remote is also set — so leaving it on by mistake in a
+    # deployed environment does not hand everyone the approver role.
+    dev_mode: bool = False
+    dev_allow_remote: bool = False
+    # The identity assumed when dev mode is on and nothing has been chosen.
+    dev_user: str = ""
+    # role -> email patterns ("someone@x.com" or "*@x.com"), matched case-insensitively.
+    roles: dict[str, list[str]] = field(default_factory=dict)
+
+    @property
+    def configured(self) -> bool:
+        # self.roles always holds a key per role, so test the patterns, not the dict.
+        return any(self.roles.values())
+
+
+@dataclass
+class MigrationConfig:
+    """Reference lists for the migration request form."""
+
+    enabled: bool = False
+    releases: list[str] = field(default_factory=list)
+    migration_paths: list[str] = field(default_factory=list)
+    microservices: list[Microservice] = field(default_factory=list)
+    change_requestors: list[str] = field(default_factory=list)
+    approvers: list[str] = field(default_factory=list)
+
+    def service(self, name: str) -> Microservice | None:
+        want = (name or "").strip().casefold()
+        return next((m for m in self.microservices if m.name.casefold() == want), None)
+
+    @property
+    def service_names(self) -> list[str]:
+        return [m.name for m in self.microservices]
+
+
 @dataclass
 class Settings:
     token: str
@@ -67,6 +131,10 @@ class Settings:
     tagger_name: str = ""
     tagger_email: str = ""
     git_timeout: int = 240
+    # Migration requests
+    auth: AuthConfig = field(default_factory=AuthConfig)
+    migrations: MigrationConfig = field(default_factory=MigrationConfig)
+    migration_store_path: Path = ROOT / ".cache" / "migrations.sqlite3"
 
     @property
     def has_github(self) -> bool:
@@ -141,6 +209,74 @@ def _parse_csr_repos(section: dict | None) -> list[CsrRepo]:
     return out
 
 
+def _parse_auth(section: dict | None) -> AuthConfig:
+    section = section or {}
+    raw_roles = section.get("roles") or {}
+    roles: dict[str, list[str]] = {}
+    for role in ROLES:
+        entries = raw_roles.get(role) or []
+        if isinstance(entries, str):
+            entries = [entries]
+        roles[role] = [str(e).strip() for e in entries if str(e).strip()]
+
+    proxies = section.get("trusted_proxies") or []
+    if isinstance(proxies, str):
+        proxies = [proxies]
+
+    return AuthConfig(
+        header=str(section.get("header") or "X-Forwarded-Email").strip(),
+        trusted_proxies=[str(p).strip() for p in proxies if str(p).strip()],
+        dev_mode=bool(section.get("dev_mode", False)),
+        dev_allow_remote=bool(section.get("dev_allow_remote", False)),
+        dev_user=str(section.get("dev_user") or "").strip(),
+        roles=roles,
+    )
+
+
+def _parse_migrations(section: dict | None) -> MigrationConfig:
+    section = section or {}
+
+    def as_list(key: str) -> list[str]:
+        raw = section.get(key) or []
+        if isinstance(raw, str):
+            raw = [raw]
+        return [str(v).strip() for v in raw if str(v).strip()]
+
+    services: list[Microservice] = []
+    for entry in section.get("microservices") or []:
+        if isinstance(entry, dict):
+            name = str(entry.get("name") or "").strip()
+            repos = entry.get("repos") or ([entry["repo"]] if entry.get("repo") else [])
+            leads = entry.get("track_leads") or (
+                [entry["track_lead"]] if entry.get("track_lead") else []
+            )
+        else:
+            # A bare name is allowed; its repo and lead lists are then empty.
+            name, repos, leads = str(entry).strip(), [], []
+        if not name:
+            continue
+        if isinstance(repos, str):
+            repos = [repos]
+        if isinstance(leads, str):
+            leads = [leads]
+        services.append(
+            Microservice(
+                name=name,
+                repos=[str(r).strip() for r in repos if str(r).strip()],
+                track_leads=[str(l).strip() for l in leads if str(l).strip()],
+            )
+        )
+
+    return MigrationConfig(
+        enabled=bool(section.get("enabled", bool(services))),
+        releases=as_list("releases"),
+        migration_paths=as_list("migration_paths"),
+        microservices=services,
+        change_requestors=as_list("change_requestors"),
+        approvers=as_list("approvers"),
+    )
+
+
 def load_settings() -> Settings:
     raw = _load_yaml()
     defaults = raw.get("defaults") or {}
@@ -172,4 +308,7 @@ def load_settings() -> Settings:
         tagger_name=os.getenv("TAGGER_NAME", "").strip(),
         tagger_email=os.getenv("TAGGER_EMAIL", "").strip(),
         git_timeout=int(os.getenv("GIT_TIMEOUT_SECONDS", "240")),
+        auth=_parse_auth(raw.get("auth")),
+        migrations=_parse_migrations(raw.get("migrations")),
+        migration_store_path=cache_root / "migrations.sqlite3",
     )

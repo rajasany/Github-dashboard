@@ -86,6 +86,15 @@ const el = {
   lkSha: $("lk-sha"),
   lkRun: $("lk-run"),
   lkBody: $("lk-body"),
+  panelPlan: $("panel-plan"),
+  planFile: $("plan-file"),
+  planConvention: $("plan-convention"),
+  planBranch: $("plan-branch"),
+  planRun: $("plan-run"),
+  planCsv: $("plan-csv"),
+  planScope: $("plan-scope"),
+  planBody: $("plan-body"),
+  planPlaceholders: $("plan-placeholders"),
   panelTags: $("panel-tags"),
   panelOrder: $("panel-order"),
   ordInput: $("ord-input"),
@@ -171,6 +180,7 @@ const state = {
   lookup: null,
   tags: null,
   order: null,
+  plan: null,
   staged: [],
   // The row a tag is being created for, and the tag queued for pushing.
   tagTarget: null,
@@ -1323,6 +1333,14 @@ const TABS = {
   lookup: { panel: () => el.panelLookup, sidebar: false, onShow: () => el.lkSha.focus?.() },
   tags: { panel: () => el.panelTags, sidebar: false, onShow: initTagsTab },
   order: { panel: () => el.panelOrder, sidebar: false, onShow: initOrderTab },
+  plan: { panel: () => el.panelPlan, sidebar: false, onShow: initPlanTab },
+  // Lives in migrations.js. Looked up lazily so a load-order change here
+  // cannot leave the tab registry referencing an undefined function.
+  migrations: {
+    panel: () => $("panel-migrations"),
+    sidebar: false,
+    onShow: () => window.initMigrationsTab?.(),
+  },
 };
 
 function showTab(name) {
@@ -2599,4 +2617,200 @@ on(el.ordClear, "click", () => {
   el.ordProblems.replaceChildren();
   el.ordBody.replaceChildren();
   state.order = null;
+});
+
+/* ---------- release plan from a spreadsheet ---------- */
+
+async function initPlanTab() {
+  if (el.planPlaceholders.children.length || el.planPlaceholders.innerHTML) return;
+  try {
+    const res = await fetch("/api/bulk/placeholders");
+    const body = await res.json();
+    el.planPlaceholders.innerHTML = (body.placeholders || [])
+      .map(
+        (p) =>
+          `<div class="plan-token"><code>${escapeHtml(p.token)}</code><span>${escapeHtml(p.help)}</span></div>`
+      )
+      .join("");
+  } catch {
+    el.planPlaceholders.innerHTML = '<p class="muted">Could not load the placeholder list.</p>';
+  }
+}
+
+async function runPlan() {
+  const file = el.planFile.files?.[0];
+  if (!file) {
+    el.planScope.textContent = "Choose a .xlsx or .csv file first.";
+    return;
+  }
+  const convention = el.planConvention.value.trim();
+  if (!convention) {
+    el.planScope.textContent = "Give a tag convention.";
+    return;
+  }
+
+  el.planRun.disabled = true;
+  el.planRun.textContent = "Processing…";
+  el.planBody.replaceChildren(
+    stateNode("Reading the sheet…", "Resolving each row, then summarising its folder.")
+  );
+
+  try {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("convention", convention);
+    if (el.planBranch.value.trim()) form.append("branch", el.planBranch.value.trim());
+    if (el.dateFrom.value) form.append("since", el.dateFrom.value);
+    else form.append("days", "14");
+
+    const res = await fetch("/api/bulk/process", { method: "POST", body: form });
+    const body = await res.json();
+    if (!res.ok) {
+      el.planScope.textContent = "";
+      el.planBody.replaceChildren(stateNode("Could not process that file", body.detail || res.statusText));
+      return;
+    }
+    state.plan = body;
+    renderPlan();
+  } catch (err) {
+    el.planBody.replaceChildren(stateNode("Could not process that file", err.message));
+  } finally {
+    el.planRun.disabled = false;
+    el.planRun.textContent = "Process";
+  }
+}
+
+function renderPlan() {
+  const d = state.plan;
+  if (!d) return;
+
+  const s = d.sheet || {};
+  el.planScope.textContent =
+    `${escapeHtml(s.filename || "sheet")} · header on row ${s.header_row} · ` +
+    `columns ${(s.columns || []).join(", ")} · ` +
+    `${d.resolved} of ${d.total} rows resolved` +
+    (d.failed ? `, ${d.failed} could not be` : "") +
+    (s.ignored ? ` · ${s.ignored} blank row(s) skipped` : "") +
+    ` · ${d.commits_total} commits summarised`;
+
+  const ok = d.rows.filter((r) => !r.error);
+  const bad = d.rows.filter((r) => r.error);
+
+  const parts = [];
+
+  if (ok.length) {
+    parts.push(`
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Repository</th><th>Folder</th><th>Branch</th>
+              <th>Latest commit</th><th class="num">Changes</th>
+              <th>Existing tag</th><th>Proposed tag</th><th></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${ok
+              .map(
+                (r) => `
+              <tr>
+                <td>${escapeHtml(r.repo)}</td>
+                <td>${
+                  r.folder
+                    ? `<span class="chip folder">${ICON.folder}<span class="txt">${escapeHtml(r.folder)}</span></span>`
+                    : '<span class="muted">whole repo</span>'
+                }</td>
+                <td><span class="chip branch">${ICON.branch}<span class="txt">${escapeHtml(r.branch)}</span></span></td>
+                <td>
+                  <a class="mono" href="${escapeAttr(r.latest_url || "#")}" target="_blank" rel="noopener">${escapeHtml(r.latest_short)}</a>
+                  <button type="button" class="copy-sha" data-sha="${escapeAttr(r.latest_sha)}" title="Copy full hash ${escapeAttr(r.latest_sha)}" aria-label="Copy full commit hash">${ICON.copy}</button>
+                  <div class="plan-sub">${escapeHtml(_clipText(r.latest_title, 46))}</div>
+                  <div class="plan-sub muted">${escapeHtml(r.latest_author)} · ${escapeHtml(fmtStamp(r.latest_date))}</div>
+                </td>
+                <td class="num">
+                  ${r.commit_count} commit${r.commit_count === 1 ? "" : "s"}
+                  <div class="plan-sub muted">${r.files_changed} files · ${r.authors.length} author${r.authors.length === 1 ? "" : "s"}</div>
+                  ${r.cherry_picks ? `<div class="plan-sub">${cherryChip({ is_cherry_pick: true, evidence: "recorded", source_sha: "" })}</div>` : ""}
+                </td>
+                <td>${
+                  r.existing_tags.length
+                    ? r.existing_tags
+                        .map((n) => `<span class="chip tag">${ICON.tag}<span class="txt">${escapeHtml(n)}</span></span>`)
+                        .join(" ")
+                    : '<span class="muted">none</span>'
+                }</td>
+                <td>
+                  <span class="chip tag proposed">${ICON.tag}<span class="txt">${escapeHtml(r.proposed_tag)}</span></span>
+                  ${r.tag_exists ? '<div class="plan-sub warn">already exists — pick another convention</div>' : ""}
+                </td>
+                <td>${
+                  r.tag_exists
+                    ? ""
+                    : tagButton(r.repo_key, r.repo, r.latest_sha, r.latest_title)
+                }</td>
+              </tr>`
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </div>`);
+  }
+
+  if (bad.length) {
+    parts.push(`
+      <div class="order-problems">
+        <h4>${bad.length} row${bad.length === 1 ? "" : "s"} could not be summarised</h4>
+        <ul>${bad
+          .map(
+            (r) =>
+              `<li>row ${r.row}: <code>${escapeHtml(r.input_repo || "(blank)")}</code> — ${escapeHtml(r.error)}</li>`
+          )
+          .join("")}</ul>
+      </div>`);
+  }
+
+  if (!ok.length && !bad.length) {
+    el.planBody.replaceChildren(stateNode("Nothing to show", "The sheet had no usable rows."));
+    return;
+  }
+
+  const box = document.createElement("div");
+  box.innerHTML = parts.join("");
+  el.planBody.replaceChildren(box);
+}
+
+function planCsv() {
+  const d = state.plan;
+  if (!d?.rows?.length) return;
+  const cell = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const lines = [
+    ["repository", "folder", "branch", "latest_commit_hash", "latest_commit_date",
+     "latest_commit_author", "latest_commit_message", "commits", "files_changed",
+     "authors", "directories", "existing_tags", "proposed_tag", "problem"]
+      .map(cell)
+      .join(","),
+  ];
+  for (const r of d.rows) {
+    lines.push(
+      [
+        r.repo || r.input_repo, r.folder || "", r.branch || "",
+        r.latest_sha || "", r.latest_date || "", r.latest_author || "", r.latest_title || "",
+        r.commit_count ?? "", r.files_changed ?? "",
+        (r.authors || []).join("; "), (r.directories || []).join("; "),
+        (r.existing_tags || []).join("; "), r.proposed_tag || "", r.error || "",
+      ]
+        .map(cell)
+        .join(",")
+    );
+  }
+  downloadBlob(new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" }), "release-plan.csv");
+}
+
+on(el.planRun, "click", runPlan);
+on(el.planCsv, "click", planCsv);
+// Picking a file is a strong signal the next action is Process.
+on(el.planFile, "change", () => {
+  el.planScope.textContent = el.planFile.files?.[0]
+    ? `${el.planFile.files[0].name} ready — press Process.`
+    : "";
 });

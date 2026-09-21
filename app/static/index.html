@@ -52,6 +52,8 @@
     <button class="tab" id="tab-lookup" data-tab="lookup" role="tab" aria-selected="false">Find a commit</button>
     <button class="tab" id="tab-tags" data-tab="tags" role="tab" aria-selected="false">Tags</button>
     <button class="tab" id="tab-order" data-tab="order" role="tab" aria-selected="false">Order commits</button>
+    <button class="tab" id="tab-plan" data-tab="plan" role="tab" aria-selected="false">Release plan</button>
+    <button class="tab" id="tab-migrations" data-tab="migrations" role="tab" aria-selected="false">Migrations</button>
   </nav>
 
   <div id="banner" class="banner hidden"></div>
@@ -244,6 +246,92 @@
         <div id="ord-body"></div>
       </div>
 
+      <!-- ============ Release plan from a spreadsheet ============ -->
+      <div id="panel-plan" class="tab-panel hidden">
+        <section class="picker-bar plan-bar">
+          <label class="field block">
+            <span>Spreadsheet</span>
+            <input id="plan-file" class="input" type="file" accept=".xlsx,.xlsm,.csv,.tsv" />
+          </label>
+          <label class="field block grow">
+            <span>Tag convention</span>
+            <input id="plan-convention" class="input" type="text" spellcheck="false"
+                   value="release/{repo_name}/{folder_slug}/{yyyy}.{mm}.{n:02}" />
+          </label>
+          <label class="field block">
+            <span>Branch override</span>
+            <input id="plan-branch" class="input" type="text" spellcheck="false" placeholder="from the sheet" />
+          </label>
+          <div class="picker-actions">
+            <button id="plan-run" class="btn primary">Process</button>
+            <button id="plan-csv" class="btn tiny" title="Download these results as CSV">CSV</button>
+          </div>
+        </section>
+
+        <p class="scope-line">
+          Columns are matched by name — <strong>Repository</strong> is required; <em>Folder</em>,
+          <em>Branch</em> and <em>Notes</em> are optional and several spellings are accepted.
+          <a id="plan-template" href="/api/bulk/template">Download a template</a>.
+          The date range in the header sets how far back each summary looks.
+        </p>
+        <details id="plan-help" class="plan-help">
+          <summary>Placeholders you can use in the convention</summary>
+          <div id="plan-placeholders" class="plan-tokens"></div>
+        </details>
+
+        <p id="plan-scope" class="scope-line"></p>
+        <div id="plan-body"></div>
+      </div>
+
+      <!-- ============ Migration requests ============ -->
+      <div id="panel-migrations" class="tab-panel hidden">
+        <div id="mig-notices"></div>
+
+        <section class="picker-bar mig-bar">
+          <label class="field block">
+            <span>Rel#</span>
+            <select id="mig-f-release" class="select"><option value="">All</option></select>
+          </label>
+          <label class="field block">
+            <span>Micro service</span>
+            <select id="mig-f-service" class="select"><option value="">All</option></select>
+          </label>
+          <label class="field block">
+            <span>Migration path</span>
+            <select id="mig-f-path" class="select"><option value="">All</option></select>
+          </label>
+          <label class="field block">
+            <span>Status</span>
+            <select id="mig-f-status" class="select"><option value="">All</option></select>
+          </label>
+          <label class="field block">
+            <span>Created from</span>
+            <input id="mig-f-from" class="input" type="date" />
+          </label>
+          <label class="field block">
+            <span>Created to</span>
+            <input id="mig-f-to" class="input" type="date" />
+          </label>
+          <label class="field inline mig-mine">
+            <input id="mig-f-mine" type="checkbox" />
+            <span>Only mine</span>
+          </label>
+          <label class="field inline mig-mine">
+            <input id="mig-f-inactive" type="checkbox" />
+            <span>Show inactive</span>
+          </label>
+          <div class="picker-actions">
+            <button id="mig-new" class="btn primary">New request</button>
+            <button id="mig-upload" class="btn">Upload sheet</button>
+            <button id="mig-freeze" class="btn">Freeze…</button>
+            <button id="mig-csv" class="btn tiny" title="Download the register as CSV">CSV</button>
+          </div>
+        </section>
+
+        <p id="mig-scope" class="scope-line"></p>
+        <div id="mig-body"></div>
+      </div>
+
       <!-- ============ Activity feed ============ -->
       <div id="panel-activity" class="tab-panel">
       <div id="stats" class="stats"></div>
@@ -312,6 +400,7 @@
     </form>
   </dialog>
 
+  <script src="/static/migrations.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>
