@@ -1536,3 +1536,68 @@ tr.is-past td { color: var(--muted); }
 /* A field the form filled in because there was only one choice. Stated, not
    silent — the value is still the person's to change. */
 .mig-hint.mig-autofilled { color: var(--accent-ink); font-weight: 600; }
+
+/* The reason box on a delete confirmation, inline with the buttons. */
+.mig-del-why { flex: 1 1 200px; min-width: 160px; }
+
+/* A tab that never reads git has no use for the controls above it: the date
+   range filters commits, Refresh refetches them, the rate meter counts GitHub
+   API calls, and the banner reports provider trouble. Hidden from <body> so the
+   banner's own className churn cannot undo it. */
+body.no-git-chrome #topbar-controls,
+body.no-git-chrome #banner,
+/* The staged/recently-pushed tag strip belongs to the git tabs: it offers to
+   push and discard tags against repositories, which is nothing to do with
+   raising a migration request. */
+body.no-git-chrome #staged-strip { display: none; }
+
+.mig-signout { font-size: 12px; color: var(--accent-ink); text-decoration: none; }
+.mig-signout:hover { text-decoration: underline; }
+
+
+/* ---------- folder timeline ---------- */
+
+.tl-bar { flex-wrap: wrap; }
+.tl-bar .field.block { min-width: 165px; flex: 1 1 165px; }
+
+/* A day heading inside the table: it keeps the thing a timeline while the
+   columns keep it a table. Sticky under the sticky column header. */
+.tl-table .tl-dayrow th {
+  position: sticky; top: 30px; z-index: 1;
+  padding: 10px 12px 6px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  font-size: 11.5px; font-weight: 700; letter-spacing: 0.05em;
+  text-transform: uppercase; color: var(--accent-ink);
+  text-align: left;
+}
+.tl-daycount {
+  display: inline-block; margin-left: 8px; padding: 1px 7px;
+  border-radius: 999px; background: var(--surface-2); color: var(--muted);
+  font-size: 10.5px; font-weight: 650; letter-spacing: 0;
+}
+
+.tl-table td { vertical-align: top; }
+.tl-when { font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--muted); }
+.tl-comment { max-width: 520px; }
+.tl-comment a { color: var(--text); text-decoration: none; }
+.tl-comment a:hover { color: var(--accent-ink); text-decoration: underline; }
+.tl-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+
+@media (max-width: 720px) {
+  /* The folder column repeats what was just filtered on; drop it first. */
+  .tl-table th:last-child, .tl-table td:last-child { display: none; }
+  .tl-comment { max-width: none; }
+}
+
+/* A cherry-picked row, marked on the row itself so it is visible when scanning
+   a column of messages rather than only when reading one. */
+.tl-table tr.is-cherry td:first-child { box-shadow: inset 3px 0 0 var(--amber-line); }
+.tl-table tr.is-cherry td { background: #fffdf7; }
+.tl-table tr.is-cherry:hover td { background: var(--amber-soft); }
+
+/* A choice the form will not accept, said where the choice was made. */
+.mig-field-error.mig-blocked {
+  padding: 6px 9px; border-radius: 6px;
+  background: #fdecec; border: 1px solid #f0c9c9;
+}

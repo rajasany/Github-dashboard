@@ -13,3 +13,7 @@ openpyxl>=3.1
 python-multipart>=0.0.9   # FastAPI multipart file uploads
 # PostgreSQL backend for the migration register (optional — SQLite needs nothing).
 psycopg[binary,pool]>=3.2
+# Built-in OpenID Connect sign-in (Google Workspace / Entra ID). Only needed
+# when auth.sso is configured.
+PyJWT[crypto]>=2.9
+itsdangerous>=2.2

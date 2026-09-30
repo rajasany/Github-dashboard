@@ -6,18 +6,20 @@ import asyncio
 import shutil
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
+from html import escape
 from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from . import (
     auth, bulk, compare, lookup, migration_sheet, migrations, naming, ordering, reference,
-    report, spreadsheet, summary, tagging,
+    report, spreadsheet, sso, summary, tagging,
 )
+from . import timeline as timeline_view
 from .config import load_settings
 from .csr import GitMirror
 from .db import Database
@@ -105,6 +107,10 @@ async def lifespan(app: FastAPI):
         seeded = reference_store.seed(settings.migrations)
         if seeded:
             print(f"  seeded reference lists from config: {seeded}", flush=True)
+        seeded_roles = reference_store.seed_roles(settings.auth.roles)
+        if seeded_roles:
+            print(f"  seeded role assignments from config: {seeded_roles}", flush=True)
+        settings.auth.live_roles = reference_store.roles()
     if settings.auth.dev_mode:
         scope = "ANY address" if settings.auth.dev_allow_remote else "loopback only"
         disabled = " — IGNORED, because auth.trusted_proxies is set" if settings.auth.trusted_proxies else ""
@@ -121,6 +127,37 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Repo Change Dashboard", version="0.2.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+# Paths that must stay reachable to someone not yet signed in: the page itself
+# and its assets (so a sign-in prompt can be shown), the sign-in routes, and the
+# liveness probe. Everything else is data.
+PUBLIC_PREFIXES = ("/static/", "/auth/")
+PUBLIC_PATHS = {"/", "/favicon.ico", "/api/health", "/api/auth/whoami"}
+
+
+@app.middleware("http")
+async def require_identity(request, call_next):
+    """Refuse unattributable requests, as one rule rather than 50 decorators.
+
+    Guarding each endpoint by hand is how `/api/tags/push` came to be reachable
+    without signing in: the guard is easy to leave off a new route, and nothing
+    notices. Here a new endpoint is protected by default and has to be named
+    above to be public, which is the safer way round.
+    """
+    path = request.url.path
+    if (
+        not settings.auth.enforced
+        or path in PUBLIC_PATHS
+        or path.startswith(PUBLIC_PREFIXES)
+    ):
+        return await call_next(request)
+
+    if not current_user(request).signed_in:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse({"detail": auth.SIGN_IN_HELP}, status_code=401)
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -161,6 +198,9 @@ async def index() -> HTMLResponse:
     html = html.replace("/static/styles.css", f"/static/styles.css?v={_asset_version('styles.css')}")
     html = html.replace(
         "/static/migrations.js", f"/static/migrations.js?v={_asset_version('migrations.js')}"
+    )
+    html = html.replace(
+        "/static/timeline.js", f"/static/timeline.js?v={_asset_version('timeline.js')}"
     )
     return HTMLResponse(html)
 
@@ -613,8 +653,19 @@ async def gcloud_auth_page() -> FileResponse:
 
 
 @app.post("/api/gcloud/login")
-async def start_gcloud_login() -> dict:
+async def start_gcloud_login(request: Request) -> dict:
     global _gcloud_login_task
+    peer = request.client.host if request.client else None
+    if not auth._is_loopback(peer):
+        # `gcloud auth login` authenticates the *machine*, not the caller. On a
+        # shared host that would change the identity every other user's data is
+        # read with, so it is a laptop convenience only.
+        raise HTTPException(
+            status_code=403,
+            detail="gcloud sign-in runs on the server itself, so it is only offered "
+                   "from the machine the server runs on. On a deployed instance, give "
+                   "the service its own credentials instead — see the README.",
+        )
     if not settings.has_csr:
         raise HTTPException(status_code=400, detail="No Google Cloud Source Repositories configured.")
     if _gcloud_login_task is None or _gcloud_login_task.done():
@@ -628,6 +679,73 @@ async def gcloud_status() -> dict:
     running = _gcloud_login_task is not None and not _gcloud_login_task.done()
     authenticated = await mirror.tokens.is_authenticated()
     return {"running": running, "authenticated": authenticated, "error": None if running else _gcloud_login_error}
+
+
+def _resolve_instant_window(
+    days: int | None,
+    since: str, until: str,
+    since_epoch: float | None, until_epoch: float | None,
+) -> tuple[datetime, datetime | None]:
+    """A window to the minute, not to the day.
+
+    The browser sends instants it computed from the viewer's own clock, so a
+    window ending "today at 17:00" means that moment wherever they are. ISO
+    strings are accepted for anything driving this by hand, and a naive one is
+    read as UTC. Falling back to `days` gives the configured default window.
+    """
+
+    def instant(epoch: float | None, text: str, what: str) -> datetime | None:
+        if epoch is not None:
+            return datetime.fromtimestamp(float(epoch), timezone.utc)
+        text = (text or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"`{what}` must be a date and time, e.g. 2026-09-01T09:30.",
+            ) from exc
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    until_dt = instant(until_epoch, until, "until")
+    since_dt = instant(since_epoch, since, "since")
+    if since_dt is None:
+        span = days if days and days > 0 else settings.days
+        since_dt = datetime.now(timezone.utc) - timedelta(days=span)
+    if until_dt and until_dt <= since_dt:
+        raise HTTPException(status_code=422, detail="The window must end after it starts.")
+    return since_dt, until_dt
+
+
+@app.get("/api/timeline")
+async def timeline(
+    key: str = Query(..., description="github:owner/repo or csr:project/repo"),
+    branch: str = Query(default="", description="one branch, or blank for all"),
+    folder: str = Query(default=""),
+    days: int | None = Query(default=None),
+    since: str = Query(default=""),
+    until: str = Query(default=""),
+    since_epoch: float | None = Query(default=None),
+    until_epoch: float | None = Query(default=None),
+    limit: int = Query(default=0, ge=0, le=300),
+) -> dict:
+    """Commits in one repository's folder over a window, ordered for a timeline."""
+    assert gh_client is not None and mirror is not None and store is not None
+    if key not in settings.all_keys():
+        raise HTTPException(status_code=404, detail=f"Not a tracked repository: {key}")
+
+    since_dt, until_dt = _resolve_instant_window(days, since, until, since_epoch, until_epoch)
+    try:
+        return await timeline_view.build_timeline(
+            settings, gh_client, mirror, store,
+            repo_key=key, branch=branch, folder=folder,
+            since_dt=since_dt, until_dt=until_dt,
+            limit=limit or settings.commits_per_branch,
+        )
+    except timeline_view.TimelineError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/api/health")
@@ -647,6 +765,10 @@ async def health() -> dict:
 
 def current_user(request: Request) -> auth.User:
     """Identify the caller from the proxy header, or dev mode (see app/auth.py)."""
+    # Role assignments live in the database; refresh the view of them before
+    # deciding what this caller may do, so a change takes effect immediately.
+    if reference_store is not None:
+        settings.auth.live_roles = reference_store.roles()
     peer = request.client.host if request.client else None
     return auth.resolve_user(request.headers, peer, settings, request.cookies)
 
@@ -745,7 +867,8 @@ async def migrations_meta(request: Request) -> dict:
         "fields": migrations.field_spec(),
         "options": migrations.option_lists(cfg),
         "services": [
-            {"name": m.name, "repos": m.repos, "track_leads": m.track_leads}
+            {"name": m.name, "repos": m.repos, "track_leads": m.track_leads,
+             "allow_full_merge": m.allow_full_merge}
             for m in cfg.microservices
         ],
         "services_source": {
@@ -767,6 +890,10 @@ async def migrations_meta(request: Request) -> dict:
         "freeze": freeze,
         "frozen": freeze is not None,
         "permissions": migrations.permissions(user),
+        "sso": {
+            "enabled": settings.auth.sso.ready,
+            "provider": settings.auth.sso.provider if settings.auth.sso.ready else "",
+        },
     }
 
 
@@ -958,8 +1085,16 @@ async def migrations_set_active(request: Request, sl_no: int, payload: dict[str,
     return row
 
 
+@app.get("/api/migrations/deleted")
+async def migrations_deleted(request: Request) -> dict:
+    """What has been removed from the register, and by whom. Approvers and admins."""
+    store_ = _require_migrations()
+    auth.require_role(current_user(request), "approver", "admin")
+    return {"deleted": store_.deleted()}
+
+
 @app.delete("/api/migrations/records/{sl_no}")
-async def migrations_delete(request: Request, sl_no: int) -> dict:
+async def migrations_delete(request: Request, sl_no: int, reason: str = Query(default="")) -> dict:
     """Remove a record and its history permanently. Approvers and admins.
 
     A freeze blocks this too: it stops record entry, and erasing one is the most
@@ -972,8 +1107,8 @@ async def migrations_delete(request: Request, sl_no: int) -> dict:
     _refuse_if_frozen(store_)
     if store_.get(sl_no) is None:
         raise HTTPException(status_code=404, detail=f"No record with SL# {sl_no}.")
-    store_.delete(sl_no)
-    return {"deleted": sl_no}
+    store_.delete(sl_no, user, reason)
+    return {"deleted": sl_no, "reason": reason}
 
 
 @app.get("/api/migrations/records/{sl_no}/audit")
@@ -1206,8 +1341,38 @@ async def migrations_save_service(request: Request, name: str, payload: dict[str
         [str(v) for v in (payload.get("repos") or [])],
         [str(v) for v in (payload.get("track_leads") or [])],
         rename_from="" if name == "new" else name,
+        allow_full_merge=bool(payload.get("allow_full_merge")),
     )
     return store_.as_payload()
+
+
+@app.put("/api/migrations/lists/roles/{role}")
+async def migrations_set_role(request: Request, role: str, payload: dict[str, Any]) -> dict:
+    """Replace the addresses holding one role. Approvers and admins.
+
+    Refuses to leave nobody holding the role the caller is using, so an
+    administrator cannot lock themselves — and everyone else — out.
+    """
+    store_ = _require_reference(request)
+    user = current_user(request)
+    patterns = payload.get("patterns")
+    if not isinstance(patterns, list):
+        raise HTTPException(status_code=422, detail="Send {\"patterns\": [...]}.")
+
+    before = list(store_.roles().get(role, []))
+    updated = store_.set_role(role, [str(v) for v in patterns])
+    settings.auth.live_roles = updated
+
+    if not auth.roles_for(user.email, settings) & {"approver", "admin"}:
+        # The caller has just removed their own way back in, and nobody else can
+        # undo it for them. Restore exactly what was there and refuse.
+        settings.auth.live_roles = store_.set_role(role, before)
+        raise HTTPException(
+            status_code=409,
+            detail="That would leave you without the approver or admin role, and "
+                   "nobody able to put it back. Add another holder first.",
+        )
+    return {"roles": updated}
 
 
 @app.put("/api/migrations/lists/employees/{number}")
@@ -1242,3 +1407,144 @@ async def migrations_delete_service(request: Request, name: str) -> dict:
         )
     store_.delete_microservice(name)
     return store_.as_payload()
+
+
+# --------------------------------------------------------------------------- #
+# Sign-in (OpenID Connect)
+# --------------------------------------------------------------------------- #
+
+_sso_client: sso.SsoClient | None = None
+
+
+def _sso() -> sso.SsoClient:
+    global _sso_client
+    if not settings.auth.sso.ready:
+        raise HTTPException(
+            status_code=404,
+            detail="Single sign-on is not configured. See the `auth.sso` section of config.yaml.",
+        )
+    if _sso_client is None:
+        _sso_client = sso.SsoClient(settings.auth.sso)
+    return _sso_client
+
+
+@app.exception_handler(sso.SsoError)
+async def _sso_error(request: Request, exc: sso.SsoError) -> Response:
+    return HTMLResponse(
+        "<h1>Sign-in failed</h1>"
+        f"<p>{escape(str(exc))}</p>"
+        '<p><a href="/auth/login">Try again</a></p>',
+        status_code=exc.status,
+    )
+
+
+def _safe_next(value: str) -> str:
+    """Only same-site paths, so the login link cannot bounce someone off-site."""
+    value = (value or "/").strip()
+    return value if value.startswith("/") and not value.startswith("//") else "/"
+
+
+def _cookie_kwargs() -> dict[str, Any]:
+    # Secure whenever the redirect URL is https, which is the only way this
+    # should be deployed; http is for a laptop, where Secure would break it.
+    secure = settings.auth.sso.redirect_url.lower().startswith("https://")
+    return {"httponly": True, "samesite": "lax", "secure": secure, "path": "/"}
+
+
+@app.get("/auth/login", include_in_schema=False)
+async def auth_login(request: Request, next: str = Query(default="/")) -> Response:
+    """Start the sign-in, remembering the flow secrets in a short-lived cookie."""
+    client = _sso()
+    url, flow = client.begin(_safe_next(next))
+    response = RedirectResponse(url, status_code=302)
+    response.set_cookie(
+        sso.FLOW_COOKIE,
+        auth.session_signer(settings).dumps(flow),
+        max_age=sso.FLOW_MAX_AGE,
+        **_cookie_kwargs(),
+    )
+    return response
+
+
+@app.get("/auth/callback", include_in_schema=False)
+async def auth_callback(
+    request: Request,
+    code: str = Query(default=""),
+    state: str = Query(default=""),
+    error: str = Query(default=""),
+    error_description: str = Query(default=""),
+) -> Response:
+    """Finish the sign-in: check the flow, verify the token, set the session."""
+    client = _sso()
+    if error:
+        raise sso.SsoError(f"{error}: {error_description or 'the provider declined the sign-in'}")
+
+    flow = auth.read_session(request.cookies.get(sso.FLOW_COOKIE, ""), settings)
+    if not flow:
+        raise sso.SsoError(
+            "That sign-in has expired or was started in another browser. Start again.", 400
+        )
+    # The state check is what makes this callback belong to a sign-in this
+    # browser began, rather than one somebody else started on its behalf.
+    if not state or state != flow.get("state"):
+        raise sso.SsoError("The sign-in could not be matched to a request from this browser.", 400)
+    if not code:
+        raise sso.SsoError("The provider returned no authorization code.")
+
+    claims = client.finish(code, flow)
+    email = sso.email_from(claims)
+    if not email:
+        raise sso.SsoError("The provider did not return an email address to identify you by.", 403)
+    if not sso.domain_allowed(email, settings.auth.sso):
+        allowed = ", ".join(settings.auth.sso.allowed_domains)
+        raise sso.SsoError(f"{email} is not in an allowed domain ({allowed}).", 403)
+
+    session = {"email": email, "name": str(claims.get("name") or "")}
+    granted = sso.roles_from_claims(claims, settings.auth.sso)
+    if granted:
+        session["roles"] = sorted(granted)
+
+    response = RedirectResponse(_safe_next(flow.get("next", "/")), status_code=302)
+    response.set_cookie(
+        auth.SESSION_COOKIE,
+        auth.session_signer(settings).dumps(session),
+        max_age=max(1, settings.auth.sso.session_hours) * 3600,
+        **_cookie_kwargs(),
+    )
+    response.delete_cookie(sso.FLOW_COOKIE, path="/")
+    return response
+
+
+@app.get("/auth/logout", include_in_schema=False)
+async def auth_logout(request: Request) -> Response:
+    """Drop the session here. The provider's own session is left alone."""
+    response = RedirectResponse("/", status_code=302)
+    response.delete_cookie(auth.SESSION_COOKIE, path="/")
+    response.delete_cookie(sso.FLOW_COOKIE, path="/")
+    return response
+
+
+@app.get("/api/auth/whoami")
+async def auth_whoami(request: Request) -> dict:
+    """Who the app thinks you are, and how it decided."""
+    user = current_user(request)
+    configured = settings.auth.sso.ready
+    peer = request.client.host if request.client else None
+    dev_on, dev_why = auth.dev_mode_available(peer, settings)
+    return {
+        **user.as_dict(),
+        "enforced": settings.auth.enforced,
+        # This endpoint stays public precisely so someone who cannot get in can
+        # find out why. Diagnosing that from behind the gate would be useless.
+        "dev_mode": {
+            "available": dev_on,
+            "configured": settings.auth.dev_mode,
+            "why_not": "" if dev_on else dev_why,
+        },
+        "sso": {
+            "enabled": configured,
+            "provider": settings.auth.sso.provider if configured else "",
+            "login_url": "/auth/login" if configured else "",
+            "logout_url": "/auth/logout" if configured else "",
+        },
+    }

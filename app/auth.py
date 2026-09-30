@@ -25,8 +25,10 @@ carries the guards in `dev_mode_available` — see there.
 from __future__ import annotations
 
 import ipaddress
+import secrets
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
+from typing import Any
 
 from .config import ROLES, Settings
 
@@ -91,6 +93,20 @@ class User:
 ANONYMOUS = User(email="")
 
 
+def role_patterns(settings: Settings) -> dict[str, list[str]]:
+    """Who holds which role — the database if it says, else config.yaml.
+
+    Held in the database so it can be changed without a file edit and a restart,
+    and so several app instances agree. config.yaml remains the answer while the
+    table is empty, which is what makes an existing deployment carry on working
+    and gives a new one something to seed from.
+    """
+    live = settings.auth.live_roles
+    if live and any(live.values()):
+        return live
+    return settings.auth.roles
+
+
 def roles_for(email: str, settings: Settings) -> frozenset[str]:
     """Every role whose patterns match this address.
 
@@ -102,9 +118,10 @@ def roles_for(email: str, settings: Settings) -> frozenset[str]:
     if not who:
         return frozenset()
 
+    patterns = role_patterns(settings)
     held = set()
     for role in ROLES:
-        for pattern in settings.auth.roles.get(role, []):
+        for pattern in patterns.get(role, []):
             if fnmatch(who, pattern.strip().casefold()):
                 held.add(role)
                 break
@@ -153,18 +170,24 @@ def _is_loopback(peer: str | None) -> bool:
 def dev_mode_available(peer: str | None, settings: Settings) -> tuple[bool, str]:
     """Is self-declared identity allowed for this request? (allowed, why not).
 
-    Three conditions, because this is a complete authentication bypass:
+    Four conditions, because this is a complete authentication bypass:
 
       1. `auth.dev_mode` must be set — it is never on by default;
-      2. `auth.trusted_proxies` must be *empty*. If you have configured a real
+      2. `auth.sso` must not be configured. Dev mode is resolved before the
+         session, so leaving both on would let someone sign in properly and
+         still be answered as `dev_user` — which looks like SSO silently not
+         working;
+      3. `auth.trusted_proxies` must be *empty*. If you have configured a real
          proxy you are not testing, and a proxy on the same host would otherwise
          satisfy the loopback check below while forwarding anyone's request;
-      3. the request must come from loopback, unless `dev_allow_remote` says
+      4. the request must come from loopback, unless `dev_allow_remote` says
          otherwise — so a forgotten flag is not reachable from the network.
     """
     auth = settings.auth
     if not auth.dev_mode:
         return False, "dev mode is off"
+    if auth.sso.ready:
+        return False, "auth.sso is configured, so sign in instead"
     if auth.trusted_proxies:
         return False, "auth.trusted_proxies is set, so this is not a test deployment"
     if not auth.dev_allow_remote and not _is_loopback(peer):
@@ -172,10 +195,47 @@ def dev_mode_available(peer: str | None, settings: Settings) -> tuple[bool, str]
     return True, ""
 
 
+_signers: dict[str, Any] = {}
+
+
+def session_signer(settings: Settings):
+    """The signer for the session cookie, made once per secret.
+
+    An unset secret gets a random one for the life of the process: sign-in still
+    works, but a restart signs everyone out, and two instances will not accept
+    each other's cookies. Set `SESSION_SECRET` for anything beyond one process.
+    """
+    from itsdangerous import URLSafeTimedSerializer
+
+    secret = settings.auth.session_secret
+    if not secret:
+        secret = _signers.setdefault("_generated", secrets.token_urlsafe(48))
+    signer = _signers.get(secret)
+    if signer is None:
+        signer = _signers[secret] = URLSafeTimedSerializer(secret, salt="migration-session")
+    return signer
+
+
+def read_session(cookie: str, settings: Settings) -> dict | None:
+    """The signed session, or None if it is absent, tampered with, or expired."""
+    if not cookie:
+        return None
+    from itsdangerous import BadSignature, SignatureExpired
+
+    try:
+        data = session_signer(settings).loads(
+            cookie, max_age=max(1, settings.auth.sso.session_hours) * 3600
+        )
+    except (BadSignature, SignatureExpired):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def resolve_user(headers, peer: str | None, settings: Settings, cookies=None) -> User:
     """Identify the caller. Returns ANONYMOUS rather than raising."""
     auth = settings.auth
     allowlist = auth.trusted_proxies
+    cookies = cookies or {}
 
     # Dev mode wins where it applies: the point of it is to choose an identity,
     # and its guards already establish that no real proxy is in play.
@@ -194,6 +254,18 @@ def resolve_user(headers, peer: str | None, settings: Settings, cookies=None) ->
             dev_mode=True,
             insecure=True,
         )
+
+    # A signed-in session, where SSO is configured. Roles are resolved now rather
+    # than stored in the cookie, so withdrawing one takes effect on the next
+    # request instead of when the session happens to lapse.
+    if auth.sso.ready:
+        session = read_session(cookies.get("session", ""), settings)
+        if session and session.get("email"):
+            email = str(session["email"])
+            granted = roles_for(email, settings) | {
+                r for r in (session.get("roles") or []) if isinstance(r, str)
+            }
+            return User(email=email, roles=frozenset(granted), dev_mode=False, insecure=False)
 
     raw = ""
     for name in (auth.header, "X-Forwarded-Email", "X-Forwarded-User", "X-Auth-Request-Email"):
@@ -219,6 +291,8 @@ def resolve_user(headers, peer: str | None, settings: Settings, cookies=None) ->
 
     return ANONYMOUS
 
+
+SESSION_COOKIE = "session"
 
 SIGN_IN_HELP = (
     "Not signed in. Either put an authenticating proxy in front of this app so it "

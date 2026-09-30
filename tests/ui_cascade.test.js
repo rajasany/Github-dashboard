@@ -106,7 +106,7 @@ const context = {
     // The copy-hash handler is delegated on document, and the clipboard
     // fallback appends a temporary textarea to body.
     addEventListener() {},
-    body: { appendChild: (c) => c },
+    body: Object.assign(makeEl("body"), { appendChild: (c) => c }),
   },
   window: { addEventListener() {} },
   navigator: { clipboard: { writeText: async () => {} } },
@@ -961,6 +961,39 @@ check("the dialog shows that repository",
   /gcp-proj\/pay/.test(els.get("tag-target").innerHTML), true);
 api.openTagDialog({ repoKey: "", sha: "" });
 check("an incomplete target is ignored", S.tagTarget?.repo_key, PAY);
+
+console.log("\n=== 12. the chrome each tab needs ===");
+
+const chromeOff = () => context.document.body.classList.contains("no-git-chrome");
+const heading = () => els.get("brand-title").textContent;
+
+api.showTab("activity");
+check("the activity tab keeps the git controls", chromeOff(), false);
+check("and is titled as the dashboard", heading(), "Repo Change Dashboard");
+
+api.showTab("migrations");
+check("the migrations tab drops them", chromeOff(), true);
+check("and is titled for itself", heading(), "Migration Requests");
+
+api.showTab("compare");
+check("going back restores them", chromeOff(), false);
+check("and the title with them", heading(), "Repo Change Dashboard");
+
+api.showTab("plan");
+check("the other git tabs keep them", chromeOff(), false);
+
+/* Every element that lives outside the tab panels is shown on every tab unless
+   something hides it. This asserts the list rather than one member of it,
+   because the staged-tag strip was missed the first time. */
+const GLOBAL_CHROME = ["topbar-controls", "banner", "staged-strip"];
+const hiddenByRule = (id) => {
+  const css = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "app", "static", "styles.css"), "utf8");
+  return new RegExp(`body\\.no-git-chrome #${id}\\b`).test(css);
+};
+for (const id of GLOBAL_CHROME) {
+  check(`${id} is hidden on a non-git tab`, hiddenByRule(id), true);
+}
 
 console.log(allOk ? "\nALL PASS" : "\nSOME FAILURES");
 process.exit(allOk ? 0 : 1);

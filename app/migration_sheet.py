@@ -19,7 +19,8 @@ from typing import Any
 
 from .config import MigrationConfig
 from .migrations import (
-    BY_KEY, REQUEST_KEYS, YESNO, MigrationError, clean_requestor, validate, _clean,
+    BY_KEY, MERGE_TYPES, REQUEST_KEYS, YESNO, MigrationError, clean_requestor, validate,
+    _clean,
 )
 from .spreadsheet import SheetError, parse_columns
 
@@ -36,6 +37,8 @@ SHEET_COLUMNS: dict[str, list[str]] = {
                          "requestor", "requester"],
     "reason": ["reason for movement", "reason for change", "reason"],
     "change_description": ["change description", "change desc", "description"],
+    "merge_type": ["merge type", "cherry pick / full merge", "cherry pick or full merge",
+                   "merge", "cherry pick"],
     "code_image_change": ["code & image change?", "code & image change",
                           "code and image change", "code image change", "code change"],
     "commit_hash": ["commit hash", "commit id", "commit sha", "commit", "sha"],
@@ -140,6 +143,7 @@ def build_template(cfg: MigrationConfig) -> bytes:
     named["migration_path"] = put("Migration Path", cfg.migration_paths)
     named["microservice"] = put("Micro Service", cfg.service_names)
     # Employee labels where staff are configured, the old plain list otherwise.
+    named["merge_type"] = put("Merge Type", list(MERGE_TYPES))
     named["change_requestor"] = put(
         "Change Requestor", cfg.employee_labels or cfg.change_requestors
     )
@@ -198,6 +202,7 @@ def build_template(cfg: MigrationConfig) -> bytes:
         "change_requestor": (cfg.employee_labels or cfg.change_requestors or [""])[0],
         "reason": "Defect fix agreed in the 09:30 triage call",
         "change_description": "Corrects the rounding on the settlement total",
+        "merge_type": "Cherry Pick",
         "code_image_change": "Yes",
         "commit_hash": "0000000",
         "env_change": "No",
@@ -213,6 +218,8 @@ def build_template(cfg: MigrationConfig) -> bytes:
     note.value = (
         "Row 2 is an example — replace or delete it. "
         "Commit Hash is required when Code & Image Change is Yes; "
+        "Merge Type must be filled in on every row — Full Merge is only accepted "
+        "for microservices configured to allow it; "
         "DB Script Path is required when DDL/DML is Yes. "
         "See the Lists sheet for which repo and track lead belong to each microservice."
     )

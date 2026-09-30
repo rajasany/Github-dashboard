@@ -13,9 +13,9 @@
   <header class="topbar" id="topbar">
     <div class="brand">
       <span class="dot"></span>
-      <h1>Repo Change Dashboard</h1>
+      <h1 id="brand-title">Repo Change Dashboard</h1>
     </div>
-    <div class="topbar-controls">
+    <div class="topbar-controls" id="topbar-controls">
       <div class="daterange" role="group" aria-label="Date range">
         <label class="field">
           <span>Period</span>
@@ -53,6 +53,7 @@
     <button class="tab" id="tab-tags" data-tab="tags" role="tab" aria-selected="false">Tags</button>
     <button class="tab" id="tab-order" data-tab="order" role="tab" aria-selected="false">Order commits</button>
     <button class="tab" id="tab-plan" data-tab="plan" role="tab" aria-selected="false">Release plan</button>
+    <button class="tab" id="tab-timeline" data-tab="timeline" role="tab" aria-selected="false">Folder timeline</button>
     <button class="tab" id="tab-migrations" data-tab="migrations" role="tab" aria-selected="false">Migrations</button>
   </nav>
 
@@ -283,6 +284,43 @@
         <div id="plan-body"></div>
       </div>
 
+      <!-- ============ Folder timeline ============ -->
+      <div id="panel-timeline" class="tab-panel hidden">
+        <section class="picker-bar tl-bar">
+          <label class="field block">
+            <span>Repository</span>
+            <select id="tl-repo" class="select"></select>
+          </label>
+          <label class="field block">
+            <span>Branch</span>
+            <select id="tl-branch" class="select">
+              <option value="">Choose a branch…</option>
+            </select>
+          </label>
+          <label class="field block">
+            <span>Service / folder</span>
+            <select id="tl-folder" class="select" disabled>
+              <option value="">Choose a branch first…</option>
+            </select>
+          </label>
+          <label class="field block">
+            <span>From</span>
+            <input id="tl-from" class="input" type="datetime-local" />
+          </label>
+          <label class="field block">
+            <span>To</span>
+            <input id="tl-to" class="input" type="datetime-local" />
+          </label>
+          <div class="picker-actions">
+            <button id="tl-run" class="btn primary">Show</button>
+            <button id="tl-reset" class="btn tiny" title="Back to the default window">Default</button>
+          </div>
+        </section>
+
+        <p id="tl-scope" class="scope-line"></p>
+        <div id="tl-body"></div>
+      </div>
+
       <!-- ============ Migration requests ============ -->
       <div id="panel-migrations" class="tab-panel hidden">
         <div id="mig-notices"></div>
@@ -326,6 +364,7 @@
             <button id="mig-freeze" class="btn">Freeze…</button>
             <button id="mig-lists" class="btn">Lists…</button>
             <button id="mig-archive-view" class="btn">Archive</button>
+            <button id="mig-deleted" class="btn">Deleted…</button>
             <button id="mig-csv" class="btn tiny" title="Download the register as CSV">CSV</button>
           </div>
         </section>
@@ -402,6 +441,7 @@
     </form>
   </dialog>
 
+  <script src="/static/timeline.js"></script>
   <script src="/static/migrations.js"></script>
   <script src="/static/app.js"></script>
 </body>

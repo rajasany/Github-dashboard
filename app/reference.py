@@ -64,7 +64,8 @@ class ReferenceStore:
                 CREATE TABLE IF NOT EXISTS ref_microservices (
                     id       {db.identity},
                     name     TEXT NOT NULL UNIQUE,
-                    position INTEGER NOT NULL DEFAULT 0
+                    position INTEGER NOT NULL DEFAULT 0,
+                    allow_full_merge TEXT NOT NULL DEFAULT 'No'
                 )
                 """
             )
@@ -81,6 +82,74 @@ class ReferenceStore:
                 """
             )
         self._init_employees()
+        self._init_roles()
+        # A database made before full-merge permission existed gains the column.
+        with db.connect() as conn:
+            if "allow_full_merge" not in db.columns(conn, "ref_microservices"):
+                conn.execute(
+                    "ALTER TABLE ref_microservices ADD COLUMN "
+                    "allow_full_merge TEXT NOT NULL DEFAULT 'No'"
+                )
+
+    def _init_roles(self) -> None:
+        with self.db.connect() as conn:
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS ref_roles (
+                    id       {self.db.identity},
+                    role     TEXT NOT NULL,
+                    pattern  TEXT NOT NULL,
+                    position INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE (role, pattern)
+                )
+                """
+            )
+
+    def roles(self) -> dict[str, list[str]]:
+        """Role assignments held in the database.
+
+        Always carries a key per role, empty or not, so a caller never has to
+        guess whether a missing key means "none" or "not asked about". A table
+        with nothing in it at all is what makes config.yaml the answer instead.
+        """
+        from .config import ROLES
+
+        out: dict[str, list[str]] = {role: [] for role in ROLES}
+        with self.db.connect() as conn:
+            for row in conn.all("SELECT role, pattern FROM ref_roles ORDER BY role, position, id"):
+                out.setdefault(row["role"], []).append(row["pattern"])
+        return out
+
+    def set_role(self, role: str, patterns: list[str]) -> dict[str, list[str]]:
+        """Replace the addresses holding one role."""
+        from .config import ROLES
+
+        if role not in ROLES:
+            raise ReferenceError(f"“{role}” is not a role.")
+        cleaned = self._clean(patterns, "address")
+        with self.db.connect() as conn:
+            conn.execute("DELETE FROM ref_roles WHERE role = ?", (role,))
+            conn.many(
+                "INSERT INTO ref_roles (role, pattern, position) VALUES (?,?,?)",
+                [(role, pattern, index) for index, pattern in enumerate(cleaned)],
+            )
+        return self.roles()
+
+    def seed_roles(self, configured: dict[str, list[str]]) -> dict[str, int]:
+        """Copy role assignments out of config.yaml, once, into an empty table."""
+        # roles() always carries a key per role, so test the patterns.
+        if any(self.roles().values()):
+            return {}
+        rows = [
+            (role, pattern, index)
+            for role, patterns in (configured or {}).items()
+            for index, pattern in enumerate(patterns)
+        ]
+        if not rows:
+            return {}
+        with self.db.connect() as conn:
+            conn.many("INSERT INTO ref_roles (role, pattern, position) VALUES (?,?,?)", rows)
+        return {role: len(patterns) for role, patterns in configured.items() if patterns}
 
     def _init_employees(self) -> None:
         with self.db.connect() as conn:
@@ -107,8 +176,11 @@ class ReferenceStore:
                 if name:
                     values[name].append(row["value"])
 
-            names = [r["name"] for r in
-                     conn.all("SELECT name FROM ref_microservices ORDER BY position, id")]
+            service_rows = conn.all(
+                "SELECT name, allow_full_merge FROM ref_microservices ORDER BY position, id"
+            )
+            names = [r["name"] for r in service_rows]
+            merges = {r["name"]: (r["allow_full_merge"] or "No") == "Yes" for r in service_rows}
             links: dict[str, dict[str, list[str]]] = {
                 name: {kind: [] for kind in LINK_KINDS} for name in names
             }
@@ -134,7 +206,8 @@ class ReferenceStore:
             migration_paths=values["migration_paths"],
             change_requestors=values["change_requestors"],
             microservices=[
-                Microservice(name=n, repos=links[n]["repo"], track_leads=links[n]["track_lead"])
+                Microservice(name=n, repos=links[n]["repo"], track_leads=links[n]["track_lead"],
+                             allow_full_merge=merges.get(n, False))
                 for n in names
             ],
         )
@@ -182,8 +255,9 @@ class ReferenceStore:
                 counts[name] = len(values)
 
             conn.many(
-                "INSERT INTO ref_microservices (name, position) VALUES (?,?)",
-                [(m.name, i) for i, m in enumerate(cfg.microservices)],
+                "INSERT INTO ref_microservices (name, position, allow_full_merge) VALUES (?,?,?)",
+                [(m.name, i, "Yes" if m.allow_full_merge else "No")
+                 for i, m in enumerate(cfg.microservices)],
             )
             links: list[tuple] = []
             for service in cfg.microservices:
@@ -246,7 +320,8 @@ class ReferenceStore:
         return self.snapshot(fresh=True)
 
     def save_microservice(
-        self, name: str, repos: list[str], leads: list[str], *, rename_from: str = ""
+        self, name: str, repos: list[str], leads: list[str], *,
+        rename_from: str = "", allow_full_merge: bool = False,
     ) -> MigrationConfig:
         """Create or update one microservice and its repos and leads."""
         named = self._clean([name], "microservice name")
@@ -270,11 +345,14 @@ class ReferenceStore:
                     "SELECT COALESCE(MAX(position), -1) + 1 AS n FROM ref_microservices"
                 )
                 conn.execute(
-                    "INSERT INTO ref_microservices (name, position) VALUES (?,?)", (name, position)
+                    "INSERT INTO ref_microservices (name, position, allow_full_merge) "
+                    "VALUES (?,?,?)",
+                    (name, position, "Yes" if allow_full_merge else "No"),
                 )
-            elif existing["name"] != name:
+            else:
                 conn.execute(
-                    "UPDATE ref_microservices SET name = ? WHERE name = ?", (name, existing["name"])
+                    "UPDATE ref_microservices SET name = ?, allow_full_merge = ? WHERE name = ?",
+                    (name, "Yes" if allow_full_merge else "No", existing["name"]),
                 )
 
             # Replacing the links wholesale is simpler than diffing them, and
@@ -364,9 +442,11 @@ class ReferenceStore:
             "migration_paths": cfg.migration_paths,
             "change_requestors": cfg.change_requestors,
             "microservices": [
-                {"name": m.name, "repos": m.repos, "track_leads": m.track_leads}
+                {"name": m.name, "repos": m.repos, "track_leads": m.track_leads,
+                 "allow_full_merge": m.allow_full_merge}
                 for m in cfg.microservices
             ],
+            "roles": self.roles(),
             "employees": [
                 {"number": e.number, "name": e.name, "email": e.email, "label": e.label}
                 for e in cfg.employees

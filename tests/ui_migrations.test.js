@@ -41,10 +41,15 @@ function makeEl(tag) {
     removeEventListener() {},
     appendChild(c) {
       this.children.push(c);
+      c._parent = this;
       return c;
     },
     remove() {
       removed.push(this);
+      // Actually detach, so a second look does not find what was just removed.
+      const siblings = this._parent?.children;
+      const at = siblings ? siblings.indexOf(this) : -1;
+      if (at >= 0) siblings.splice(at, 1);
     },
     showModal() {
       this.shown = true;
@@ -91,7 +96,41 @@ function makeEl(tag) {
       this._openCache = { html: this._html, nodes };
       return nodes;
     },
-    querySelector: () => makeEl("div"),
+    /* Two selectors resolve to something real, because code that marks a bad
+     * field reaches for them: the field wrapper by key, and a child by class.
+     * Everything else still gets a throwaway node. */
+    querySelector(selector) {
+      const field = /^\.mig-field\[data-field="([a-z_]+)"\]$/.exec(selector || "");
+      if (field) {
+        if (!new RegExp(`data-field="${field[1]}"`).test(this._html)) return null;
+        // Keyed on the current markup: a re-render replaces the nodes, and with
+        // them anything that had been appended to the old ones.
+        if (this._fieldCache?.html !== this._html) {
+          this._fieldCache = { html: this._html, nodes: new Map() };
+        }
+        const nodes = this._fieldCache.nodes;
+        if (!nodes.has(field[1])) {
+          const node = makeEl("mig-field");
+          node.dataset.field = field[1];
+          nodes.set(field[1], node);
+        }
+        return nodes.get(field[1]);
+      }
+      // Only inside a field wrapper: elsewhere a class lookup is something this
+      // stub has no tree for, and a throwaway node is the honest answer.
+      const byClass =
+        this.tag === "mig-field" && /^\.([\w-]+)(?::not\(\.([\w-]+)\))?$/.exec(selector || "");
+      if (byClass) {
+        return (
+          this.children.find(
+            (c) =>
+              c.classList.contains(byClass[1]) &&
+              !(byClass[2] && c.classList.contains(byClass[2]))
+          ) || null
+        );
+      }
+      return makeEl("div");
+    },
   };
   const classes = new Set(String(tag || "").split(/\s+/).filter(Boolean));
   Object.defineProperty(el, "className", {
@@ -220,6 +259,7 @@ const FIELDS = [
   { key: "track_lead", label: "Track Lead Name", kind: "enum", stage: "request", roles: ["developer"], options: "", required: true, required_if: null, amber_when: "", depends_on: "microservice", default: "", help: "" },
   { key: "change_requestor", label: "Change Requestor", kind: "enum", stage: "request", roles: ["developer"], options: "change_requestors", required: true, required_if: null, amber_when: "", depends_on: "", default: "", help: "" },
   { key: "reason", label: "Reason for Movement", kind: "longtext", stage: "request", roles: ["developer"], options: "", required: false, required_if: null, amber_when: "", depends_on: "", default: "", help: "" },
+  { key: "merge_type", label: "Merge Type", kind: "enum", stage: "request", roles: ["developer"], options: "merge_types", required: true, required_if: null, amber_when: "", depends_on: "", default: "", help: "How the change reaches the target branch." },
   { key: "code_image_change", label: "Code & Image Change?", kind: "yesno", stage: "request", roles: ["developer"], options: "", required: false, required_if: null, amber_when: "Yes", depends_on: "", default: "No", help: "" },
   { key: "commit_hash", label: "Commit Hash", kind: "text", stage: "request", roles: ["developer"], options: "", required: false, required_if: ["code_image_change", "Yes"], amber_when: "", depends_on: "", default: "", help: "Required when there is a code or image change." },
   { key: "ddl_dml", label: "DDL/DML", kind: "yesno", stage: "request", roles: ["developer"], options: "", required: false, required_if: null, amber_when: "Yes", depends_on: "", default: "No", help: "" },
@@ -246,10 +286,11 @@ const baseMeta = () => ({
     change_requestors: ["E1001 - Jane Doe", "E1002 - John Roe"],
     approvers: ["lead@example.com"],
     yesno: ["Yes", "No"],
+    merge_types: ["Cherry Pick", "Full Merge"],
   },
   services: [
-    { name: "payments", repos: ["demo/payments"], track_leads: ["A. Kumar"] },
-    { name: "cart", repos: ["demo/cart", "demo/cart-ui"], track_leads: ["R. Iyer", "S. Rao"] },
+    { name: "payments", repos: ["demo/payments"], track_leads: ["A. Kumar"], allow_full_merge: false },
+    { name: "cart", repos: ["demo/cart", "demo/cart-ui"], track_leads: ["R. Iyer", "S. Rao"], allow_full_merge: true },
   ],
   statuses: [
     { key: "submitted", label: "Awaiting approval" },
@@ -268,7 +309,7 @@ const baseMeta = () => ({
     { number: "E1002", name: "John Roe", label: "E1002 - John Roe" },
   ],
   request_fields: ["release", "microservice", "repo_name", "track_lead", "change_requestor",
-                   "reason", "code_image_change", "commit_hash", "ddl_dml"],
+                   "reason", "merge_type", "code_image_change", "commit_hash", "ddl_dml"],
   freeze: null,
   frozen: false,
   permissions: { can_raise: true, why_not_raise: "", can_retire: false, can_freeze: false,
@@ -762,6 +803,118 @@ async function load(meta, rows, sort) {
         form.innerHTML.includes("Only one — filled in for you."), false);
   check("the stale repo is gone from the options",
         form.innerHTML.includes("demo/payments"), false);
+  close_();
+
+  console.log("\n=== merge type ===");
+
+  await load(baseMeta(), [record()]);
+  els.get("mig-new")._on.click();
+  form = pick(".mig-dialog-body");
+  const mergeSel = () =>
+    pick(".mig-dialog-body").querySelectorAll(".mig-input").find((i) => i.dataset.key === "merge_type");
+  const svcSel = () =>
+    pick(".mig-dialog-body").querySelectorAll(".mig-input").find((i) => i.dataset.key === "microservice");
+  const saveBtn = () => els.get("mig-save");
+
+  check("it starts on nothing chosen",
+        selectFor(form.innerHTML, "merge_type").includes("selected"), false);
+  check("offering cherry pick",
+        selectFor(form.innerHTML, "merge_type").includes("Cherry Pick"), true);
+  check("and full merge", selectFor(form.innerHTML, "merge_type").includes("Full Merge"), true);
+  check("it is marked mandatory",
+        /data-field="merge_type"[\s\S]*?mig-req/.test(form.innerHTML), true);
+  check("and saving waits for an answer", saveBtn().disabled, true);
+  check("the button says what it is waiting for", saveBtn().title, "Choose a Merge Type first.");
+
+  // Leaving it empty says so there and then, rather than after Save.
+  const mergeField = () =>
+    pick(".mig-dialog-body").querySelector('.mig-field[data-field="merge_type"]');
+  check("nothing is marked before it is touched", mergeField().classList.contains("is-bad"), false);
+  mergeSel()._on.blur();
+  check("moving off it while empty marks it", mergeField().classList.contains("is-bad"), true);
+  check("and says what is wrong",
+        mergeField().children.map((c) => c.textContent).join(""), "Required.");
+  check("once, however many times it is left",
+        (mergeSel()._on.blur(), mergeField().children.length), 1);
+
+  control = mergeSel();
+  control.value = "Cherry Pick";
+  control._on.change();
+  form = pick(".mig-dialog-body");
+  check("answering it clears the mark", mergeField().classList.contains("is-bad"), false);
+  check("taking the message with it", mergeField().children.length, 0);
+  check("and releases Save", saveBtn().disabled, false);
+  check("nothing is blocked", form.innerHTML.includes("mig-blocked"), false);
+
+  // Merge Type re-renders the form, which would hide a failure to un-mark a
+  // field in place. Rel# does not, so it exercises that path.
+  const relInput = () =>
+    pick(".mig-dialog-body").querySelectorAll(".mig-input").find((i) => i.dataset.key === "release");
+  const relField = () =>
+    pick(".mig-dialog-body").querySelector('.mig-field[data-field="release"]');
+  relInput()._on.blur();
+  check("another mandatory field marks the same way",
+        relField().classList.contains("is-bad"), true);
+  control = relInput();
+  control.value = "R2026.09";
+  control._on.change();
+  control._on.blur();
+  check("and un-marks in place when answered", relField().classList.contains("is-bad"), false);
+  check("with its message gone too", relField().children.length, 0);
+
+  // An optional field is left alone — the mark means "you must", not "you did not".
+  const reasonInput = () =>
+    pick(".mig-dialog-body").querySelectorAll(".mig-input").find((i) => i.dataset.key === "reason");
+  reasonInput()._on.blur();
+  check("an optional field left empty is not marked",
+        pick(".mig-dialog-body").querySelector('.mig-field[data-field="reason"]')
+          .classList.contains("is-bad"), false);
+
+  // A service that does not permit it.
+  control = svcSel();
+  control.value = "payments";
+  control._on.change();
+  control = mergeSel();
+  control.value = "Full Merge";
+  control._on.change();
+  form = pick(".mig-dialog-body");
+  check("choosing full merge where it is not allowed is refused",
+        form.innerHTML.includes("mig-blocked"), true);
+  check("the message names the repository",
+        form.innerHTML.includes("demo/payments"), true);
+  check("and says to cherry-pick instead",
+        form.innerHTML.includes("cherry-pick the change"), true);
+  check("saving is blocked while it stands", saveBtn().disabled, true);
+
+  // Going back undoes it, rather than leaving the form stuck.
+  control = mergeSel();
+  control.value = "Cherry Pick";
+  control._on.change();
+  form = pick(".mig-dialog-body");
+  check("switching back clears the refusal", form.innerHTML.includes("mig-blocked"), false);
+  check("and saving is available again", saveBtn().disabled, false);
+
+  // A service that does permit it.
+  control = svcSel();
+  control.value = "cart";
+  control._on.change();
+  control = mergeSel();
+  control.value = "Full Merge";
+  control._on.change();
+  form = pick(".mig-dialog-body");
+  check("a service that allows full merge is not refused",
+        form.innerHTML.includes("mig-blocked"), false);
+  check("and can be saved", saveBtn().disabled, false);
+
+  // Switching from an allowing service to a refusing one must re-check, or the
+  // form would let a full merge through on the wrong repository.
+  control = svcSel();
+  control.value = "payments";
+  control._on.change();
+  form = pick(".mig-dialog-body");
+  check("moving it to a service that does not is caught",
+        form.innerHTML.includes("mig-blocked"), true);
+  check("and blocks saving again", saveBtn().disabled, true);
   close_();
 
   console.log("\n=== the archive ===");

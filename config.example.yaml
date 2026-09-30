@@ -74,10 +74,10 @@ branch_exclude:
 # ---------------------------------------------------------------------------
 # Who is using the app, and what they may do (the Migrations tab).
 #
-# There are two ways to run this, and they are MUTUALLY EXCLUSIVE.
-# Pick one. Setting `trusted_proxies` switches `dev_mode` off, because a proxy
+# Three ways to run this. A (dev mode) and C (proxy headers) are MUTUALLY
+# EXCLUSIVE: setting `trusted_proxies` switches `dev_mode` off, because a proxy
 # on the same host also looks like loopback and would otherwise let dev mode be
-# reached through it.
+# reached through it. B (built-in SSO) is the one to use for a real deployment.
 # ---------------------------------------------------------------------------
 
 # --- OPTION A: testing, no SSO ---------------------------------------------
@@ -97,7 +97,46 @@ branch_exclude:
 #     devops:    [you@example.com]
 #     admin:     [you@example.com]   # superset; can also retire and delete records
 
-# --- OPTION B: deployed, behind an SSO proxy -------------------------------
+# --- OPTION B: deployed, with built-in single sign-on ----------------------
+# The app does the OpenID Connect flow itself — no proxy needed. Point it at
+# Google Workspace, Microsoft Entra ID (Azure AD), or any OIDC provider, and
+# register the redirect_url below with that provider as a permitted redirect.
+#
+# Secrets belong in .env, not here: SSO_CLIENT_ID, SSO_CLIENT_SECRET and
+# SESSION_SECRET all override what is written in this file.
+#
+# auth:
+#   session_secret: ""                 # or SESSION_SECRET in .env; random if unset
+#   sso:
+#     # Google Cloud console → Credentials → OAuth client ID → Web application.
+#     # Add redirect_url below to "Authorised redirect URIs" exactly as written.
+#     provider: google                 # google | azure | oidc
+#     client_id: "...apps.googleusercontent.com"
+#     client_secret: "..."
+#     redirect_url: https://dashboard.example.com/auth/callback
+#     allowed_domains: [tcs.com]       # refuse anyone outside these
+#     hosted_domain: tcs.com           # google only: pre-filter the chooser
+#     session_hours: 12
+#   roles:
+#     developer: ["*@tcs.com"]
+#     approver:  [lead@tcs.com]
+#
+# For Microsoft Entra ID instead:
+#
+# auth:
+#   sso:
+#     provider: azure
+#     tenant: 00000000-0000-0000-0000-000000000000   # or "organizations"
+#     client_id: "..."
+#     client_secret: "..."
+#     redirect_url: https://dashboard.example.com/auth/callback
+#     # Optional: take roles from the token as well as from the address.
+#     role_claim: roles
+#     role_map:
+#       MigrationApprover: approver
+#       MigrationDevOps: devops
+
+# --- OPTION C: deployed, behind an SSO proxy -------------------------------
 # Identity comes from a header the proxy sets. This is only safe if the app
 # CANNOT be reached except through that proxy — a header is just bytes the
 # client sends, so anyone able to connect directly can claim to be anybody.
@@ -134,6 +173,14 @@ branch_exclude:
 #     - SIT to QA
 #     - QA to PROD
 #   # Repo Name and Track Lead Name are narrowed to the microservice chosen.
+#   #
+#   # allow_full_merge decides what Merge Type a developer may choose. Merge Type
+#   # itself is mandatory and starts blank — it is always answered by hand. This
+#   # setting is off everywhere unless given, so a full merge is refused — on the
+#   # form as soon as it is picked, and again on the server — with a note to
+#   # cherry-pick the change and raise the request against that commit instead.
+#   # Turn it on only for a service whose target branch really does take whole
+#   # merges.
 #   microservices:
 #     - name: payments
 #       repos:
@@ -145,6 +192,7 @@ branch_exclude:
 #         - rajasany/Guardrails
 #       track_leads:
 #         - R. Iyer
+#       allow_full_merge: true
 #   change_requestors:
 #     - Business Ops
 #     - Release Management

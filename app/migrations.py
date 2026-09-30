@@ -20,6 +20,7 @@ no second source of truth to fall out of step with them.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -32,6 +33,16 @@ from .db import Database
 
 YES, NO = "Yes", "No"
 YESNO = (YES, NO)
+
+CHERRY_PICK, FULL_MERGE = "Cherry Pick", "Full Merge"
+MERGE_TYPES = (CHERRY_PICK, FULL_MERGE)
+
+# Said once, so the form, the API and the spreadsheet importer all refuse in the
+# same words.
+FULL_MERGE_REFUSED = (
+    "Full merge is not allowed for {repo}. Please cherry-pick the change and use "
+    "that commit for the migration."
+)
 
 # Stages, in order. A field belongs to exactly one.
 STAGES = ("request", "approval", "qa", "prod_gate", "prod")
@@ -98,6 +109,13 @@ FIELDS: tuple[Field, ...] = (
           help="Defaults to you, where your address is on the employee list."),
     Field("reason", "Reason for Movement", "longtext", "request", ("developer",)),
     Field("change_description", "Change Description", "longtext", "request", ("developer",)),
+    # Deliberately undefaulted. How a change reaches the target branch is the
+    # developer's statement about their own change, and a default would let it
+    # be answered by not answering it.
+    Field("merge_type", "Merge Type", "enum", "request", ("developer",),
+          options="merge_types", required=True,
+          help="How the change reaches the target branch. Full merge is only "
+               "available where the microservice permits it."),
     Field("code_image_change", "Code & Image Change?", "yesno", "request", ("developer",),
           amber_when=YES, default=NO),
     Field("commit_hash", "Commit Hash", "text", "request", ("developer",),
@@ -375,6 +393,7 @@ def option_lists(cfg: MigrationConfig, microservice: str = "") -> dict[str, list
         # list is still honoured where no employees are configured, so an
         # existing deployment keeps working until staff are added.
         "change_requestors": cfg.employee_labels or list(cfg.change_requestors),
+        "merge_types": list(MERGE_TYPES),
         "approvers": list(cfg.approvers),
         "yesno": list(YESNO),
     }
@@ -437,6 +456,15 @@ def validate(values: dict[str, str], cfg: MigrationConfig, *, partial: bool = Fa
 
     if values.get("commit_hash") and not _SHA.match(values["commit_hash"]):
         problems["commit_hash"] = "Not a commit hash (7–40 hex characters)."
+
+    # A full merge brings a branch across wholesale; where that is not permitted
+    # the answer is a cherry-pick, and the message says which repository refused.
+    if values.get("merge_type") == FULL_MERGE:
+        service = cfg.service(values.get("microservice", ""))
+        if service is None or not service.allow_full_merge:
+            problems["merge_type"] = FULL_MERGE_REFUSED.format(
+                repo=values.get("repo_name") or (service.name if service else "this repository")
+            )
 
     # Requiredness is checked against the merged record, so a partial edit that
     # leaves a required field untouched is not reported as missing.
@@ -523,6 +551,22 @@ class MigrationStore:
                 """
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_sl ON migration_audit(sl_no)")
+            # Deleting a record removes it from the register, but not from the
+            # account of what was done: the whole row and its history are kept
+            # here, with who removed it and why.
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS deleted_migrations (
+                    id         {db.identity},
+                    sl_no      BIGINT NOT NULL,
+                    deleted_at {db.float_type} NOT NULL,
+                    deleted_by TEXT NOT NULL,
+                    reason     TEXT NOT NULL DEFAULT '',
+                    record     TEXT NOT NULL,
+                    history    TEXT NOT NULL DEFAULT '[]'
+                )
+                """
+            )
 
     # -- records ----------------------------------------------------------- #
 
@@ -731,22 +775,75 @@ class MigrationStore:
 
         return {"archived": archived, "skipped": skipped, "requested": len(sl_nos)}
 
-    def delete(self, sl_no: int) -> bool:
-        """Remove a record and its history. Irreversible — deactivate is not.
+    def delete(self, sl_no: int, user: User, reason: str = "") -> bool:
+        """Remove a record from the register, keeping an account of it.
 
-        The audit rows go with it: leaving them behind would keep a trail nobody
-        can reach, for a record that no longer exists.
+        Irreversible as far as the register is concerned — the record is gone
+        from every view and every number. What is kept is the evidence: the whole
+        row as it stood, its full history, and who removed it and why. Deleting
+        something should not also delete the fact that it was deleted.
         """
+        now = time.time()
         with self.db.connect() as conn:
             row = self._raw(conn, sl_no)
-            if row is not None and (row.get("archived_at") or ""):
+            if row is None:
+                return False
+            if row.get("archived_at") or "":
                 raise MigrationError(
                     f"SL# {sl_no} is archived and cannot be deleted.", status=409
                 )
-            gone = bool(conn.one("DELETE FROM migrations WHERE sl_no = ? RETURNING sl_no", (sl_no,)))
-            if gone:
-                conn.execute("DELETE FROM migration_audit WHERE sl_no = ?", (sl_no,))
-            return gone
+
+            history = conn.all(
+                "SELECT at, who, field, old_value, new_value FROM migration_audit "
+                "WHERE sl_no = ? ORDER BY id",
+                (sl_no,),
+            )
+            conn.execute(
+                "INSERT INTO deleted_migrations "
+                "(sl_no, deleted_at, deleted_by, reason, record, history) VALUES (?,?,?,?,?,?)",
+                (sl_no, now, user.email, (reason or "").strip(),
+                 json.dumps(row, default=str), json.dumps(history, default=str)),
+            )
+            conn.execute("DELETE FROM migrations WHERE sl_no = ?", (sl_no,))
+            conn.execute("DELETE FROM migration_audit WHERE sl_no = ?", (sl_no,))
+            return True
+
+    def deleted(self, limit: int = 200) -> list[dict[str, Any]]:
+        """What has been removed from the register, newest first."""
+        with self.db.connect() as conn:
+            rows = conn.all(
+                "SELECT * FROM deleted_migrations ORDER BY deleted_at DESC, id DESC LIMIT ?",
+                (limit,),
+            )
+        out = []
+        for row in rows:
+            try:
+                record = json.loads(row["record"])
+                history = json.loads(row["history"])
+            except (TypeError, ValueError):
+                record, history = {}, []
+            out.append({
+                "sl_no": row["sl_no"],
+                "deleted_at": _iso(row["deleted_at"]),
+                "deleted_by": row["deleted_by"],
+                "reason": row["reason"],
+                "microservice": record.get("microservice", ""),
+                "repo_name": record.get("repo_name", ""),
+                "release": record.get("release", ""),
+                "created_by": record.get("created_by", ""),
+                "status_label": STATUS_LABELS.get(status_of(record), ""),
+                "record": record,
+                "history": [
+                    {"at": _iso(h.get("at")), "who": h.get("who", ""),
+                     "field": h.get("field", ""),
+                     "label": (BY_KEY[h["field"]].label if h.get("field") in BY_KEY
+                               else str(h.get("field", "")).replace("_", " ").title()),
+                     "old_value": _stamp(h.get("field", ""), h.get("old_value", "")),
+                     "new_value": _stamp(h.get("field", ""), h.get("new_value", ""))}
+                    for h in history
+                ],
+            })
+        return out
 
     def audit(self, sl_no: int) -> list[dict[str, Any]]:
         with self.db.connect() as conn:

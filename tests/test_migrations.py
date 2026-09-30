@@ -29,8 +29,9 @@ from app.migrations import MigrationError, MigrationStore  # noqa: E402
 
 # Set TEST_DATABASE_URL to run this whole suite against PostgreSQL instead.
 TEST_DB_URL = os.getenv("TEST_DATABASE_URL", "").strip()
-APP_TABLES = ("migration_audit", "migrations", "freezes",
-              "ref_microservice_links", "ref_microservices", "ref_values", "ref_employees")
+APP_TABLES = ("migration_audit", "migrations", "deleted_migrations", "freezes",
+              "ref_microservice_links", "ref_microservices", "ref_values",
+              "ref_employees", "ref_roles")
 
 
 _SHARED_PG: Database | None = None
@@ -130,6 +131,7 @@ DEV = User("dev@example.com", frozenset({"developer"}))
 DEV2 = User("other@example.com", frozenset({"developer"}))
 APPROVER = User("lead@example.com", frozenset({"developer", "approver"}))
 DEVOPS = User("ops@example.com", frozenset({"devops"}))
+ADMIN_USER = User("boss@elsewhere.com", frozenset({"admin"}))
 
 GOOD_REQUEST = {
     "release": "R2026.09",
@@ -138,6 +140,7 @@ GOOD_REQUEST = {
     "repo_name": "demo/payments",
     "track_lead": "A. Kumar",
     "change_requestor": "E1001 - Jane Doe",
+    "merge_type": "Cherry Pick",
     "reason": "Defect fix",
     "change_description": "Rounding correction",
     "code_image_change": "Yes",
@@ -218,6 +221,19 @@ def test_dev_mode() -> None:
     settings.auth.dev_allow_remote = True
     check("which does widen it", dev_mode_available("10.1.2.3", settings)[0], True)
     settings.auth.dev_allow_remote = False
+
+    # Configuring SSO must rule dev mode out: dev mode resolves first, so a real
+    # sign-in would otherwise be answered as dev_user and SSO would look broken.
+    from app.config import SsoConfig
+
+    settings.auth.sso = SsoConfig(enabled=True, provider="google", client_id="x",
+                                  redirect_url="https://app/auth/callback")
+    allowed, why = dev_mode_available("127.0.0.1", settings)
+    check("configured SSO turns dev mode off", allowed, False)
+    check("and says to sign in instead", "sign in" in why, True)
+    settings.auth.sso = SsoConfig()
+    check("with SSO unconfigured it is back",
+          dev_mode_available("127.0.0.1", settings)[0], True)
 
     # The guard that matters: a proxy on the same host is also loopback, so a
     # configured allowlist has to rule dev mode out entirely.
@@ -560,15 +576,16 @@ def test_sheet() -> None:
     page.append(["Migration requests for the October release"])  # a title above the header
     page.append([])
     page.append(["Rel#", "Migration Path", "Micro Service Name", "Repo Name",
-                 "Track Lead Name", "Change Requestor", "Code & Image Change?", "Commit Hash"])
+                 "Track Lead Name", "Change Requestor", "Merge Type",
+                 "Code & Image Change?", "Commit Hash"])
     page.append(["R2026.09", "SIT to QA", "payments", "demo/payments", "A. Kumar",
-                 "E1001", "Yes", "a1b2c3d"])
+                 "E1001", "Cherry Pick", "Yes", "a1b2c3d"])
     page.append(["R2026.09", "SIT to QA", "cart", "demo/cart", "R. Iyer",
-                 "E1001", "yes", ""])           # missing the required hash
+                 "E1001", "Cherry Pick", "yes", ""])   # missing the required hash
     page.append(["R1999.01", "SIT to QA", "payments", "demo/payments", "A. Kumar",
-                 "E1001", "No", ""])            # release not in the list
+                 "E1001", "Cherry Pick", "No", ""])    # release not in the list
     page.append(["R2026.09", "SIT to QA", "payments", "demo/cart", "A. Kumar",
-                 "E1001", "No", ""])            # repo of another microservice
+                 "E1001", "Cherry Pick", "No", ""])    # repo of another microservice
     page.append([None, None, None])                    # blank row, skipped
 
     import io
@@ -624,6 +641,92 @@ def test_permissions() -> None:
     check("and can retire", admin["can_retire"], True)
     check("and freeze", admin["can_freeze"], True)
     check("with nothing to explain", admin["why_not_raise"], "")
+
+
+def test_merge_type(root: Path) -> None:
+    """Cherry-pick or full merge, and where a full merge is refused."""
+    print("\n=== merge type ===")
+    settings = build_settings()
+    cfg = settings.migrations
+    cfg.microservices = [
+        Microservice("payments", ["demo/payments"], ["A. Kumar"], allow_full_merge=False),
+        Microservice("cart", ["demo/cart"], ["R. Iyer"], allow_full_merge=True),
+    ]
+
+    check("both are offered", migrations.option_lists(cfg)["merge_types"],
+          ["Cherry Pick", "Full Merge"])
+    check("it must be answered",
+          migrations.validate({}, cfg).get("merge_type"), "Required.")
+    check("and only with one of the two",
+          "merge_type" in migrations.validate({"merge_type": "Rebase"}, cfg, partial=True), True)
+
+    base = {"microservice": "payments", "repo_name": "demo/payments"}
+    check("a cherry-pick is accepted",
+          "merge_type" in migrations.validate({**base, "merge_type": "Cherry Pick"}, cfg, partial=True),
+          False)
+
+    refused = migrations.validate({**base, "merge_type": "Full Merge"}, cfg, partial=True)
+    check("a full merge is refused where it is not allowed", "merge_type" in refused, True)
+    check("naming the repository", "demo/payments" in refused["merge_type"], True)
+    check("and saying what to do instead",
+          "cherry-pick the change" in refused["merge_type"], True)
+
+    allowed = {"microservice": "cart", "repo_name": "demo/cart", "merge_type": "Full Merge"}
+    check("but permitted where the service allows it",
+          "merge_type" in migrations.validate(allowed, cfg, partial=True), False)
+
+    unknown = migrations.validate({"microservice": "", "merge_type": "Full Merge"}, cfg, partial=True)
+    check("with no microservice chosen it is still refused", "merge_type" in unknown, True)
+
+    # End to end, so the rule holds on the way in and not only in validate().
+    store = store_for(root, "merge.sqlite3")
+    settings.migrations = cfg
+    row = migrations.create_record(settings, store, DEV, {
+        **GOOD_REQUEST, "microservice": "cart", "repo_name": "demo/cart",
+        "track_lead": "R. Iyer", "merge_type": "Full Merge",
+    })
+    check("a full merge is stored where allowed", row["merge_type"], "Full Merge")
+
+    refused_call = lambda: migrations.create_record(settings, store, DEV, {
+        **GOOD_REQUEST, "merge_type": "Full Merge",
+    })
+    try:
+        refused_call()
+        check("and refused where not", "accepted", "refused")
+    except MigrationError as exc:
+        check("and refused where not", "refused", "refused")
+        check("with the field named for the form", list(exc.fields), ["merge_type"])
+
+    # No default: how the change reaches the branch is not something to be
+    # answered by leaving it alone.
+    check("it has no default to fall back on", migrations.BY_KEY["merge_type"].default, "")
+    omitted = dict(GOOD_REQUEST)
+    omitted.pop("merge_type")
+    try:
+        migrations.create_record(settings, store, DEV, omitted)
+        check("omitting it is refused", "accepted", "refused")
+    except MigrationError as exc:
+        check("omitting it is refused", "refused", "refused")
+        check("naming it as the gap", list(exc.fields), ["merge_type"])
+
+    # A spreadsheet is held to the same rule: a sheet written before this field
+    # existed no longer imports silently, it names the column it is missing.
+    sheet_row = {"_row": 2, "release": "R2026.09", "migration_path": "SIT to QA",
+                 "microservice": "payments", "repo_name": "demo/payments",
+                 "track_lead": "A. Kumar", "change_requestor": "E1001"}
+    result = migration_sheet.check_rows([sheet_row], cfg)[0]
+    check("a sheet row without it is invalid", result["ok"], False)
+    check("and says which column to add", "Merge Type" in result["problems"], True)
+    check("but passes once it carries one",
+          migration_sheet.check_rows([{**sheet_row, "merge_type": "Cherry Pick"}], cfg)[0]["ok"],
+          True)
+
+    # Turning the permission off later must refuse new requests, not old ones.
+    cfg.microservices = [Microservice("cart", ["demo/cart"], ["R. Iyer"], allow_full_merge=False)]
+    check("revoking it refuses the next request",
+          "merge_type" in migrations.validate(allowed, cfg, partial=True), True)
+    check("while the record already raised is untouched",
+          store.get(row["sl_no"])["merge_type"], "Full Merge")
 
 
 def test_employees(root: Path) -> None:
@@ -699,7 +802,7 @@ def test_spec() -> None:
     print("\n=== the field contract ===")
     spec = migrations.field_spec()
     check("every field is published", len(spec), len(migrations.FIELDS))
-    check("every field is accounted for", len(migrations.FIELDS), 33)
+    check("every field is accounted for", len(migrations.FIELDS), 34)
     check("the stage headings cover every stage",
           sorted(migrations.STAGE_TITLES), sorted({f.stage for f in migrations.FIELDS}))
     check("QA approval is named as such", migrations.STAGE_TITLES["approval"], "QA Approval")
@@ -786,7 +889,8 @@ async def test_http(root: Path) -> None:
             check("an incomplete request is refused", r.status_code, 422)
             check("with every missing field named",
                   sorted(r.json()["fields"]),
-                  ["change_requestor", "migration_path", "release", "repo_name", "track_lead"])
+                  ["change_requestor", "merge_type", "migration_path", "release",
+                   "repo_name", "track_lead"])
             check("each with a reason", set(r.json()["fields"].values()), {"Required."})
             check("and a sentence for the summary line",
                   "Rel#: Required." in r.json()["detail"], True)
@@ -839,11 +943,13 @@ async def test_http(root: Path) -> None:
             book = Workbook()
             page = book.active
             page.append(["Rel#", "Migration Path", "Micro Service Name", "Repo Name",
-                         "Track Lead Name", "Change Requestor"])
+                         "Track Lead Name", "Change Requestor", "Merge Type"])
             # The requestor column carries just the employee number, as a real
             # sheet usually would; the server resolves it to the full label.
-            page.append(["R2026.09", "SIT to QA", "cart", "demo/cart", "R. Iyer", "E1001"])
-            page.append(["R2026.09", "SIT to QA", "cart", "demo/payments", "R. Iyer", "E1001"])
+            page.append(["R2026.09", "SIT to QA", "cart", "demo/cart", "R. Iyer", "E1001",
+                         "Cherry Pick"])
+            page.append(["R2026.09", "SIT to QA", "cart", "demo/payments", "R. Iyer", "E1001",
+                         "Cherry Pick"])
             buffer = io.BytesIO()
             book.save(buffer)
             upload = {"file": ("plan.xlsx", buffer.getvalue(),
@@ -1118,7 +1224,10 @@ async def test_http(root: Path) -> None:
             await c.delete(f"/api/migrations/freezes/{fid}")
 
         # An admin holds every permission without being given every role.
-        M.settings.auth.roles["admin"] = ["boss@elsewhere.com"]
+        # Roles now live in the database, so config.yaml is no longer the place
+        # to add one — that is the whole point of the change.
+        M.reference_store.set_role("admin", ["boss@elsewhere.com"])
+        M.settings.auth.live_roles = M.reference_store.roles()
         async with client("boss@elsewhere.com") as c:
             meta = (await c.get("/api/migrations/meta")).json()
             check("an admin is listed as admin alone", meta["user"]["roles"], ["admin"])
@@ -1194,9 +1303,12 @@ async def test_http_dev(root: Path) -> None:
         async with client(peer="10.1.2.3") as c:
             r = await c.get("/api/migrations/records")
             check("dev mode is refused from off-box", r.status_code, 401)
-            meta = (await c.get("/api/migrations/meta")).json()
-            check("and meta explains why", "loopback" in meta["dev"]["why_not"], True)
-            check("while still admitting it is configured", meta["dev"]["configured"], True)
+            # meta is behind the gate now, so the explanation has to come from
+            # somewhere a locked-out caller can still reach.
+            who = (await c.get("/api/auth/whoami")).json()
+            check("whoami explains why", "loopback" in who["dev_mode"]["why_not"], True)
+            check("while still admitting it is configured", who["dev_mode"]["configured"], True)
+            check("and says the gate is on", who["enforced"], True)
 
         M.settings.auth.dev_allow_remote = True
         async with client(peer="10.1.2.3") as c:
@@ -1206,9 +1318,12 @@ async def test_http_dev(root: Path) -> None:
 
         M.settings.auth.trusted_proxies = ["127.0.0.1"]
         async with client() as c:
-            meta = (await c.get("/api/migrations/meta")).json()
-            check("a configured proxy switches dev mode off", meta["dev"]["enabled"], False)
-            check("and nobody is signed in without a header", meta["user"]["signed_in"], False)
+            # With dev mode off and no header, the gate refuses before meta —
+            # so whoami, which stays public, is what answers.
+            check("the register is closed", (await c.get("/api/migrations/meta")).status_code, 401)
+            who = (await c.get("/api/auth/whoami")).json()
+            check("a configured proxy switches dev mode off", who["dev_mode"]["available"], False)
+            check("and nobody is signed in without a header", who["signed_in"], False)
 
 
 def test_sorting_and_dates(root: Path) -> None:
@@ -1331,12 +1446,12 @@ def test_retire_and_delete(root: Path) -> None:
     check("retiring an already-retired record records nothing new",
           len(store.audit(first["sl_no"])), before)
 
-    check("deleting removes it", store.delete(first["sl_no"]), True)
+    check("deleting removes it", store.delete(first["sl_no"], APPROVER), True)
     check("it is gone from the store", store.get(first["sl_no"]), None)
     check("its history goes with it", store.audit(first["sl_no"]), [])
     check("even when inactive rows are asked for",
           [r["sl_no"] for r in store.list(include_inactive=True)], [second["sl_no"]])
-    check("deleting something absent says so", store.delete(9999), False)
+    check("deleting something absent says so", store.delete(9999, APPROVER), False)
     check("the other record is untouched", store.get(second["sl_no"])["active"], True)
 
     # A database written before `active` existed must still open. Simulate one
@@ -1670,6 +1785,33 @@ def test_bulk_execution(root: Path) -> None:
            migrations.permissions(ADMIN)["can_approve"]), (True, True))
 
 
+def test_table_list_is_complete() -> None:
+    """The suite's table list must not drift behind the schema.
+
+    It is used to reset PostgreSQL between tests, and a table missing from it
+    leaks rows into the next test — which is how this check came to exist.
+    """
+    print("\n=== the schema the tests reset ===")
+    import tempfile as _tf
+
+    from app.reference import ReferenceStore
+
+    with _tf.TemporaryDirectory() as tmp:
+        db = Database(f"sqlite:///{Path(tmp) / 'schema.sqlite3'}")
+        MigrationStore(db)
+        ReferenceStore(db)
+        with db.connect() as conn:
+            real = {
+                r["name"]
+                for r in conn.all("SELECT name FROM sqlite_master WHERE type = ?", ("table",))
+                if not r["name"].startswith("sqlite_")
+            }
+    check("every table the app creates is in APP_TABLES",
+          sorted(real - set(APP_TABLES)), [])
+    check("and nothing in APP_TABLES is imaginary",
+          sorted(set(APP_TABLES) - real), [])
+
+
 def test_database_reachability(root: Path) -> None:
     """A database that cannot be reached must say so clearly, and quickly."""
     print("\n=== reaching the database ===")
@@ -1703,6 +1845,47 @@ def test_database_reachability(root: Path) -> None:
             check("quoting what the server said", "does not exist" in message, True)
             check("and suggesting what to check", "pg_hba.conf" in message, True)
         check("without waiting on a long timeout", _t.monotonic() - start < 5, True)
+
+
+def test_delete_audit(root: Path) -> None:
+    """Deleting a record must not delete the fact that it existed."""
+    print("\n=== deletion leaves an account ===")
+    settings = build_settings()
+    store = store_for(root, "delaudit.sqlite3")
+
+    row = migrations.create_record(settings, store, DEV, dict(GOOD_REQUEST))
+    sl = row["sl_no"]
+    migrations.apply_changes(settings, store, APPROVER, sl, {"ready_for_qa": "Yes"})
+    check("nothing deleted yet", store.deleted(), [])
+
+    check("it deletes", store.delete(sl, APPROVER, "raised against the wrong release"), True)
+    check("and is gone from the register", store.get(sl), None)
+    check("its live history is gone too", store.audit(sl), [])
+
+    kept = store.deleted()
+    check("but the deletion is recorded", len(kept), 1)
+    entry = kept[0]
+    check("under its own SL#", entry["sl_no"], sl)
+    check("naming who removed it", entry["deleted_by"], "lead@example.com")
+    check("when", entry["deleted_at"].endswith("Z"), True)
+    check("and why", entry["reason"], "raised against the wrong release")
+    check("the record is kept as it stood", entry["record"]["microservice"], "payments")
+    check("with the status it had reached", entry["status_label"], "Approved")
+    check("and its whole history",
+          [h["field"] for h in entry["history"]],
+          ["created", "ready_for_qa", "approved_by", "date_approved"])
+    check("readably", entry["history"][1]["label"], "Ready for QA")
+
+    check("deleting something absent does nothing",
+          store.delete(9999, APPROVER), False)
+    check("and records nothing", len(store.deleted()), 1)
+
+    # A reason is not required, and its absence is visible rather than implied.
+    second = migrations.create_record(settings, store, DEV, dict(GOOD_REQUEST))["sl_no"]
+    store.delete(second, ADMIN_USER, "")
+    check("a deletion without a reason is still recorded", len(store.deleted()), 2)
+    check("with the reason blank", store.deleted()[0]["reason"], "")
+    check("newest first", store.deleted()[0]["sl_no"], second)
 
 
 def test_db_migration(root: Path) -> None:
@@ -1789,6 +1972,53 @@ def test_db_migration(root: Path) -> None:
     if not TEST_DB_URL:
         target.close()
     source.close()
+
+
+def test_roles_in_database(root: Path) -> None:
+    """Role assignments come from the database first, config.yaml second."""
+    print("\n=== where roles come from ===")
+    from app.auth import role_patterns, roles_for
+    from app.reference import ReferenceError, ReferenceStore
+
+    settings = build_settings()
+    ref = ReferenceStore(database_for(root, "roles.sqlite3"))
+
+    settings.auth.live_roles = {}
+    check("with an empty table, config decides", role_patterns(settings), settings.auth.roles)
+    check("so lead is an approver", "approver" in roles_for("lead@example.com", settings), True)
+
+    seeded = ref.seed_roles(settings.auth.roles)
+    check("config seeds the table once", seeded["approver"], 2)
+    settings.auth.live_roles = ref.roles()
+    check("after which the database decides",
+          sorted(role_patterns(settings)["approver"]), ["head@example.com", "lead@example.com"])
+    check("seeding again does nothing", ref.seed_roles(settings.auth.roles), {})
+
+    # Editing the database takes effect; editing config.yaml no longer does.
+    ref.set_role("approver", ["someone.new@example.com"])
+    settings.auth.live_roles = ref.roles()
+    check("a change in the database is honoured",
+          "approver" in roles_for("someone.new@example.com", settings), True)
+    check("and the old holder loses it",
+          "approver" in roles_for("lead@example.com", settings), False)
+    settings.auth.roles["approver"] = ["lead@example.com", "another@example.com"]
+    check("while config.yaml is now ignored",
+          "approver" in roles_for("another@example.com", settings), False)
+
+    check("globs still work from the database",
+          "developer" in roles_for("anyone@example.com", settings), True)
+    check("blank entries are dropped",
+          ref.set_role("devops", ["  ", "ops@example.com", ""])["devops"], ["ops@example.com"])
+    check("a list can be cleared", ref.set_role("devops", [])["devops"], [])
+    refused("an unknown role is refused",
+            lambda: ref.set_role("wizard", ["x@y.com"]), contains="not a role")
+
+    # Clearing every role leaves nobody able to do anything — the API guards
+    # against the caller doing that to themselves; the store itself allows it.
+    settings.auth.live_roles = ref.roles()
+    # Still a developer: that comes from the *@example.com glob, not from devops.
+    check("clearing devops removes only devops",
+          sorted(roles_for("ops@example.com", settings)), ["developer"])
 
 
 def test_reference_store(root: Path) -> None:
@@ -1954,7 +2184,7 @@ def test_archive(root: Path) -> None:
             lambda: store.set_active(done, False, APPROVER),
             contains="archived")
     refused("nor deleted",
-            lambda: store.delete(done),
+            lambda: store.delete(done, APPROVER),
             contains="archived")
     # A bulk action reports it rather than raising, as it does for anything
     # else it cannot move.
@@ -1986,6 +2216,7 @@ def test_archive(root: Path) -> None:
 
 def main() -> int:
     test_config_parsing()
+    test_table_list_is_complete()
     test_identity()
     test_dev_mode()
     test_validation()
@@ -2006,11 +2237,17 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         test_database_reachability(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
+        test_delete_audit(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
         test_db_migration(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_roles_in_database(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
         test_reference_store(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
         test_archive(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_merge_type(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
         test_employees(Path(tmp))
     test_sheet()

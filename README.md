@@ -166,6 +166,7 @@ a `+` on the file count and may under-report folders.
 | `GET /api/config` | Tracked repos, providers, and defaults, for the UI to bootstrap. |
 | `GET /api/feed?since=2026-07-01&until=2026-08-05&key=…&refresh=false` | The merged feed. `since`/`until` are UTC calendar dates; `until` is inclusive and may be omitted for "through to now". `days=N` still works as a lookback when `since` is absent. `key` may repeat; values are `github:owner/repo` or `csr:project/repo`. |
 | `GET /api/summary?key=…&branch=…&folder=…&since=…&limit=100` | One row per commit on a branch, with full tag metadata. |
+| `GET /api/timeline?key=…&branch=…&folder=…&since_epoch=…&until_epoch=…&days=N` | Commits in one folder over a window, ordered for a timeline. `branch` blank means every branch config permits; the window defaults to `defaults.days`. |
 | `POST /api/commits/order` | `{commits, repo_key?, branch?}` → the list validated and ordered newest-first. |
 | `GET /api/bulk/template` | A starter `.xlsx` with the expected columns, so they need not be guessed. |
 | `GET /api/bulk/placeholders` | The placeholders a tag convention may use, with one line of help each. |
@@ -209,6 +210,7 @@ a `+` on the file count and may under-report folders.
 | [app/store.py](app/store.py) | SQLite cache of commit → file paths. |
 | [app/report.py](app/report.py) | Rollup + PDF and PowerPoint generation. |
 | [app/summary.py](app/summary.py) | Repo + branch + folder → the commit/tag table. |
+| [app/timeline.py](app/timeline.py) | Repo + folder + a window → commits ordered for a time axis. |
 | [app/lookup.py](app/lookup.py) | Hash → repo, branches, graph position. |
 | [app/tagging.py](app/tagging.py) | Tag staging, pushing, and the tag overview. |
 | [app/ordering.py](app/ordering.py) | Parse a commit list, validate it, order by ancestry. |
@@ -217,7 +219,8 @@ a `+` on the file count and may under-report folders.
 | [app/naming.py](app/naming.py) | The tag convention: placeholders, validation, next `{n}` in a series. |
 | [app/bulk.py](app/bulk.py) | Resolves each sheet row to a repo/folder and summarises it. |
 | [app/identity.py](app/identity.py) | Who a tag is attributed to: config, then the signed-in provider account. |
-| [app/auth.py](app/auth.py) | Identity from the proxy header, the trusted-proxy guard, role matching. |
+| [app/auth.py](app/auth.py) | Identity: the session, the proxy header, dev mode, role matching. |
+| [app/sso.py](app/sso.py) | The OpenID Connect flow, and everything verified about a token. |
 | [app/db.py](app/db.py) | The SQLite / PostgreSQL layer: dialect differences and nothing else. |
 | [tools/migrate_db.py](tools/migrate_db.py) | Copy the register between databases, in either direction. |
 | [app/reference.py](app/reference.py) | The dropdown lists in the database, and the one-time seed from config. |
@@ -340,11 +343,65 @@ the totals and breakdowns still cover every commit.
 | **Tags** | Every tag in every repo, grouped by the service / folder its commit touched. |
 | **Order commits** | Paste a list of commits; it validates and orders them newest-first. |
 | **Release plan** | Upload a spreadsheet of repo/folder rows; get each one's latest commit and a proposed tag name. |
+| **Folder timeline** | One repo, branch and folder over a window to the minute — a table of commits, grouped by day. |
 | **Migrations** | The SIT → QA → PROD request register: raise, approve, record and freeze. |
 
 The sidebar filters drive the Activity feed only; the other tabs carry their own
 pickers, so the sidebar folds away on them. The date range in the header applies to
 Activity and to the Summary table.
+
+## Folder timeline
+
+The Summary table answers *what are the commits, with their tags*. This answers a
+different question: **when did work happen in this folder**.
+
+Pick a **repository**, a **branch** and a **service / folder**, and a window **to the
+minute**. Nothing is drawn until all three are chosen — the tab says which is missing
+rather than showing a repo-wide list you did not ask for. Commits then come back in a
+table, grouped by day, newest first:
+
+```
+MONDAY 21-Sep-2026                                                              2
+ Time    Comment                            Hash         Created by  Files  Branch
+ 16:56   enhancement of migration tracker   c2d518002f   rajasany       16  main
+ 09:46   migration tracker added            f3ea48e253   rajasany       19  main
+
+SUNDAY 31-Aug-2026                                                              1
+ 14:36   tagging bug fixed                  385c5e65f9   rajasany        7  main
+```
+
+A **cherry-picked** commit is marked on the row, not only in the cell — an amber tint and
+edge, so it is visible while scanning a column of messages rather than only when reading
+one. The chip beside the comment keeps the distinction the rest of the app makes:
+
+| | |
+| --- | --- |
+| `cherry-pick 3f9a1c2` | `git cherry-pick -x` recorded the source commit, and it is named. |
+| `cherry-pick?` (faded) | The message mentions a cherry-pick but git recorded no source. |
+
+That difference is not cosmetic. A plain `git cherry-pick` leaves **no trace at all** in
+the commit, so the absence of a mark never means a commit is original — and a passing
+mention in a message is not provenance. Tags appear alongside.
+
+**The default window is the configured one** — `defaults.days` in config.yaml, 14 unless
+you change it — counted back from now, with the end left open at "now". **Default** puts
+it back after you have been exploring.
+
+**Changing the folder costs nothing.** The repository, branch and window are one request,
+and every folder in that window comes back with it; picking a folder narrows what is
+already here. So the folder list is never empty because of the folder you just chose, and
+moving between folders is instant.
+
+**Days are bucketed in your browser, not on the server.** A commit at 23:40 UTC falls on a
+different day in Auckland than in Los Angeles, and only the browser knows which one you
+mean. The window is sent as instants computed from your own clock for the same reason.
+
+The tab asks for one branch, which is also the cheap path — one page of commits rather
+than a request per branch. The API will still answer for every branch if `branch` is left
+out, folding a commit reachable from several into one row carrying all of them; where
+`branch_include` or `branch_exclude` is set, that is only all the branches config permits,
+and the summary line says so. A commit on an excluded branch is simply absent, and silence
+about that reads as it not existing.
 
 ## Summary table
 
@@ -501,7 +558,7 @@ open only when the preceding step is done.
 
 | Stage | Who | What they set | Opens when |
 | --- | --- | --- | --- |
-| Request | developer | Rel#, path, microservice, repo, track lead, requestor, reason, description, the four risk flags, commit hash, DB script path | always — and locks once approved |
+| Request | developer | Rel#, path, microservice, repo, track lead, requestor, reason, description, merge type, the four risk flags, commit hash, DB script path | always — and locks once approved |
 | QA Approval | approver | Ready for QA, QA Migration Date Planned | always |
 | QA Migration | devops | Executed in QA, QA Migration Remarks | once approved for QA |
 | Prod Approval | approver | Ready for Prod, Prod Migration Date Planned | once the QA migration is recorded |
@@ -550,6 +607,43 @@ genuine choice nothing is picked. Changing the microservice re-evaluates both fi
 clears anything the new service does not offer — in the form *and* on an existing
 record, which previously kept showing the old service's repos until the server refused
 the pairing.
+
+**Merge Type** asks how the change reaches the target branch: **Cherry Pick** or **Full
+Merge**. It starts blank and is mandatory — there is no default, because how a change
+reaches the branch is the developer's statement about their own change, and a default
+would let it be answered by not answering it. Leaving it empty marks it *Required.* under
+the field there and then rather than at Save, and Save stays disabled until it is
+answered.
+
+A full merge is refused unless the microservice is configured to permit one:
+
+```yaml
+migrations:
+  microservices:
+    - name: guardrails
+      repos: [rajasany/Guardrails]
+      track_leads: [R. Iyer]
+      allow_full_merge: true      # off unless set
+```
+
+Where it is off, choosing Full Merge is refused the moment it is picked — under the field,
+before the rest of the form has been filled in — with:
+
+> Full merge is not allowed for *repo*. Please cherry-pick the change and use that commit
+> for the migration.
+
+The same sentence comes back from the server, because the form is not a security boundary:
+the rule is enforced in `validate()`, so an API call or a spreadsheet upload is refused in
+the same words. The permission is also editable from **Lists…** in the Migrations tab,
+where each microservice carries a **Merge** checkbox.
+
+Revoking the permission refuses the *next* request; records already raised keep the merge
+type they were raised with, since rewriting history to match a rule that changed later
+would misrepresent what was actually approved.
+
+**A spreadsheet must carry a Merge Type column.** A sheet without one is reported as
+invalid per row, naming the column to add, rather than being imported under an assumption
+nobody made. Re-download the template from the tab to get the column with its dropdown.
 
 ### Where the data lives
 
@@ -874,7 +968,7 @@ Approvers and admins get two ways to take a record out of the register:
 | | What it does | Reversible |
 | --- | --- | --- |
 | **Deactivate** | Marks it inactive. It leaves the default listing, becomes read-only, and the change is recorded in its history. | Yes — **Reactivate** brings it back. |
-| **Delete…** | Removes the record and its whole audit trail from the database. | No. |
+| **Delete…** | Removes the record from the register. The record, its history, who deleted it and why are kept under **Deleted…**. | No. |
 
 Both are in the record's own dialog, on the left of the footer away from **Save**.
 Delete asks for confirmation in place, and the confirmation names Deactivate as the
@@ -953,6 +1047,26 @@ from those addresses, and the peer address is used for that check, never
 still runs, but every page carries a standing warning that it is unprotected. Roles may
 be exact addresses or globs, matching ignores case, and one person may hold several.
 
+### Where roles are kept
+
+Role assignments live **in the database**, editable without a restart, so several
+instances agree and nobody has to redeploy to make someone an approver. `config.yaml` is
+the answer only while the table is empty — which is what lets an existing deployment carry
+on working and gives a new one something to seed from. After that first seed, editing the
+YAML does nothing.
+
+```yaml
+auth:
+  roles:              # seed only; the database is the source once populated
+    developer: ["*@tcs.com"]
+    approver:  [lead@tcs.com]
+```
+
+`PUT /api/migrations/lists/roles/{role}` replaces the holders of one role. It refuses a
+change that would leave the caller without approver or admin and nobody able to put it
+back — locking everyone out of the register is easy to do in one careless edit and
+impossible to undo from inside the app.
+
 ### The admin role
 
 `admin` is a fourth role, and a superset: every check any other role satisfies, it
@@ -963,6 +1077,97 @@ freeze. The roles actually held are still reported as configured, so an admin sh
 
 Retiring and deleting need `approver` **or** `admin`, so neither is out of reach if you
 never configure an admin.
+
+### Signing in with Google Workspace or Entra ID
+
+The app does the OpenID Connect flow itself, so it can be pointed at a provider and used
+— no proxy in front, nothing else to run:
+
+```yaml
+auth:
+  sso:
+    provider: google                 # google | azure | oidc
+    client_id: "...apps.googleusercontent.com"
+    client_secret: "..."
+    redirect_url: https://dashboard.example.com/auth/callback
+    allowed_domains: [tcs.com]
+    session_hours: 12
+```
+
+#### Setting up Google
+
+In the [Google Cloud console](https://console.cloud.google.com/apis/credentials), for the
+project you want this under:
+
+1. **OAuth consent screen** — choose **Internal** if everyone using this is in your
+   Workspace, which skips verification entirely. Add your domain under authorised domains.
+2. **Credentials → Create credentials → OAuth client ID → Web application**.
+3. Under **Authorised redirect URIs** add exactly the `redirect_url` you will configure —
+   scheme, host, port and path must match character for character, including
+   `http://localhost:8000/auth/callback` if that is where you are testing. A mismatch here
+   is the single most common failure, and Google's own `redirect_uri_mismatch` is passed
+   straight through so you can see it.
+4. Copy the client ID and secret into `.env`:
+
+```
+SSO_CLIENT_ID=1234....apps.googleusercontent.com
+SSO_CLIENT_SECRET=...
+SESSION_SECRET=$(openssl rand -base64 48)
+```
+
+No scopes need requesting beyond `openid email profile`, and no Google APIs need enabling
+— this only signs people in.
+
+`hosted_domain` pre-filters Google's account chooser to one Workspace domain, which is a
+convenience. `allowed_domains` is the check that matters: it is enforced here, after the
+token is verified, and a `hd` parameter alone is not a security control.
+
+**Turn `dev_mode` off.** Dev mode is resolved before the session, so with both configured
+you would sign in successfully and still be answered as `dev_user`. The app now refuses
+to run dev mode while SSO is configured and says so, rather than letting sign-in look
+silently broken.
+
+#### Other providers
+
+For **Microsoft Entra ID (Azure AD)** set `provider: azure` and a `tenant`; for anything
+else set `provider: oidc` and an `issuer`. Endpoints and signing keys come from the
+provider's own discovery document, so there is nothing else to configure and nothing to
+update when a provider rotates its keys.
+
+Register `redirect_url` with the provider as a permitted redirect URI — a mismatch there
+is the usual first failure, and the provider's own complaint is passed straight through
+rather than replaced with something vaguer.
+
+Put the secrets in `.env`, not in `config.yaml`: `SSO_CLIENT_ID`, `SSO_CLIENT_SECRET` and
+`SESSION_SECRET` all override the file. Without `SESSION_SECRET` a random one is made per
+process, which signs everyone out on restart and means two instances will not accept each
+other's cookies.
+
+**What is checked**, because an ID token is worth only what is verified about it: the
+signature against the provider's published keys, the issuer and audience so a token minted
+for another application cannot be replayed here, the expiry, the **nonce** tying the token
+to the sign-in this browser began, the **state** tying the callback to it — which is what
+stops a login CSRF — and **PKCE**, so an intercepted authorization code is useless without
+the verifier held in this browser.
+
+The session is a signed, expiring cookie holding the address and nothing else. **Roles are
+resolved per request**, not stored in it, so withdrawing someone's role takes effect on
+their next click rather than whenever their session happens to lapse.
+
+Entra ID often omits `email` and puts the address in `preferred_username` or `upn`; all
+three are accepted. Where a provider carries roles in the token, `role_claim` and
+`role_map` read them and add them to whatever the address grants:
+
+```yaml
+    role_claim: roles
+    role_map:
+      MigrationApprover: approver
+      MigrationDevOps: devops
+```
+
+Routes are `/auth/login`, `/auth/callback` and `/auth/logout`; `GET /api/auth/whoami`
+reports who the app thinks you are and how it decided. Signing out clears the session here
+and leaves the provider's own session alone.
 
 ### Testing without SSO
 
@@ -1238,13 +1443,17 @@ other rule hard-codes a colour.
 .venv/bin/python tests/test_report.py   # date window + report rollup        (57 checks)
 .venv/bin/python tests/test_lookup.py   # tag metadata, summary, lookup      (51 checks)
 .venv/bin/python tests/test_tagging.py  # staging, pushing, tag branches     (68 checks)
+.venv/bin/python tests/test_sso.py      # OIDC against a live test provider   (47 checks)
+.venv/bin/python tests/test_auth_gate.py # every endpoint closed by default   (23 checks)
+.venv/bin/python tests/test_timeline.py # folder timeline, cherry-picks      (40 checks)
 .venv/bin/python tests/test_ordering.py # parsing and ordering a list        (30 checks)
 .venv/bin/python tests/test_cherrypick.py # cherry-pick detection            (24 checks)
 .venv/bin/python tests/test_compare.py  # branch comparison, real git repo   (33 checks)
 .venv/bin/python tests/test_bulk.py     # sheet parsing, conventions, concurrency (55 checks)
-.venv/bin/python tests/test_migrations.py # roles, workflow, archive, staff    (553 checks)
-node tests/ui_cascade.test.js          # selection, rendering, escaping      (186 checks)
+.venv/bin/python tests/test_migrations.py # roles, workflow, archive, sign-in  (589 checks)
+node tests/ui_cascade.test.js          # selection, rendering, escaping     (196 checks)
 node tests/ui_migrations.test.js       # rendering, archive, staff, escaping (182 checks)
+node tests/ui_timeline.test.js         # gating, grouping, cherry-picks     (61 checks)
 ```
 
 The second suite runs the real `app/static/app.js` in a stubbed DOM and asserts the cases
@@ -1254,6 +1463,77 @@ selections are pruned on repo switch; the lists render single-select buttons wit
 checkbox inputs; commit rows mark the default branch and expose the full message only
 when there is one; and a commit title containing `"`, `&`, or `<tag>` is escaped rather
 than injected into the markup.
+
+## Deploying to a server
+
+On a laptop this runs open, which is fine — it reads your own git and your own credentials.
+A shared server is a different thing, and three questions decide whether it is safe.
+
+### Every request is attributable
+
+**The moment any authentication is configured, every API call requires a signed-in user.**
+That is one middleware rule, not a decorator per route, because the failure mode it
+replaces was real: `/api/tags/push` — which pushes a tag to a remote — was reachable by
+anyone, simply because that route had been written without a guard. A route added tomorrow
+is closed until it is deliberately listed as public.
+
+Public by necessity: the page and its assets, `/auth/*`, `/api/health`, and
+`/api/auth/whoami` — which reports who you are, whether the gate is on, and *why* you are
+not signed in. Diagnosing a lockout from behind the gate would be useless.
+
+```yaml
+auth:
+  require_sign_in: true      # force it even with no auth configured — a clear 401
+```
+
+Unset, it follows whether SSO or roles exist. Configured authentication plus open data
+would be a trap; demanding a sign-in nobody can perform would just break a laptop.
+
+### One identity reads the repositories — not each user's own
+
+This is the part to be clear about, because it is a design property rather than a setting.
+
+The dashboard reads GitHub with **one** `GITHUB_TOKEN` and Cloud Source Repositories with
+**one** gcloud identity. Everyone who signs in sees whatever that identity can see. Signing
+in as yourself authenticates *you to the dashboard*; it does not change *whose credentials
+the dashboard reads git with*.
+
+So `gcloud auth login` on a server is not a user action — it re-authenticates the machine,
+and every other user's view with it. **That route is now refused unless the request comes
+from the machine itself**, where it is the laptop convenience it was written as. On a
+server, give the service its own credentials:
+
+| | |
+| --- | --- |
+| GitHub | A **GitHub App** installation token, or a machine PAT with `Contents: read` on exactly the repos to expose. |
+| Cloud Source Repositories | A **service account** with `source.reader`, via `GOOGLE_APPLICATION_CREDENTIALS` or workload identity — never a human's `gcloud auth login`. |
+
+Give it the narrowest access that shows what the dashboard should show. It is the ceiling
+on what any signed-in user can reach.
+
+### Credentials and repository data on the server
+
+**No user credential is ever stored.** Sign-in is OpenID Connect: the app takes a verified
+ID token, reads the address from it, and keeps a signed, expiring cookie holding that
+address and nothing else. No password, no provider token, nothing to leak. Roles are
+resolved per request, so the cookie confers no authority by itself.
+
+**One service credential does exist**, and belongs in the environment — `GITHUB_TOKEN`,
+`SSO_CLIENT_SECRET`, `SESSION_SECRET`, `DATABASE_URL` — from your platform's secret manager
+rather than a file in the repository. `config.yaml` is for things that are not secret.
+
+**Repository content does land on disk**, and is worth knowing about:
+
+| | |
+| --- | --- |
+| `.cache/mirrors/` | Full `--mirror` clones of each CSR repository. CSR has no history API, so this is how history is read at all. |
+| `.cache/commit-files.sqlite3` | Which paths each commit touched. |
+| `.cache/staged-tags.sqlite3` | Tags created but not yet pushed. |
+
+All of it is derived from what the service identity can already read, and it is shared
+across users exactly as the service identity is. Treat the server's disk as holding a copy
+of every repository it tracks, and encrypt it accordingly. Deleting `.cache/` loses nothing
+that cannot be refetched.
 
 ## Known limits of this version
 
@@ -1274,12 +1554,13 @@ than injected into the markup.
 - `auth.dev_mode` bypasses authentication entirely and is for testing. It is guarded
   three ways and announces itself loudly, but it is still a bypass: do not deploy with
   it on.
-- Everything but the Migrations tab is unauthenticated. Anyone who can reach the app can
-  read the commit feed, compare branches and stage tags; roles gate the migration
-  register only.
-- Deleting a migration request also deletes its audit trail. Deactivating is the
-  reversible option and keeps the history; prefer it unless the record should genuinely
-  never have existed.
+- Every user sees the same repositories. The dashboard reads git with one service
+  identity, so signing in decides *whether* you may look, not *what* you may look at.
+  Per-user repository visibility would need either per-user OAuth or a per-role repo
+  allowlist; neither exists yet.
+- Deleting a migration request removes it from the register for good — there is no
+  restore. The record and its history are kept under **Deleted…** so the deletion is
+  itself accounted for, but nothing puts them back. Deactivating is the reversible one.
 - Archiving is permanent and has no undo. It is limited to records already migrated to
   production, and confirmed before it happens, but there is no way back short of editing
   the database.

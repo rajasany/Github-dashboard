@@ -73,6 +73,33 @@ class Microservice:
     name: str
     repos: list[str] = field(default_factory=list)
     track_leads: list[str] = field(default_factory=list)
+    # Off unless a service says otherwise: bringing a whole branch across is the
+    # exception, and the form should have to be told it is permitted.
+    allow_full_merge: bool = False
+
+
+@dataclass
+class SsoConfig:
+    """OpenID Connect sign-in — Google Workspace, Entra ID, or any provider."""
+
+    enabled: bool = False
+    provider: str = "oidc"            # google | azure | oidc
+    issuer: str = ""                  # required when provider is oidc
+    tenant: str = ""                  # azure: tenant id, "organizations", "common"
+    client_id: str = ""
+    client_secret: str = ""
+    redirect_url: str = ""
+    scopes: list[str] = field(default_factory=lambda: ["openid", "email", "profile"])
+    allowed_domains: list[str] = field(default_factory=list)
+    hosted_domain: str = ""           # google: restrict the account chooser
+    session_hours: int = 12
+    # Optional: take roles from a claim as well as from the address.
+    role_claim: str = ""
+    role_map: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.enabled and self.client_id and self.redirect_url)
 
 
 @dataclass
@@ -96,12 +123,37 @@ class AuthConfig:
     # The identity assumed when dev mode is on and nothing has been chosen.
     dev_user: str = ""
     # role -> email patterns ("someone@x.com" or "*@x.com"), matched case-insensitively.
+    # `roles` is what config.yaml said; `live_roles` is what the database holds and
+    # is filled in per request. The database wins where it has anything to say.
     roles: dict[str, list[str]] = field(default_factory=dict)
+    live_roles: dict[str, list[str]] = field(default_factory=dict)
+    sso: SsoConfig = field(default_factory=SsoConfig)
+    # Whether every API call must come from someone signed in. None means
+    # "decide from whether any authentication is configured at all", which is
+    # what stops a laptop needing auth and a server silently not having it.
+    require_sign_in: bool | None = None
+    # Signs the session cookie. Generated per process when unset, which logs
+    # everyone out on restart — fine for one instance, not for several.
+    session_secret: str = ""
+
+    @property
+    def enforced(self) -> bool:
+        """Must every request be attributable to someone?
+
+        Defaults to yes the moment any authentication exists — configuring SSO
+        or roles and still serving the data to anyone would be a trap. A
+        deployment with no authentication at all stays open, because demanding
+        a sign-in nobody can perform would just break it; `require_sign_in: true`
+        forces the question and gives a clear 401 instead.
+        """
+        if self.require_sign_in is not None:
+            return self.require_sign_in
+        return bool(self.sso.ready or self.configured)
 
     @property
     def configured(self) -> bool:
-        # self.roles always holds a key per role, so test the patterns, not the dict.
-        return any(self.roles.values())
+        # Each dict always holds a key per role, so test the patterns, not the dict.
+        return any(self.live_roles.values()) or any(self.roles.values())
 
 
 SERVICE_COLUMNS: dict[str, list[str]] = {
@@ -387,6 +439,33 @@ def _parse_auth(section: dict | None) -> AuthConfig:
     raw_roles = section.get("roles") or {}
     roles = {role: _clean_list(raw_roles.get(role)) for role in ROLES}
 
+    raw_sso = section.get("sso") or {}
+    provider = str(raw_sso.get("provider") or "oidc").strip().lower()
+    role_map = {
+        str(k): str(v).strip()
+        for k, v in (raw_sso.get("role_map") or {}).items()
+        if str(v).strip() in ROLES
+    }
+    sso = SsoConfig(
+        enabled=bool(raw_sso.get("enabled", bool(raw_sso.get("client_id")))),
+        provider=provider,
+        issuer=str(raw_sso.get("issuer") or "").strip(),
+        tenant=str(raw_sso.get("tenant") or "").strip(),
+        # Secrets belong in the environment, so the env wins over the file.
+        client_id=os.getenv("SSO_CLIENT_ID", "").strip() or str(raw_sso.get("client_id") or "").strip(),
+        client_secret=(
+            os.getenv("SSO_CLIENT_SECRET", "").strip()
+            or str(raw_sso.get("client_secret") or "").strip()
+        ),
+        redirect_url=str(raw_sso.get("redirect_url") or "").strip(),
+        scopes=_clean_list(raw_sso.get("scopes")) or ["openid", "email", "profile"],
+        allowed_domains=_clean_list(raw_sso.get("allowed_domains")),
+        hosted_domain=str(raw_sso.get("hosted_domain") or "").strip(),
+        session_hours=int(raw_sso.get("session_hours", 12) or 12),
+        role_claim=str(raw_sso.get("role_claim") or "").strip(),
+        role_map=role_map,
+    )
+
     return AuthConfig(
         header=str(section.get("header") or "X-Forwarded-Email").strip(),
         trusted_proxies=_clean_list(section.get("trusted_proxies")),
@@ -394,6 +473,15 @@ def _parse_auth(section: dict | None) -> AuthConfig:
         dev_allow_remote=bool(section.get("dev_allow_remote", False)),
         dev_user=str(section.get("dev_user") or "").strip(),
         roles=roles,
+        sso=sso,
+        require_sign_in=(
+            None if section.get("require_sign_in") is None
+            else bool(section.get("require_sign_in"))
+        ),
+        session_secret=(
+            os.getenv("SESSION_SECRET", "").strip()
+            or str(section.get("session_secret") or "").strip()
+        ),
     )
 
 
@@ -432,8 +520,10 @@ def _parse_migrations(section: dict | None) -> MigrationConfig:
             name, repos, leads = str(entry).strip(), [], []
         if not name:
             continue
+        allow_merge = bool(entry.get("allow_full_merge", False)) if isinstance(entry, dict) else False
         services.append(
-            Microservice(name=name, repos=_clean_list(repos), track_leads=_clean_list(leads))
+            Microservice(name=name, repos=_clean_list(repos),
+                         track_leads=_clean_list(leads), allow_full_merge=allow_merge)
         )
 
     raw_path = str(section.get("microservices_file") or "").strip()

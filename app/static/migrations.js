@@ -183,10 +183,16 @@
     if (dev.enabled) parts.push(devStrip());
 
     const roles = user.roles.length ? user.roles.join(", ") : "no roles";
+    const singleSignOn = state.meta.sso || {};
     parts.push(
       `<div class="mig-whoami">` +
         `<span class="mig-who">${esc(user.email || "Not signed in")}</span>` +
         `<span class="mig-roles">${esc(roles)}</span>` +
+        (singleSignOn.enabled
+          ? user.signed_in
+            ? `<a class="mig-signout" href="/auth/logout">Sign out</a>`
+            : `<a class="btn tiny primary" href="/auth/login">Sign in</a>`
+          : "") +
       `</div>`
     );
 
@@ -205,7 +211,13 @@
       parts.push(note("warn", `<code>auth.dev_mode</code> is set but not in effect: ${esc(dev.why_not)}.`));
     }
 
-    if (!user.signed_in && !dev.enabled) {
+    if (!user.signed_in && !dev.enabled && singleSignOn.enabled) {
+      parts.push(
+        note("warn",
+          "<strong>Not signed in.</strong> " +
+          `<a href="/auth/login">Sign in</a> to use the register — it is read-only until you do.`)
+      );
+    } else if (!user.signed_in && !dev.enabled) {
       parts.push(
         note("warn",
           "<strong>Not signed in.</strong> No identity header reached the app, so the register " +
@@ -848,9 +860,31 @@
     return `<input id="${id}" class="input mig-input" type="text" spellcheck="false" value="${esc(value)}" data-key="${field.key}" />`;
   }
 
+  /* Why a full merge cannot be requested here, if it cannot. The server refuses
+   * it too — this only means finding out at the moment of choosing rather than
+   * after filling the rest of the form in. */
+  function mergeRefusal(values) {
+    if (values.merge_type !== "Full Merge") return "";
+    const service = (state.meta.services || []).find((s) => s.name === values.microservice);
+    if (!values.microservice) {
+      return "Choose a micro service — whether a full merge is allowed depends on it.";
+    }
+    if (service && service.allow_full_merge) return "";
+    const where = values.repo_name || values.microservice;
+    return (
+      `Full merge is not allowed for ${where}. Please cherry-pick the change and ` +
+      `use that commit for the migration.`
+    );
+  }
+
+  function isRequired(field, values) {
+    return Boolean(
+      field.required || (field.required_if && values[field.required_if[0]] === field.required_if[1])
+    );
+  }
+
   function fieldBlock(field, value, values, editable, autofilled = false) {
-    const required =
-      field.required || (field.required_if && values[field.required_if[0]] === field.required_if[1]);
+    const required = isRequired(field, values);
     return (
       `<div class="mig-field${field.kind === "longtext" ? " wide" : ""}" data-field="${field.key}">` +
       `<label for="mig-in-${field.key}">${esc(field.label)}` +
@@ -858,6 +892,9 @@
       (field.amber_when ? `<span class="mig-flagmark" title="Marked amber when ${esc(field.amber_when)}">▲</span>` : "") +
       `</label>` +
       inputFor(field, value, values, editable) +
+      (field.key === "merge_type" && editable && mergeRefusal(values)
+        ? `<p class="mig-field-error mig-blocked">${esc(mergeRefusal(values))}</p>`
+        : "") +
       // Say so rather than filling it in silently: the value is still the
       // person's to change, they just did not have to pick from a list of one.
       (autofilled && editable
@@ -907,8 +944,41 @@
 
     const body = document.querySelector(".mig-dialog-body");
 
+    // Only fields the person has actually left are marked, so a form that has
+    // just opened is not already covered in red.
+    const touched = new Set();
+
+    /* Say "Required." under a mandatory field as soon as it is left empty.
+     * The focus is deliberately not trapped there: holding someone in a control
+     * breaks keyboard and screen-reader navigation, and stops them filling the
+     * form in whatever order suits them. The mark stays until they answer. */
+    function flagGap(key) {
+      const node = body.querySelector(`.mig-field[data-field="${key}"]`);
+      if (!node) return;
+      const empty = !String(values[key] || "").trim();
+      node.classList.toggle("is-bad", empty);
+      const existing = node.querySelector(".mig-field-error:not(.mig-blocked)");
+      if (!empty) {
+        existing?.remove();
+        return;
+      }
+      if (existing) return;
+      const message = document.createElement("p");
+      message.className = "mig-field-error";
+      message.textContent = "Required.";
+      node.appendChild(message);
+    }
+
+    // A re-render replaces the nodes, so the marks have to be put back.
+    const reflectGaps = () => touched.forEach(flagGap);
+
     function rewire() {
       for (const input of body.querySelectorAll(".mig-input")) {
+        input.addEventListener("blur", () => {
+          if (!isRequired(specs.find((f) => f.key === input.dataset.key) || {}, values)) return;
+          touched.add(input.dataset.key);
+          flagGap(input.dataset.key);
+        });
         input.addEventListener("change", () => {
           values[input.dataset.key] = input.value;
           // The dependent lists become wrong the moment the service changes.
@@ -919,9 +989,13 @@
             if (keptRequestor) autofilled.push("change_requestor");
             body.innerHTML = render();
             rewire();
-          } else if (input.dataset.key === "code_image_change" || input.dataset.key === "ddl_dml") {
-            body.innerHTML = render(); // requiredness and the amber tint change
+            reflectMerge();
+          } else if (["code_image_change", "ddl_dml", "merge_type"].includes(input.dataset.key)) {
+            // Requiredness, the amber tint and the full-merge refusal all depend
+            // on a value that just changed.
+            body.innerHTML = render();
             rewire();
+            reflectMerge();
           } else {
             input.classList.toggle(
               "is-amber",
@@ -933,6 +1007,22 @@
       }
     }
     rewire();
+
+    function reflectMerge() {
+      reflectGaps();
+      const save = $("mig-save");
+      if (!save) return;
+      // Merge Type is the one gap held at the button. It is not a value that can
+      // be inferred, and a full merge on the wrong repository is the mistake
+      // this whole field exists to prevent — so neither blank nor refused goes
+      // to the server to be bounced back.
+      const blocked =
+        mergeRefusal(values) ||
+        (!String(values.merge_type || "").trim() ? "Choose a Merge Type first." : "");
+      save.disabled = Boolean(blocked);
+      save.title = blocked || "";
+    }
+    reflectMerge();
 
     $("mig-cancel").addEventListener("click", close);
     $("mig-save").addEventListener("click", async () => {
@@ -1098,17 +1188,21 @@
       const actions = document.querySelector(".mig-foot-actions");
       if (!actions) return;
       actions.innerHTML =
-        `<span class="mig-confirm">Delete SL# ${slNo} and its whole history? ` +
-        `This cannot be undone — <strong>Deactivate</strong> is the reversible option.</span>` +
+        `<span class="mig-confirm">Remove SL# ${slNo} from the register? ` +
+        `<strong>Deactivate</strong> is the reversible option. The record and its history ` +
+        `are kept under <em>Deleted</em> for the audit trail.</span>` +
+        `<input id="mig-del-why" class="input mig-del-why" type="text" ` +
+        `placeholder="Why (recorded against the deletion)" />` +
         `<button class="btn" id="mig-del-no">Cancel</button>` +
-        `<button class="btn danger" id="mig-del-yes">Delete permanently</button>`;
+        `<button class="btn danger" id="mig-del-yes">Delete</button>`;
 
       $("mig-del-no").addEventListener("click", () => openRecord(slNo));
       $("mig-del-yes").addEventListener("click", async () => {
         $("mig-del-yes").disabled = true;
         setError("");
         try {
-          await api(`/api/migrations/records/${slNo}`, { method: "DELETE" });
+          const why = encodeURIComponent($("mig-del-why")?.value || "");
+          await api(`/api/migrations/records/${slNo}?reason=${why}`, { method: "DELETE" });
           close();
           await refresh();
         } catch (error) {
@@ -1334,6 +1428,66 @@
     }
   }
 
+  async function showDeleted() {
+    dialog("Deleted records", `<p class="muted">Loading…</p>`,
+           `<button class="btn" id="mig-cancel">Close</button>`);
+    $("mig-cancel").addEventListener("click", close);
+
+    let data;
+    try {
+      data = await api("/api/migrations/deleted");
+    } catch (error) {
+      document.querySelector(".mig-dialog-body").innerHTML =
+        `<div class="mig-note warn">${esc(error.message)}</div>`;
+      return;
+    }
+
+    const rows = (data.deleted || [])
+      .map(
+        (d, index) =>
+          `<tr><td class="num">${esc(d.sl_no)}</td>` +
+          `<td>${esc(d.microservice)}</td><td class="mono">${esc(d.repo_name)}</td>` +
+          `<td>${esc(d.status_label)}</td>` +
+          `<td class="mig-date">${esc(dmy(d.deleted_at))}</td>` +
+          `<td>${esc(d.deleted_by)}</td>` +
+          `<td>${esc(d.reason) || '<span class="muted">not given</span>'}</td>` +
+          `<td class="num"><button class="btn tiny mig-del-show" data-i="${index}">History</button></td>` +
+          `</tr>`
+      )
+      .join("");
+
+    document.querySelector(".mig-dialog-body").innerHTML =
+      `<p class="scope-line">Records removed from the register. The record and its full ` +
+      `history are kept here so a deletion is itself accounted for — they cannot be ` +
+      `restored, but nothing is lost from the audit trail.</p>` +
+      (rows
+        ? `<div class="table-scroll"><table class="data-table"><thead><tr>` +
+          `<th>SL#</th><th>Micro service</th><th>Repo</th><th>Status when deleted</th>` +
+          `<th>Deleted</th><th>By</th><th>Reason</th><th></th>` +
+          `</tr></thead><tbody>${rows}</tbody></table></div>` +
+          `<div id="mig-del-detail"></div>`
+        : `<p class="muted">Nothing has been deleted.</p>`);
+
+    for (const button of document.querySelector(".mig-dialog-body").querySelectorAll(".mig-del-show")) {
+      button.addEventListener("click", () => {
+        const entry = data.deleted[Number(button.dataset.i)];
+        $("mig-del-detail").innerHTML =
+          `<section class="mig-stage is-open"><h3>SL# ${esc(entry.sl_no)} — as it stood</h3>` +
+          `<div class="table-scroll"><table class="data-table mig-audit-table"><thead><tr>` +
+          `<th>When</th><th>Who</th><th>Field</th><th>From</th><th>To</th></tr></thead><tbody>` +
+          (entry.history || [])
+            .map(
+              (h) =>
+                `<tr><td>${esc(shortDate(h.at))}</td><td>${esc(h.who)}</td>` +
+                `<td>${esc(h.label)}</td><td class="muted">${esc(h.old_value) || "—"}</td>` +
+                `<td>${esc(h.new_value) || "—"}</td></tr>`
+            )
+            .join("") +
+          `</tbody></table></div></section>`;
+      });
+    }
+  }
+
   /* ----------------------------------------------------- reference lists -- */
 
   // Change Requestor is not here: it comes from the employee list below.
@@ -1386,6 +1540,7 @@
             `<tr><td>${esc(s.name)}</td>` +
             `<td class="mono">${esc(s.repos.join(", ")) || '<span class="muted">—</span>'}</td>` +
             `<td>${esc(s.track_leads.join(", ")) || '<span class="muted">—</span>'}</td>` +
+            `<td>${s.allow_full_merge ? "Full merge allowed" : '<span class="muted">cherry-pick only</span>'}</td>` +
             (editable
               ? `<td class="num"><button class="btn tiny mig-svc-edit" data-name="${esc(s.name)}">Edit</button>` +
                 ` <button class="btn tiny danger mig-svc-del" data-name="${esc(s.name)}">Delete</button></td>`
@@ -1429,8 +1584,8 @@
         (editable ? `<span class="mig-yours">repo and track lead per service</span>` : "") +
         `</h3>` +
         `<div class="table-scroll"><table class="data-table"><thead><tr>` +
-        `<th>Name</th><th>Repos</th><th>Track leads</th><th></th></tr></thead>` +
-        `<tbody>${services || '<tr><td colspan="4" class="muted">None yet.</td></tr>'}</tbody>` +
+        `<th>Name</th><th>Repos</th><th>Track leads</th><th>Merge</th><th></th></tr></thead>` +
+        `<tbody>${services || '<tr><td colspan="5" class="muted">None yet.</td></tr>'}</tbody>` +
         `</table></div>` +
         (editable ? `<p class="mig-hint"><button class="linkish" id="mig-svc-add">Add a micro service</button></p>` : "") +
         `</section>` +
@@ -1551,6 +1706,11 @@
         `<div class="mig-field wide"><label for="mig-svc-leads">Track leads</label>` +
         `<textarea id="mig-svc-leads" class="input" rows="3">${esc((service?.track_leads || []).join("\n"))}</textarea>` +
         `<p class="mig-hint">One per line.</p></div>` +
+        `<div class="mig-field wide"><label class="field inline">` +
+        `<input id="mig-svc-merge" type="checkbox"${service?.allow_full_merge ? " checked" : ""} />` +
+        `<span>Allow full merge</span></label>` +
+        `<p class="mig-hint">Off by default. While it is off, a request naming this ` +
+        `micro service must be a cherry-pick, and the form says so.</p></div>` +
         `<div class="mig-field wide"><button class="btn primary" id="mig-svc-save">` +
         `${service ? "Save" : "Add"} micro service</button> ` +
         `<button class="btn" id="mig-svc-back">Back</button></div>` +
@@ -1571,6 +1731,7 @@
                 name: $("mig-svc-name").value,
                 repos: lines("mig-svc-repos"),
                 track_leads: lines("mig-svc-leads"),
+                allow_full_merge: Boolean($("mig-svc-merge")?.checked),
               }),
             }
           )
@@ -1603,6 +1764,12 @@
     }
     const freeze = $("mig-freeze");
     if (freeze) freeze.textContent = state.meta.frozen ? "Frozen — manage…" : "Freeze…";
+
+    const deleted = $("mig-deleted");
+    if (deleted) {
+      const mayRead = Boolean(can.can_retire);
+      deleted.classList.toggle("hidden", !mayRead);
+    }
 
     // In the archive there is nothing to create, upload or freeze against.
     const viewing = state.archiveView;
@@ -1657,6 +1824,7 @@
       bind("mig-upload", uploadSheet);
       bind("mig-freeze", manageFreezes);
       bind("mig-lists", manageLists);
+      bind("mig-deleted", showDeleted);
       bind("mig-archive-view", async () => {
         state.archiveView = !state.archiveView;
         state.selected.clear();

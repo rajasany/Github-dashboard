@@ -970,6 +970,18 @@ function repoOptions() {
   ];
 }
 
+/* The pieces other tabs' scripts need. They load separately, so they reach for
+ * these lazily rather than at parse time. */
+window.__dash = {
+  repoOptions: () => repoOptions(),
+  fillRepoSelect: (select, selected) => fillRepoSelect(select, selected),
+  config: () => state.config,
+  // Shared so every tab marks a cherry-pick the same way. Two copies of this
+  // would eventually disagree about recorded-versus-mentioned, which is the one
+  // distinction that must not blur.
+  cherryChip: (cp) => cherryChip(cp),
+};
+
 function fillRepoSelect(select, selected) {
   const repos = repoOptions();
   select.innerHTML = repos
@@ -1336,9 +1348,22 @@ const TABS = {
   plan: { panel: () => el.panelPlan, sidebar: false, onShow: initPlanTab },
   // Lives in migrations.js. Looked up lazily so a load-order change here
   // cannot leave the tab registry referencing an undefined function.
+  timeline: {
+    panel: () => $("panel-timeline"),
+    sidebar: false,
+    // Its own window pickers, to the minute — the topbar's date range would be
+    // a second, coarser answer to the same question.
+    chrome: false,
+    title: "Folder Timeline",
+    onShow: () => window.initTimelineTab?.(),
+  },
   migrations: {
     panel: () => $("panel-migrations"),
     sidebar: false,
+    // Nothing in the topbar applies here: the date range, Refresh and the API
+    // rate meter are all about reading git, and this tab reads a database.
+    chrome: false,
+    title: "Migration Requests",
     onShow: () => window.initMigrationsTab?.(),
   },
 };
@@ -1359,6 +1384,15 @@ function showTab(name) {
   // carry their own pickers, so the sidebar would just be dead weight.
   el.sidebar.classList.toggle("hidden", !tab.sidebar);
   el.layout.classList.toggle("no-sidebar", !tab.sidebar);
+
+  // Some tabs are not about git at all, and the repo controls above them are
+  // then just noise offering to filter something they do not show.
+  // Marked on <body> rather than on each element: setBanner() reassigns the
+  // banner's whole className, so a class set here would not survive it.
+  document.body.classList.toggle("no-git-chrome", tab.chrome === false);
+  const title = $("brand-title");
+  if (title) title.textContent = tab.title || "Repo Change Dashboard";
+
   tab.onShow?.();
 }
 
